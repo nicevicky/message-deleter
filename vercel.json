@@ -2,17 +2,17 @@
   "version": 2,
   "builds": [
     {
-      "src": "api/webhook.py",
+      "src": "main.py",
       "use": "@vercel/python"
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "api/webhook.py"
+      "dest": "main.py"
     }
   ],
   "env": {
-    "PYTHONPATH": "."
+    "PYTHON_VERSION": "3.9"
   }
 }
