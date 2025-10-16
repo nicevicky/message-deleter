@@ -12,6 +12,9 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Global application instance
+_application = None
+
 # Simple in-memory storage
 class SimpleStorage:
     def __init__(self):
@@ -388,3 +391,101 @@ def setup_handlers(application: Application):
     except Exception as e:
         logger.error(f"Setup handlers error: {e}")
         raise
+
+async def get_application():
+    """Get or create the application instance"""
+    global _application
+    
+    if _application is None:
+        try:
+            bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+            if not bot_token:
+                raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
+            
+            # Create application
+            _application = Application.builder().token(bot_token).build()
+            
+            # Setup handlers
+            setup_handlers(_application)
+            
+            # Initialize the application
+            await _application.initialize()
+            
+            logger.info("Application initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize application: {e}")
+            raise
+    
+    return _application
+
+async def process_update(update_data):
+    """Process a single update"""
+    try:
+        # Get the application instance
+        application = await get_application()
+        
+        # Create Update object from the data
+        update = Update.de_json(update_data, application.bot)
+        
+        if update:
+            # Process the update
+            await application.process_update(update)
+            logger.info(f"Processed update: {update.update_id}")
+        else:
+            logger.warning("Failed to create Update object from data")
+            
+    except Exception as e:
+        logger.error(f"Error processing update: {e}")
+        raise
+
+# For webhook handler (if using webhooks)
+async def webhook_handler(request_data):
+    """Handle webhook requests"""
+    try:
+        await process_update(request_data)
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Webhook handler error: {e}")
+        return {"status": "error", "message": str(e)}
+
+# For polling (if running locally)
+async def run_polling():
+    """Run the bot with polling"""
+    try:
+        application = await get_application()
+        
+        # Start polling
+        await application.start()
+        await application.updater.start_polling()
+        
+        logger.info("Bot started with polling")
+        
+        # Keep running
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Stopping bot...")
+        finally:
+            await application.stop()
+            
+    except Exception as e:
+        logger.error(f"Polling error: {e}")
+        raise
+
+# Cleanup function for serverless
+async def cleanup():
+    """Cleanup resources"""
+    global _application
+    if _application:
+        try:
+            await _application.shutdown()
+            _application = None
+            logger.info("Application cleaned up")
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+
+# Main entry point
+if __name__ == "__main__":
+    asyncio.run(run_polling())
