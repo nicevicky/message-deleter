@@ -24,7 +24,9 @@ class SimpleStorage:
             "bandwidth", "bandwith", "band width",
             "spam", "scam", "fake", 
             "join my channel", "free money",
-            "click here", "bit.ly", "tinyurl"
+            "click here", "bit.ly", "tinyurl",
+            "crypto", "bitcoin", "investment",
+            "pump", "dump", "signal", "trading"
         }
     
     def add_user(self, user_id, first_name, username=None):
@@ -137,72 +139,55 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /stats - Show group statistics
 
 **Auto Features:**
-• Delete join/leave messages
-• Welcome new members
+• Delete join/leave messages silently
 • Filter spam words
 • AI responses to questions
 • Admin-only private messaging
+• Silent group management
         """
         await update.message.reply_text(help_text.strip())
     except Exception as e:
         logger.error(f"Help command error: {e}")
 
 async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle new member joins"""
+    """Handle new member joins - silently delete join messages"""
     try:
         message = update.message
         
         if message.new_chat_members:
-            # Delete the join message
+            # Silently delete the join message immediately
             try:
                 await message.delete()
+                logger.info(f"Deleted join message for {len(message.new_chat_members)} new members")
             except Exception as e:
                 logger.error(f"Failed to delete join message: {e}")
             
-            # Welcome new members
+            # Store new members in storage (no welcome message for private group)
             for new_member in message.new_chat_members:
                 if not new_member.is_bot:
-                    welcome_text = f"""
-🎉 Welcome to Social Bounty, {new_member.first_name}!
-
-**About Social Bounty:**
-We're a task reward platform where you can:
-• Complete social media tasks and earn rewards
-• Create your own tasks for promotion
-• Build authentic engagement
-• Grow your social presence organically
-
-Questions? Just ask in the group!
-                    """
+                    storage.add_user(
+                        new_member.id, 
+                        new_member.first_name or "Unknown", 
+                        new_member.username
+                    )
+                    logger.info(f"Added new member: {new_member.first_name} ({new_member.id})")
                     
-                    try:
-                        welcome_msg = await context.bot.send_message(
-                            chat_id=message.chat_id,
-                            text=welcome_text.strip()
-                        )
-                        
-                        # Delete welcome message after 60 seconds
-                        asyncio.create_task(delete_message_later(context.bot, welcome_msg, 60))
-                        
-                        # Store user in storage
-                        storage.add_user(new_member.id, new_member.first_name, new_member.username)
-                        
-                    except Exception as e:
-                        logger.error(f"Failed to send welcome message: {e}")
     except Exception as e:
         logger.error(f"Handle new member error: {e}")
 
 async def handle_member_left(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle member leaving"""
+    """Handle member leaving - silently delete leave messages"""
     try:
         message = update.message
         
         if message.left_chat_member:
-            # Delete the leave message
+            # Silently delete the leave message immediately
             try:
                 await message.delete()
+                logger.info(f"Deleted leave message for user: {message.left_chat_member.first_name}")
             except Exception as e:
                 logger.error(f"Failed to delete leave message: {e}")
+                
     except Exception as e:
         logger.error(f"Handle member left error: {e}")
 
@@ -214,8 +199,11 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         text = message.text or ""
         
+        # Handle None values safely
+        user_name = user.first_name or "User"
+        
         # Store user data
-        storage.add_user(user.id, user.first_name, user.username)
+        storage.add_user(user.id, user_name, user.username)
         storage.increment_message_count(user.id)
         
         # Only respond in private chat to admins
@@ -227,6 +215,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if storage.contains_filtered_words(text):
             try:
                 await message.delete()
+                logger.info(f"Deleted filtered message from {user_name}: {text[:50]}...")
                 return
             except Exception as e:
                 logger.error(f"Failed to delete filtered message: {e}")
@@ -246,12 +235,12 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_question or is_mention or chat.type == "private":
             # Get simple response
             try:
-                response = get_simple_response(text, user.first_name)
+                response = get_simple_response(text, user_name)
                 await message.reply_text(response)
                 
             except Exception as e:
                 logger.error(f"Response error: {e}")
-                await message.reply_text("🤖 Sorry, I'm having trouble processing your request right now.")
+                await message.reply_text("🤖 I'm here to help with Social Bounty questions! How can I assist you?")
                 
     except Exception as e:
         logger.error(f"Handle messages error: {e}")
@@ -260,10 +249,10 @@ def get_simple_response(text: str, user_name: str) -> str:
     """Get simple response based on keywords"""
     text_lower = text.lower()
     
-    if any(word in text_lower for word in ['hello', 'hi', 'hey']):
+    if any(word in text_lower for word in ['hello', 'hi', 'hey', 'greetings']):
         return f"Hello {user_name}! 👋 How can I help you with Social Bounty?"
     
-    elif any(word in text_lower for word in ['social bounty', 'platform', 'what is']):
+    elif any(word in text_lower for word in ['social bounty', 'platform', 'what is', 'about']):
         return """
 🚀 **About Social Bounty:**
 
@@ -276,7 +265,7 @@ Social Bounty is a task reward platform where you can:
 Join us and start earning today!
         """.strip()
     
-    elif any(word in text_lower for word in ['how', 'start', 'begin']):
+    elif any(word in text_lower for word in ['how', 'start', 'begin', 'getting started']):
         return """
 📝 **Getting Started:**
 
@@ -286,10 +275,10 @@ Join us and start earning today!
 4. Create your own tasks for promotion
 5. Withdraw your earnings
 
-Need more help? Ask in the group!
+Need more help? Feel free to ask!
         """.strip()
     
-    elif any(word in text_lower for word in ['task', 'earn', 'money', 'reward']):
+    elif any(word in text_lower for word in ['task', 'earn', 'money', 'reward', 'payment']):
         return """
 💰 **About Tasks & Rewards:**
 
@@ -300,6 +289,31 @@ Available task types:
 • Content sharing and promotion
 
 Earn rewards for each completed task and withdraw when you reach minimum threshold!
+        """.strip()
+    
+    elif any(word in text_lower for word in ['withdraw', 'payout', 'cash out', 'payment']):
+        return """
+💳 **Withdrawals & Payments:**
+
+• Minimum withdrawal threshold applies
+• Multiple payment methods available
+• Fast processing times
+• Secure transactions
+
+Check your dashboard for current balance and withdrawal options!
+        """.strip()
+    
+    elif any(word in text_lower for word in ['support', 'help', 'problem', 'issue']):
+        return """
+🆘 **Need Support?**
+
+I'm here to help! You can:
+• Ask questions about the platform
+• Get help with tasks
+• Report issues
+• Learn about features
+
+What specific help do you need?
         """.strip()
     
     else:
@@ -322,7 +336,9 @@ async def top_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, user in enumerate(top_users, 1):
             name = user.get("first_name", "Unknown")
             count = user.get("message_count", 0)
-            response += f"{i}. {name}: {count} messages\n"
+            username = user.get("username", "")
+            username_display = f"@{username}" if username else ""
+            response += f"{i}. {name} {username_display}: {count} messages\n"
         
         await update.message.reply_text(response)
         
@@ -347,6 +363,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💬 Total Messages: {total_messages}
 🚫 Filtered Words: {filtered_words_count}
 🤖 Bot Status: Active
+🔒 Group Type: Private
         """
         
         await update.message.reply_text(stats_text.strip())
@@ -372,7 +389,7 @@ def setup_handlers(application: Application):
         application.add_handler(CommandHandler("topusers", top_users_command))
         application.add_handler(CommandHandler("stats", stats_command))
         
-        # Message handlers
+        # Message handlers - order matters!
         application.add_handler(MessageHandler(
             filters.StatusUpdate.NEW_CHAT_MEMBERS, 
             handle_new_member
