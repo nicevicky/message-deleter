@@ -9,7 +9,7 @@ class GeminiAI:
             raise ValueError("GEMINI_API_KEY not found in environment variables")
         
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        self.model = genai.GenerativeModel('gemini-2.5-flash')
         
         self.system_prompt = """
 You are a support bot for Social Bounty, a task reward platform. Your identity:
