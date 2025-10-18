@@ -13,7 +13,7 @@
     }
   ],
   "env": {
-    "TELEGRAM_BOT_TOKEN": "@telegram_bot_token",
-    "WEBHOOK_URL": "@webhook_url"
+    "TELEGRAM_BOT_TOKEN": "8392694245:AAGKagwiDclLdxDbuDVPJoU7UroRSf9OZks",
+    "WEBHOOK_URL": "https://message-deleter.vercel.app/webhook"
   }
 }
