@@ -1,44 +1,20 @@
-# Social Bounty Telegram Bot
-
-A comprehensive Telegram bot for Social Bounty group management with AI support.
-
-## Features
-
-- 🤖 AI-powered responses using Gemini 2.0 Flash
-- 🛡️ Auto-delete join/leave messages
-- 👋 Welcome new members
-- 🚫 Word filtering and spam protection
-- 📊 Top users statistics with image generation
-- 👨‍💼 Admin-only private messaging
-- 💾 User activity tracking
+# README.md
 
 ## Setup
 
-1. Clone the repository
-2. Install dependencies: `pip install -r requirements.txt`
-3. Set up environment variables (copy `.env.example` to `.env`)
-4. Deploy to Vercel
-5. Set webhook: `GET /set-webhook`
+1. Create bot with @BotFather
+2. Fork this repo
+3. Deploy to Vercel
+4. Add environment variables in Vercel:
+   - TELEGRAM_BOT_TOKEN: your bot token
+   - WEBHOOK_URL: https://your-app.vercel.app
 
-## Environment Variables
+5. Visit: https://your-app.vercel.app/setwebhook
 
-- `TELEGRAM_BOT_TOKEN`: Your bot token from @BotFather
-- `GEMINI_API_KEY`: Your Google Gemini API key
-- `WEBHOOK_URL`: Your Vercel app URL + /webhook
-- `ADMIN_IDS`: Comma-separated admin user IDs
-- `GROUP_CHAT_ID`: Your group chat ID
+## Usage
 
-## Commands
-
-- `/start` - Bot introduction
-- `/help` - Show help (admin only)
-- `/topusers` - Generate top users image (admin only)
-- `/filter add/remove/list` - Manage word filters (admin only)
-
-## Deployment
-
-1. Push to GitHub
-2. Connect to Vercel
-3. Set environment variables in Vercel dashboard
-4. Deploy
-5. Set webhook using the `/set-webhook` endpoint
+1. Start bot in private: /start
+2. Add bot to group as admin
+3. Configure: /settings
+4. Add filters: /filter word
+5. Ban users: /ban @username
