@@ -14,6 +14,10 @@
   ],
   "env": {
     "TELEGRAM_BOT_TOKEN": "8392694245:AAGKagwiDclLdxDbuDVPJoU7UroRSf9OZks",
-    "WEBHOOK_URL": "https://message-deleter.vercel.app/webhook"
+    "WEBHOOK_URL": "https://message-deleter.vercel.app/webhook",
+    "SUPABASE_URL": "https://sgldaqajigbqwghypojb.supabase.co",
+    "SUPABASE_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNnbGRhcWFqaWdicXdnaHlwb2piIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA3Mzg2MDEsImV4cCI6MjA3NjMxNDYwMX0.hHZoYEpBHz-mPBYotnbsnJYuPkCNDp46TgqJltAQ78E"
   }
 }
+
+
