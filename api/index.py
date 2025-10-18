@@ -14,8 +14,31 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
 DATA_FILE = "/tmp/settings.json"
 
+# Global application instance
+application = None
+
 # Initialize bot application
-application = Application.builder().token(BOT_TOKEN).build()
+async def get_application():
+    global application
+    if application is None:
+        application = Application.builder().token(BOT_TOKEN).build()
+        
+        # Register handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("mygroups", mygroups))
+        application.add_handler(CommandHandler("settings", settings))
+        application.add_handler(CommandHandler("filter", filter_word))
+        application.add_handler(CommandHandler("unfilter", unfilter_word))
+        application.add_handler(CommandHandler("listfilters", list_filters))
+        application.add_handler(CommandHandler("ban", ban_user))
+        application.add_handler(CallbackQueryHandler(button_callback))
+        application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot_added_to_group))
+        application.add_handler(MessageHandler(filters.ALL, handle_group_message))
+        
+        await application.initialize()
+        await application.start()
+    
+    return application
 
 # Load/Save JSON data
 def load_data():
@@ -268,7 +291,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_to_ban = update.message.reply_to_message.from_user.id
     # Check if username provided
     elif context.args:
-        username = context.args[0].replace("@", "")  # THIS LINE WAS INCORRECTLY INDENTED
+        username = context.args[0].replace("@", "")
         try:
             chat = await context.bot.get_chat(f"@{username}")
             user_to_ban = chat.id
@@ -350,25 +373,14 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         print(f"Error handling message: {e}")
 
-# Register handlers
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("mygroups", mygroups))
-application.add_handler(CommandHandler("settings", settings))
-application.add_handler(CommandHandler("filter", filter_word))
-application.add_handler(CommandHandler("unfilter", unfilter_word))
-application.add_handler(CommandHandler("listfilters", list_filters))
-application.add_handler(CommandHandler("ban", ban_user))
-application.add_handler(CallbackQueryHandler(button_callback))
-application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot_added_to_group))
-application.add_handler(MessageHandler(filters.ALL, handle_group_message))
-
 # FastAPI webhook endpoint
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
+        app_instance = await get_application()
         data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.process_update(update)
+        update = Update.de_json(data, app_instance.bot)
+        await app_instance.process_update(update)
         return {"ok": True}
     except Exception as e:
         print(f"Webhook error: {e}")
@@ -381,8 +393,9 @@ async def root():
 @app.get("/setwebhook")
 async def set_webhook():
     try:
+        app_instance = await get_application()
         webhook_url = f"{WEBHOOK_URL}/webhook"
-        await application.bot.set_webhook(webhook_url)
+        await app_instance.bot.set_webhook(webhook_url)
         return {"status": "Webhook set", "url": webhook_url}
     except Exception as e:
         return {"status": "Failed", "error": str(e)}
@@ -390,8 +403,7 @@ async def set_webhook():
 # Initialize application on startup
 @app.on_event("startup")
 async def startup():
-    await application.initialize()
-    await application.start()
+    await get_application()
     # Set webhook
     if WEBHOOK_URL:
         webhook_url = f"{WEBHOOK_URL}/webhook"
@@ -399,7 +411,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    await application.stop()
-    await application.shutdown()
+    if application:
+        await application.stop()
+        await application.shutdown()
 
-        
