@@ -4,7 +4,7 @@ import json
 import re
 from fastapi import FastAPI, Request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
 from telegram.constants import ChatMemberStatus
 
 app = FastAPI()
@@ -13,6 +13,9 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
 DATA_FILE = "/tmp/settings.json"
+
+# Conversation states
+WAITING_FOR_GROUP = 1
 
 # Global application instance
 application = None
@@ -23,6 +26,15 @@ async def get_application():
     if application is None:
         application = Application.builder().token(BOT_TOKEN).build()
         
+        # Conversation handler for adding groups
+        conv_handler = ConversationHandler(
+            entry_points=[CallbackQueryHandler(start_add_group, pattern="^add_group$")],
+            states={
+                WAITING_FOR_GROUP: [MessageHandler(filters.ALL & ~filters.COMMAND, receive_group_message)]
+            },
+            fallbacks=[CommandHandler("cancel", cancel_add_group)]
+        )
+        
         # Register handlers
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("mygroups", mygroups))
@@ -31,6 +43,7 @@ async def get_application():
         application.add_handler(CommandHandler("unfilter", unfilter_word))
         application.add_handler(CommandHandler("listfilters", list_filters))
         application.add_handler(CommandHandler("ban", ban_user))
+        application.add_handler(conv_handler)
         application.add_handler(CallbackQueryHandler(button_callback))
         application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot_added_to_group))
         application.add_handler(MessageHandler(filters.ALL, handle_group_message))
@@ -54,6 +67,10 @@ def save_data(data):
 
 # Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Group Manually", callback_data="add_group")]
+    ]
+    
     await update.message.reply_text(
         "👋 Welcome to Group Manager Bot!\n\n"
         "Features:\n"
@@ -65,8 +82,135 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Add me to your group\n"
         "2. Make me admin (delete messages & ban users)\n"
         "3. Use /mygroups to see your groups\n"
-        "4. Use /settings to configure"
+        "4. Use /settings to configure\n\n"
+        "Or click the button below to add a group manually:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
+# Start add group process
+async def start_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text(
+        "📝 To add a group manually:\n\n"
+        "1. Go to the group you want to add\n"
+        "2. Send any message in that group\n"
+        "3. Forward that message to me\n\n"
+        "⚠️ Note: I must be a member of that group and have admin rights!\n\n"
+        "Send /cancel to cancel this operation."
+    )
+    
+    return WAITING_FOR_GROUP
+
+# Receive forwarded message from group
+async def receive_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    
+    # Check if message is forwarded from a group
+    if not message.forward_from_chat:
+        await message.reply_text(
+            "❌ Please forward a message from the group you want to add.\n"
+            "Send /cancel to cancel."
+        )
+        return WAITING_FOR_GROUP
+    
+    if message.forward_from_chat.type not in ["group", "supergroup"]:
+        await message.reply_text(
+            "❌ The forwarded message must be from a group!\n"
+            "Send /cancel to cancel."
+        )
+        return WAITING_FOR_GROUP
+    
+    group_id = str(message.forward_from_chat.id)
+    group_name = message.forward_from_chat.title
+    user_id = str(message.from_user.id)
+    
+    # Check if bot is member of the group
+    try:
+        bot_member = await context.bot.get_chat_member(message.forward_from_chat.id, context.bot.id)
+        
+        if bot_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER]:
+            await message.reply_text(
+                f"❌ I'm not a member of '{group_name}'!\n"
+                "Please add me to the group first."
+            )
+            return ConversationHandler.END
+        
+        # Check if bot is admin
+        if bot_member.status != ChatMemberStatus.ADMINISTRATOR:
+            await message.reply_text(
+                f"⚠️ I'm a member of '{group_name}' but not an admin!\n"
+                "Please make me an admin with these permissions:\n"
+                "• Delete messages\n"
+                "• Ban users\n\n"
+                "Group added, but features may not work properly."
+            )
+        
+        # Check if user is admin of the group
+        user_member = await context.bot.get_chat_member(message.forward_from_chat.id, message.from_user.id)
+        
+        if user_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+            await message.reply_text(
+                f"❌ You must be an admin of '{group_name}' to add it!"
+            )
+            return ConversationHandler.END
+        
+    except Exception as e:
+        await message.reply_text(
+            f"❌ Error checking group status: {str(e)}\n"
+            "Make sure I'm a member of the group and you're an admin."
+        )
+        return ConversationHandler.END
+    
+    # Add group to database
+    data = load_data()
+    
+    if group_id in data["groups"]:
+        await message.reply_text(
+            f"ℹ️ '{group_name}' is already registered!\n"
+            "Use /settings to configure it."
+        )
+        return ConversationHandler.END
+    
+    data["groups"][group_id] = {
+        "group_name": group_name,
+        "admin_user_id": user_id,
+        "settings": {
+            "delete_join_leave": True,
+            "delete_links": False,
+            "delete_promotions": False
+        },
+        "filtered_words": ["scam", "fuck"],
+        "banned_users": []
+    }
+    
+    if user_id not in data["user_groups"]:
+        data["user_groups"][user_id] = []
+    
+    if group_id not in data["user_groups"][user_id]:
+        data["user_groups"][user_id].append(group_id)
+    
+    save_data(data)
+    
+    await message.reply_text(
+        f"✅ Successfully added '{group_name}'!\n\n"
+        "You can now:\n"
+        "• Use /settings to configure the bot\n"
+        "• Use /mygroups to see all your groups\n"
+        "• Use /filter to add filtered words\n\n"
+        "Make sure I have admin rights in the group!"
+    )
+    
+    return ConversationHandler.END
+
+# Cancel add group
+async def cancel_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "❌ Operation cancelled.\n"
+        "Use /start to see available options."
+    )
+    return ConversationHandler.END
 
 # Bot added to group
 async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -92,7 +236,9 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 
                 if admin_id not in data["user_groups"]:
                     data["user_groups"][admin_id] = []
-                data["user_groups"][admin_id].append(group_id)
+                
+                if group_id not in data["user_groups"][admin_id]:
+                    data["user_groups"][admin_id].append(group_id)
                 
                 save_data(data)
                 
@@ -110,7 +256,14 @@ async def mygroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     
     if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
-        await update.message.reply_text("You don't have any groups with this bot yet.")
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Group Manually", callback_data="add_group")]
+        ]
+        await update.message.reply_text(
+            "You don't have any groups with this bot yet.\n"
+            "Click the button below to add a group manually:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
     
     text = "📋 Your Groups:\n\n"
@@ -118,7 +271,11 @@ async def mygroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if group_id in data["groups"]:
             text += f"• {data['groups'][group_id]['group_name']}\n"
     
-    await update.message.reply_text(text)
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Another Group", callback_data="add_group")]
+    ]
+    
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # Settings command
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,7 +283,13 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     
     if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
-        await update.message.reply_text("No groups found. Add me to a group first!")
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
+        ]
+        await update.message.reply_text(
+                        "No groups found. Add me to a group first!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
     
     group_id = data["user_groups"][user_id][0]
@@ -147,7 +310,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )]
     ]
     
-    filtered = ", ".join(group['filtered_words'])
+    filtered = ", ".join(group['filtered_words']) if group['filtered_words'] else "None"
     text = f"⚙️ Settings for '{group['group_name']}'\n\n"
     text += f"Filtered words: {filtered}\n\n"
     text += "Use /filter <word> to add\nUse /unfilter <word> to remove\nUse /listfilters to view all"
@@ -193,7 +356,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )]
             ]
             
-            filtered = ", ".join(group['filtered_words'])
+            filtered = ", ".join(group['filtered_words']) if group['filtered_words'] else "None"
             text = f"⚙️ Settings for '{group['group_name']}'\n\n"
             text += f"Filtered words: {filtered}\n\n"
             text += "Use /filter <word> to add\nUse /unfilter <word> to remove\nUse /listfilters to view all"
@@ -211,7 +374,13 @@ async def filter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     
     if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
-        await update.message.reply_text("No groups found!")
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
+        ]
+        await update.message.reply_text(
+            "No groups found!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
     
     group_id = data["user_groups"][user_id][0]
@@ -234,7 +403,13 @@ async def unfilter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     
     if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
-        await update.message.reply_text("No groups found!")
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
+        ]
+        await update.message.reply_text(
+            "No groups found!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
     
     group_id = data["user_groups"][user_id][0]
@@ -252,7 +427,13 @@ async def list_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     
     if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
-        await update.message.reply_text("No groups found!")
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
+        ]
+        await update.message.reply_text(
+            "No groups found!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
     
     group_id = data["user_groups"][user_id][0]
@@ -414,4 +595,3 @@ async def shutdown():
     if application:
         await application.stop()
         await application.shutdown()
-
