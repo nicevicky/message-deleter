@@ -274,16 +274,17 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     print(f"Error sending message to user: {e}")
                 
                 # Send message in group
-                try:
-                    await context.bot.send_message(
-                        chat_id=group_id,
-                        text=f"👋 Hello! I'm Group Manager Bot.\n\n"
-                             f"⚠️ Setup not complete yet!\n\
-                             f"The admin who added me needs to verify this group.\n\n"
-                             f"Admin: Please go to @{BOT_USERNAME} and follow the verification steps."
-                    )
-                except Exception as e:
-                    print(f"Error sending message to group: {e}")
+try:
+    await context.bot.send_message(
+        chat_id=group_id,
+        text=f"👋 Hello! I'm Group Manager Bot.\n\n"
+             f"⚠️ Setup not complete yet!\n\n"
+             f"The admin who added me needs to verify this group.\n\n"
+             f"Admin: Please go to @{BOT_USERNAME} and follow the verification steps."
+    )
+except Exception as e:
+    print(f"Error sending message to group: {e}")
+
 
 # Verify forwarded message from group
 async def verify_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
