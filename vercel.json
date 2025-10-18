@@ -1,8 +1,9 @@
+// vercel.json
 {
   "version": 2,
   "builds": [
     {
-      "src": "main.py",
+      "src": "api/index.py",
       "use": "@vercel/python"
     }
   ],
@@ -13,6 +14,7 @@
     }
   ],
   "env": {
-    "PYTHON_VERSION": "3.9"
+    "TELEGRAM_BOT_TOKEN": "@telegram_bot_token",
+    "WEBHOOK_URL": "@webhook_url"
   }
 }
