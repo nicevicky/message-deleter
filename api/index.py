@@ -1,6 +1,7 @@
 # api/index.py
 import os
 import re
+import logging
 from fastapi import FastAPI, Request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
@@ -8,13 +9,20 @@ from telegram.constants import ChatMemberStatus
 from supabase import create_client, Client
 from typing import Optional, List, Dict
 
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "Messagersdeleterbot")  # Add your bot username
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "Messagersdeleterbot")
 
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -27,6 +35,20 @@ application = None
 
 # Store pending group additions (user_id -> group_id)
 pending_groups = {}
+
+# Error handler
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors caused by updates."""
+    logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
+    
+    # Try to send error message to user if possible
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "❌ An error occurred while processing your request. Please try again later."
+            )
+    except Exception as e:
+        logger.error(f"Failed to send error message to user: {e}")
 
 # Initialize bot application
 async def get_application():
@@ -56,6 +78,9 @@ async def get_application():
         application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot_added_to_group))
         application.add_handler(MessageHandler(filters.ALL, handle_group_message))
         
+        # Add error handler
+        application.add_error_handler(error_handler)
+        
         await application.initialize()
         await application.start()
     
@@ -68,7 +93,7 @@ async def get_group(group_id: str) -> Optional[Dict]:
         response = supabase.table("groups").select("*").eq("group_id", group_id).execute()
         return response.data[0] if response.data else None
     except Exception as e:
-        print(f"Error getting group: {e}")
+        logger.error(f"Error getting group: {e}")
         return None
 
 async def create_group(group_id: str, group_name: str, admin_user_id: str) -> bool:
@@ -100,7 +125,7 @@ async def create_group(group_id: str, group_name: str, admin_user_id: str) -> bo
         
         return True
     except Exception as e:
-        print(f"Error creating group: {e}")
+        logger.error(f"Error creating group: {e}")
         return False
 
 async def get_user_groups(user_id: str) -> List[Dict]:
@@ -115,7 +140,7 @@ async def get_user_groups(user_id: str) -> List[Dict]:
         groups_response = supabase.table("groups").select("*").in_("group_id", group_ids).execute()
         return groups_response.data
     except Exception as e:
-        print(f"Error getting user groups: {e}")
+        logger.error(f"Error getting user groups: {e}")
         return []
 
 async def update_group_setting(group_id: str, setting: str, value: bool) -> bool:
@@ -124,7 +149,7 @@ async def update_group_setting(group_id: str, setting: str, value: bool) -> bool
         supabase.table("groups").update({setting: value}).eq("group_id", group_id).execute()
         return True
     except Exception as e:
-        print(f"Error updating setting: {e}")
+        logger.error(f"Error updating setting: {e}")
         return False
 
 async def get_filtered_words(group_id: str) -> List[str]:
@@ -133,7 +158,7 @@ async def get_filtered_words(group_id: str) -> List[str]:
         response = supabase.table("filtered_words").select("word").eq("group_id", group_id).execute()
         return [item["word"] for item in response.data]
     except Exception as e:
-        print(f"Error getting filtered words: {e}")
+        logger.error(f"Error getting filtered words: {e}")
         return []
 
 async def add_filtered_word(group_id: str, word: str) -> bool:
@@ -145,7 +170,7 @@ async def add_filtered_word(group_id: str, word: str) -> bool:
         }).execute()
         return True
     except Exception as e:
-        print(f"Error adding filtered word: {e}")
+        logger.error(f"Error adding filtered word: {e}")
         return False
 
 async def remove_filtered_word(group_id: str, word: str) -> bool:
@@ -154,7 +179,7 @@ async def remove_filtered_word(group_id: str, word: str) -> bool:
         supabase.table("filtered_words").delete().eq("group_id", group_id).eq("word", word).execute()
         return True
     except Exception as e:
-        print(f"Error removing filtered word: {e}")
+        logger.error(f"Error removing filtered word: {e}")
         return False
 
 async def add_banned_user(group_id: str, user_id: int) -> bool:
@@ -166,7 +191,7 @@ async def add_banned_user(group_id: str, user_id: int) -> bool:
         }).execute()
         return True
     except Exception as e:
-        print(f"Error adding banned user: {e}")
+        logger.error(f"Error adding banned user: {e}")
         return False
 
 # Start command
@@ -189,7 +214,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Send /cancel to cancel this operation."
             )
             return
-        except:
+        except Exception as e:
+            logger.error(f"Error getting pending group chat: {e}")
             # Group not accessible, remove from pending
             del pending_groups[user_id]
     
@@ -270,8 +296,8 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                              f"Click the button below to continue:",
                         reply_markup=InlineKeyboardMarkup(keyboard)
                     )
-                except Exception as e:  # Fixed indentation here
-                    print(f"Error sending message to user: {e}")
+                except Exception as e:
+                    logger.error(f"Error sending message to user: {e}")
                 
                 # Send message in group
                 try:
@@ -283,9 +309,8 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                              f"Admin: Please go to @{BOT_USERNAME} and follow the verification steps."
                     )
                 except Exception as e:
-                    print(f"Error sending message to group: {e}")
+                    logger.error(f"Error sending message to group: {e}")
 
-                    
 # Verify forwarded message from group
 async def verify_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -332,7 +357,8 @@ async def verify_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"You added me to '{pending_chat.title}', but you forwarded a message from '{group_name}'.\n\n"
                 f"Please forward a message from '{pending_chat.title}' instead."
             )
-        except:
+        except Exception as e:
+            logger.error(f"Error getting pending chat: {e}")
             await message.reply_text(
                 f"❌ Wrong group!\n\n"
                 f"Please forward a message from the group where you added me."
@@ -374,6 +400,7 @@ async def verify_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             return ConversationHandler.END
         
     except Exception as e:
+        logger.error(f"Error checking group status: {e}")
         await message.reply_text(
             f"❌ Error checking group status: {str(e)}\n\n"
             "Make sure:\n"
@@ -430,7 +457,7 @@ async def verify_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                      f"Admins can configure settings via @{BOT_USERNAME}"
             )
         except Exception as e:
-            print(f"Error sending confirmation to group: {e}")
+            logger.error(f"Error sending confirmation to group: {e}")
     else:
         await message.reply_text(
             "❌ Failed to add group to database. Please try again later."
@@ -508,7 +535,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # If multiple groups, show selection (for now, use first group)
+    # If multiple groups, use first group
     group = groups[0]
     group_id = group['group_id']
     
@@ -521,7 +548,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             callback_data=f"toggle_join_leave_{group_id}"
         )],
         [InlineKeyboardButton(
-            f"🔗 Delete Links: {'✅' if group['delete_links'] else '❌'}",
+            f"🔗 Delete Links: {'✅' if group['delete_links'] else '❌'}
             callback_data=f"toggle_links_{group_id}"
         )],
         [InlineKeyboardButton(
@@ -574,9 +601,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ Important: You must be an admin of the group!",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        
-        # Start conversation handler for verification
-        return WAITING_FOR_GROUP_VERIFICATION
     
     elif callback_data == "my_groups":
         groups = await get_user_groups(user_id)
@@ -779,8 +803,8 @@ async def unfilter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
         ]
-        await update.message.reply_text(
-            "No groups found!",
+        await update.message.reply_text
+         "No groups found!",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
@@ -819,7 +843,7 @@ async def list_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if filtered_words:
         text = f"📝 Filtered words for '{group_name}':\n\n"
         text += "\n".join([f"• {word}" for word in filtered_words])
-        text += f"\n\n Total: {len(filtered_words)} words"
+        text += f"\n\nTotal: {len(filtered_words)} words"
     else:
         text = f"No filtered words yet for '{group_name}'\n\n"
         text += "Use /filter <word> to add filtered words"
@@ -840,13 +864,17 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Check if user is admin
-    member = await context.bot.get_chat_member(update.effective_chat.id, update.message.from_user.id)
-    if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-        await update.message.reply_text("Only admins can use this command!")
-        try:
-            await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-        except:
-            pass
+    try:
+        member = await context.bot.get_chat_member(update.effective_chat.id, update.message.from_user.id)
+        if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+            await update.message.reply_text("Only admins can use this command!")
+            try:
+                await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
+            except Exception as e:
+                logger.error(f"Error deleting command message: {e}")
+            return
+    except Exception as e:
+        logger.error(f"Error checking admin status: {e}")
         return
     
     user_to_ban = None
@@ -860,19 +888,20 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             chat = await context.bot.get_chat(f"@{username}")
             user_to_ban = chat.id
-        except:
+        except Exception as e:
+            logger.error(f"Error getting user by username: {e}")
             await update.message.reply_text("User not found!")
             try:
                 await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Error deleting command message: {e}")
             return
     else:
         await update.message.reply_text("Usage: /ban @username or reply to a message with /ban")
         try:
             await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error deleting command message: {e}")
         return
     
     try:
@@ -881,9 +910,10 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ User has been banned")
         try:
             await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error deleting command message: {e}")
     except Exception as e:
+        logger.error(f"Error banning user: {e}")
         await update.message.reply_text(f"Failed to ban user: {str(e)}")
 
 # Handle all group messages
@@ -922,12 +952,11 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                             text=f"⚠️ Message deleted: Contains filtered word '{word}'"
                         )
                         # Delete warning after 5 seconds
-                        await context.application.job_queue.run_once(
-                            lambda ctx: ctx.bot.delete_message(update.effective_chat.id, warning.message_id),
-                            5
-                        )
-                    except:
-                        pass
+                        import asyncio
+                        await asyncio.sleep(5)
+                        await context.bot.delete_message(update.effective_chat.id, warning.message_id)
+                    except Exception as e:
+                        logger.error(f"Error sending/deleting warning: {e}")
                     return
         
         # Delete links
@@ -959,7 +988,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                         return
     
     except Exception as e:
-        print(f"Error handling message: {e}")
+        logger.error(f"Error handling message: {e}")
 
 # FastAPI webhook endpoint
 @app.post("/webhook")
@@ -971,7 +1000,7 @@ async def webhook(request: Request):
         await app_instance.process_update(update)
         return {"ok": True}
     except Exception as e:
-        print(f"Webhook error: {e}")
+        logger.error(f"Webhook error: {e}")
         return {"ok": False, "error": str(e)}
 
 @app.get("/")
@@ -991,6 +1020,7 @@ async def set_webhook():
         await app_instance.bot.set_webhook(webhook_url)
         return {"status": "Webhook set", "url": webhook_url}
     except Exception as e:
+        logger.error(f"Error setting webhook: {e}")
         return {"status": "Failed", "error": str(e)}
 
 @app.get("/health")
@@ -1006,6 +1036,7 @@ async def health_check():
             "pending_verifications": len(pending_groups)
         }
     except Exception as e:
+        logger.error(f"Health check failed: {e}")
         return {
             "status": "unhealthy",
             "error": str(e)
@@ -1022,20 +1053,29 @@ async def get_pending():
 # Initialize application on startup
 @app.on_event("startup")
 async def startup():
-    await get_application()
-    # Set webhook
-    if WEBHOOK_URL:
-        webhook_url = f"{WEBHOOK_URL}/webhook"
-        await application.bot.set_webhook(webhook_url)
-        print(f"Webhook set to: {webhook_url}")
-        print(f"Bot username: {BOT_USERNAME}")
-        print(f"Add to group link: https://t.me/{BOT_USERNAME}?startgroup=true")
+    try:
+        await get_application()
+        # Set webhook
+        if WEBHOOK_URL:
+            webhook_url = f"{WEBHOOK_URL}/webhook"
+            await application.bot.set_webhook(webhook_url)
+            logger.info(f"Webhook set to: {webhook_url}")
+            logger.info(f"Bot username: {BOT_USERNAME}")
+            logger.info(f"Add to group link: https://t.me/{BOT_USERNAME}?startgroup=true")
+        else:
+            logger.warning("WEBHOOK_URL not set!")
+    except Exception as e:
+        logger.error(f"Startup error: {e}")
 
 @app.on_event("shutdown")
 async def shutdown():
-    if application:
-        await application.stop()
-        await application.shutdown()
+    try:
+        if application:
+            await application.stop()
+            await application.shutdown()
+            logger.info("Application shut down successfully")
+    except Exception as e:
+        logger.error(f"Shutdown error: {e}")
 
 
 
