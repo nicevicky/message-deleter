@@ -238,6 +238,7 @@ async def start_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # Bot added to group - store as pending
+# Bot added to group - store as pending
 async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.new_chat_members:
         for member in update.message.new_chat_members:
@@ -270,7 +271,7 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                              f"Click the button below to continue:",
                         reply_markup=InlineKeyboardMarkup(keyboard)
                     )
-                                except Exception as e:
+                except Exception as e:  # This line was incorrectly indented
                     print(f"Error sending message to user: {e}")
                 
                 # Send message in group
@@ -284,9 +285,7 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     )
                 except Exception as e:
                     print(f"Error sending message to group: {e}")
-
-
-
+                    
 # Verify forwarded message from group
 async def verify_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
