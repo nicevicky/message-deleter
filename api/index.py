@@ -268,7 +268,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_to_ban = update.message.reply_to_message.from_user.id
     # Check if username provided
     elif context.args:
-            username = context.args[0].replace("@", "")
+        username = context.args[0].replace("@", "")  # THIS LINE WAS INCORRECTLY INDENTED
         try:
             chat = await context.bot.get_chat(f"@{username}")
             user_to_ban = chat.id
