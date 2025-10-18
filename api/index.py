@@ -14,7 +14,7 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "@Messagersdeleterbot")  # Add your bot username
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "Messagersdeleterbot")  # Add your bot username
 
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
