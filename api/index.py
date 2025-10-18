@@ -1,18 +1,22 @@
 # api/index.py
 import os
-import json
 import re
 from fastapi import FastAPI, Request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
 from telegram.constants import ChatMemberStatus
+from supabase import create_client, Client
+from typing import Optional, List, Dict
 
 app = FastAPI()
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-DATA_FILE = "/tmp/settings.json"
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Conversation states
 WAITING_FOR_GROUP = 1
@@ -53,17 +57,113 @@ async def get_application():
     
     return application
 
-# Load/Save JSON data
-def load_data():
+# Database helper functions
+async def get_group(group_id: str) -> Optional[Dict]:
+    """Get group from database"""
     try:
-        with open(DATA_FILE, 'r') as f:
-            return json.load(f)
-    except:
-        return {"groups": {}, "user_groups": {}}
+        response = supabase.table("groups").select("*").eq("group_id", group_id).execute()
+        return response.data[0] if response.data else None
+    except Exception as e:
+        print(f"Error getting group: {e}")
+        return None
 
-def save_data(data):
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+async def create_group(group_id: str, group_name: str, admin_user_id: str) -> bool:
+    """Create a new group in database"""
+    try:
+        # Insert group
+        supabase.table("groups").insert({
+            "group_id": group_id,
+            "group_name": group_name,
+            "admin_user_id": admin_user_id,
+            "delete_join_leave": True,
+            "delete_links": False,
+            "delete_promotions": False
+        }).execute()
+        
+        # Link user to group
+        supabase.table("user_groups").insert({
+            "user_id": admin_user_id,
+            "group_id": group_id
+        }).execute()
+        
+        # Add default filtered words
+        default_words = ["scam", "fuck"]
+        for word in default_words:
+            supabase.table("filtered_words").insert({
+                "group_id": group_id,
+                "word": word
+            }).execute()
+        
+        return True
+    except Exception as e:
+        print(f"Error creating group: {e}")
+        return False
+
+async def get_user_groups(user_id: str) -> List[Dict]:
+    """Get all groups for a user"""
+    try:
+        response = supabase.table("user_groups").select("group_id").eq("user_id", user_id).execute()
+        group_ids = [item["group_id"] for item in response.data]
+        
+        if not group_ids:
+            return []
+        
+        groups_response = supabase.table("groups").select("*").in_("group_id", group_ids).execute()
+        return groups_response.data
+    except Exception as e:
+        print(f"Error getting user groups: {e}")
+        return []
+
+async def update_group_setting(group_id: str, setting: str, value: bool) -> bool:
+    """Update group setting"""
+    try:
+        supabase.table("groups").update({setting: value}).eq("group_id", group_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error updating setting: {e}")
+        return False
+
+async def get_filtered_words(group_id: str) -> List[str]:
+    """Get filtered words for a group"""
+    try:
+        response = supabase.table("filtered_words").select("word").eq("group_id", group_id).execute()
+        return [item["word"] for item in response.data]
+    except Exception as e:
+        print(f"Error getting filtered words: {e}")
+        return []
+
+async def add_filtered_word(group_id: str, word: str) -> bool:
+    """Add a filtered word"""
+    try:
+        supabase.table("filtered_words").insert({
+            "group_id": group_id,
+            "word": word
+        }).execute()
+        return True
+    except Exception as e:
+        print(f"Error adding filtered word: {e}")
+        return False
+
+async def remove_filtered_word(group_id: str, word: str) -> bool:
+    """Remove a filtered word"""
+    try:
+        supabase.table("filtered_words").delete().eq("group_id", group_id).eq("word", word).execute()
+        return True
+    except Exception as e:
+        print(f"Error removing filtered word: {e}")
+        return False
+
+async def add_banned_user(group_id: str, user_id: int) -> bool:
+    """Add a banned user"""
+    try:
+        supabase.table("banned_users").insert({
+            "group_id": group_id,
+            "user_id": user_id
+        }).execute()
+        return True
+    except Exception as e:
+        print(f"Error adding banned user: {e}")
+        return False
 
 # Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -163,44 +263,31 @@ async def receive_group_message(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return ConversationHandler.END
     
-    # Add group to database
-    data = load_data()
-    
-    if group_id in data["groups"]:
+    # Check if group already exists
+    existing_group = await get_group(group_id)
+    if existing_group:
         await message.reply_text(
             f"ℹ️ '{group_name}' is already registered!\n"
             "Use /settings to configure it."
         )
         return ConversationHandler.END
     
-    data["groups"][group_id] = {
-        "group_name": group_name,
-        "admin_user_id": user_id,
-        "settings": {
-            "delete_join_leave": True,
-            "delete_links": False,
-            "delete_promotions": False
-        },
-        "filtered_words": ["scam", "fuck"],
-        "banned_users": []
-    }
+    # Add group to database
+    success = await create_group(group_id, group_name, user_id)
     
-    if user_id not in data["user_groups"]:
-        data["user_groups"][user_id] = []
-    
-    if group_id not in data["user_groups"][user_id]:
-        data["user_groups"][user_id].append(group_id)
-    
-    save_data(data)
-    
-    await message.reply_text(
-        f"✅ Successfully added '{group_name}'!\n\n"
-        "You can now:\n"
-        "• Use /settings to configure the bot\n"
-        "• Use /mygroups to see all your groups\n"
-        "• Use /filter to add filtered words\n\n"
-        "Make sure I have admin rights in the group!"
-    )
+    if success:
+        await message.reply_text(
+            f"✅ Successfully added '{group_name}'!\n\n"
+            "You can now:\n"
+            "• Use /settings to configure the bot\n"
+            "• Use /mygroups to see all your groups\n"
+            "• Use /filter to add filtered words\n\n"
+            "Make sure I have admin rights in the group!"
+        )
+    else:
+        await message.reply_text(
+            "❌ Failed to add group. Please try again later."
+        )
     
     return ConversationHandler.END
 
@@ -217,30 +304,15 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if update.message.new_chat_members:
         for member in update.message.new_chat_members:
             if member.id == context.bot.id:
-                data = load_data()
                 group_id = str(update.effective_chat.id)
                 group_name = update.effective_chat.title
                 admin_id = str(update.message.from_user.id)
                 
-                data["groups"][group_id] = {
-                    "group_name": group_name,
-                    "admin_user_id": admin_id,
-                    "settings": {
-                        "delete_join_leave": True,
-                        "delete_links": False,
-                        "delete_promotions": False
-                    },
-                    "filtered_words": ["scam", "fuck"],
-                    "banned_users": []
-                }
-                
-                if admin_id not in data["user_groups"]:
-                    data["user_groups"][admin_id] = []
-                
-                if group_id not in data["user_groups"][admin_id]:
-                    data["user_groups"][admin_id].append(group_id)
-                
-                save_data(data)
+                # Check if group already exists
+                existing_group = await get_group(group_id)
+                if not existing_group:
+                    # Create new group
+                    await create_group(group_id, group_name, admin_id)
                 
                 try:
                     await context.bot.send_message(
@@ -252,10 +324,10 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # My groups command
 async def mygroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
     user_id = str(update.message.from_user.id)
+    groups = await get_user_groups(user_id)
     
-    if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
+    if not groups:
         keyboard = [
             [InlineKeyboardButton("➕ Add Group Manually", callback_data="add_group")]
         ]
@@ -267,9 +339,8 @@ async def mygroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     text = "📋 Your Groups:\n\n"
-    for group_id in data["user_groups"][user_id]:
-        if group_id in data["groups"]:
-            text += f"• {data['groups'][group_id]['group_name']}\n"
+    for group in groups:
+        text += f"• {group['group_name']}\n"
     
     keyboard = [
         [InlineKeyboardButton("➕ Add Another Group", callback_data="add_group")]
@@ -279,38 +350,41 @@ async def mygroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Settings command
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
     user_id = str(update.message.from_user.id)
+    groups = await get_user_groups(user_id)
     
-    if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
+    if not groups:
         keyboard = [
             [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
         ]
         await update.message.reply_text(
-                        "No groups found. Add me to a group first!",
+            "No groups found. Add me to a group first!",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
     
-    group_id = data["user_groups"][user_id][0]
-    group = data["groups"][group_id]
+    group = groups[0]
+    group_id = group['group_id']
+    
+    # Get filtered words
+    filtered_words = await get_filtered_words(group_id)
     
     keyboard = [
         [InlineKeyboardButton(
-            f"🗑️ Join/Leave: {'✅' if group['settings']['delete_join_leave'] else '❌'}",
+            f"🗑️ Join/Leave: {'✅' if group['delete_join_leave'] else '❌'}",
             callback_data=f"toggle_join_leave_{group_id}"
         )],
         [InlineKeyboardButton(
-            f"🔗 Delete Links: {'✅' if group['settings']['delete_links'] else '❌'}",
+            f"🔗 Delete Links: {'✅' if group['delete_links'] else '❌'}",
             callback_data=f"toggle_links_{group_id}"
         )],
         [InlineKeyboardButton(
-            f"📢 Delete Promotions: {'✅' if group['settings']['delete_promotions'] else '❌'}",
+            f"📢 Delete Promotions: {'✅' if group['delete_promotions'] else '❌'}",
             callback_data=f"toggle_promotions_{group_id}"
         )]
     ]
     
-    filtered = ", ".join(group['filtered_words']) if group['filtered_words'] else "None"
+    filtered = ", ".join(filtered_words) if filtered_words else "None"
     text = f"⚙️ Settings for '{group['group_name']}'\n\n"
     text += f"Filtered words: {filtered}\n\n"
     text += "Use /filter <word> to add\nUse /unfilter <word> to remove\nUse /listfilters to view all"
@@ -322,7 +396,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    data = load_data()
     callback_data = query.data
     
     if callback_data.startswith("toggle_"):
@@ -330,33 +403,42 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         setting = "_".join(parts[1:-1])
         group_id = parts[-1]
         
-        if group_id in data["groups"]:
+        # Get current group settings
+        group = await get_group(group_id)
+        
+        if group:
+            # Toggle the setting
+            new_value = None
             if setting == "join_leave":
-                data["groups"][group_id]["settings"]["delete_join_leave"] = not data["groups"][group_id]["settings"]["delete_join_leave"]
+                new_value = not group['delete_join_leave']
+                await update_group_setting(group_id, "delete_join_leave", new_value)
             elif setting == "links":
-                data["groups"][group_id]["settings"]["delete_links"] = not data["groups"][group_id]["settings"]["delete_links"]
+                new_value = not group['delete_links']
+                await update_group_setting(group_id, "delete_links", new_value)
             elif setting == "promotions":
-                data["groups"][group_id]["settings"]["delete_promotions"] = not data["groups"][group_id]["settings"]["delete_promotions"]
+                new_value = not group['delete_promotions']
+                await update_group_setting(group_id, "delete_promotions", new_value)
             
-            save_data(data)
+            # Get updated group data
+            group = await get_group(group_id)
+            filtered_words = await get_filtered_words(group_id)
             
-            group = data["groups"][group_id]
             keyboard = [
                 [InlineKeyboardButton(
-                    f"🗑️ Join/Leave: {'✅' if group['settings']['delete_join_leave'] else '❌'}",
+                    f"🗑️ Join/Leave: {'✅' if group['delete_join_leave'] else '❌'}",
                     callback_data=f"toggle_join_leave_{group_id}"
                 )],
                 [InlineKeyboardButton(
-                    f"🔗 Delete Links: {'✅' if group['settings']['delete_links'] else '❌'}",
+                    f"🔗 Delete Links: {'✅' if group['delete_links'] else '❌'}",
                     callback_data=f"toggle_links_{group_id}"
                 )],
                 [InlineKeyboardButton(
-                    f"📢 Delete Promotions: {'✅' if group['settings']['delete_promotions'] else '❌'}",
+                    f"📢 Delete Promotions: {'✅' if group['delete_promotions'] else '❌'}",
                     callback_data=f"toggle_promotions_{group_id}"
                 )]
             ]
             
-            filtered = ", ".join(group['filtered_words']) if group['filtered_words'] else "None"
+            filtered = ", ".join(filtered_words) if filtered_words else "None"
             text = f"⚙️ Settings for '{group['group_name']}'\n\n"
             text += f"Filtered words: {filtered}\n\n"
             text += "Use /filter <word> to add\nUse /unfilter <word> to remove\nUse /listfilters to view all"
@@ -370,10 +452,11 @@ async def filter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     word = context.args[0].lower()
-    data = load_data()
     user_id = str(update.message.from_user.id)
     
-    if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
+    groups = await get_user_groups(user_id)
+    
+    if not groups:
         keyboard = [
             [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
         ]
@@ -383,12 +466,15 @@ async def filter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    group_id = data["user_groups"][user_id][0]
+    group_id = groups[0]['group_id']
+    filtered_words = await get_filtered_words(group_id)
     
-    if word not in data["groups"][group_id]["filtered_words"]:
-        data["groups"][group_id]["filtered_words"].append(word)
-        save_data(data)
-        await update.message.reply_text(f"✅ Added '{word}' to filtered words")
+    if word not in filtered_words:
+        success = await add_filtered_word(group_id, word)
+        if success:
+            await update.message.reply_text(f"✅ Added '{word}' to filtered words")
+        else:
+            await update.message.reply_text(f"❌ Failed to add '{word}'")
     else:
         await update.message.reply_text(f"'{word}' is already filtered")
 
@@ -399,10 +485,11 @@ async def unfilter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     word = context.args[0].lower()
-    data = load_data()
     user_id = str(update.message.from_user.id)
     
-    if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
+    groups = await get_user_groups(user_id)
+    
+    if not groups:
         keyboard = [
             [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
         ]
@@ -412,21 +499,24 @@ async def unfilter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    group_id = data["user_groups"][user_id][0]
+    group_id = groups[0]['group_id']
+    filtered_words = await get_filtered_words(group_id)
     
-    if word in data["groups"][group_id]["filtered_words"]:
-        data["groups"][group_id]["filtered_words"].remove(word)
-        save_data(data)
-        await update.message.reply_text(f"✅ Removed '{word}' from filtered words")
+    if word in filtered_words:
+        success = await remove_filtered_word(group_id, word)
+        if success:
+            await update.message.reply_text(f"✅ Removed '{word}' from filtered words")
+        else:
+            await update.message.reply_text(f"❌ Failed to remove '{word}'")
     else:
         await update.message.reply_text(f"'{word}' is not in filtered words")
 
 # List filters command
 async def list_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
     user_id = str(update.message.from_user.id)
+    groups = await get_user_groups(user_id)
     
-    if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
+    if not groups:
         keyboard = [
             [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
         ]
@@ -436,11 +526,11 @@ async def list_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    group_id = data["user_groups"][user_id][0]
-    filtered = data["groups"][group_id]["filtered_words"]
+    group_id = groups[0]['group_id']
+    filtered_words = await get_filtered_words(group_id)
     
-    if filtered:
-        text = "📝 Filtered words:\n" + "\n".join([f"• {word}" for word in filtered])
+    if filtered_words:
+        text = "📝 Filtered words:\n" + "\n".join([f"• {word}" for word in filtered_words])
     else:
         text = "No filtered words yet"
     
@@ -452,10 +542,11 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("This command only works in groups!")
         return
     
-    data = load_data()
     group_id = str(update.effective_chat.id)
     
-    if group_id not in data["groups"]:
+    # Check if group exists in database
+    group = await get_group(group_id)
+    if not group:
         return
     
     # Check if user is admin
@@ -487,8 +578,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, user_to_ban)
-        data["groups"][group_id]["banned_users"].append(user_to_ban)
-        save_data(data)
+        await add_banned_user(group_id, user_to_ban)
         await update.message.reply_text("✅ User has been banned")
         await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
     except Exception as e:
@@ -499,18 +589,18 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if update.effective_chat.type == "private":
         return
     
-    data = load_data()
     group_id = str(update.effective_chat.id)
     
-    if group_id not in data["groups"]:
+    # Get group from database
+    group = await get_group(group_id)
+    if not group:
         return
     
-    group = data["groups"][group_id]
     message = update.message
     
     try:
         # Delete join/leave messages
-        if group["settings"]["delete_join_leave"]:
+        if group["delete_join_leave"]:
             if message.new_chat_members or message.left_chat_member:
                 await context.bot.delete_message(update.effective_chat.id, message.message_id)
                 return
@@ -518,13 +608,15 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         # Check filtered words
         if message.text:
             text_lower = message.text.lower()
-            for word in group["filtered_words"]:
+            filtered_words = await get_filtered_words(group_id)
+            
+            for word in filtered_words:
                 if word in text_lower:
                     await context.bot.delete_message(update.effective_chat.id, message.message_id)
                     return
         
         # Delete links
-        if group["settings"]["delete_links"]:
+        if group["delete_links"]:
             if message.text:
                 url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
                 if re.search(url_pattern, message.text):
@@ -538,7 +630,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                         return
         
         # Delete promotions
-        if group["settings"]["delete_promotions"]:
+        if group["delete_promotions"]:
             if message.forward_from or message.forward_from_chat:
                 await context.bot.delete_message(update.effective_chat.id, message.message_id)
                 return
@@ -581,6 +673,23 @@ async def set_webhook():
     except Exception as e:
         return {"status": "Failed", "error": str(e)}
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        # Test Supabase connection
+        supabase.table("groups").select("count").limit(1).execute()
+        return {
+            "status": "healthy",
+            "bot": "running",
+            "database": "connected"
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e)
+        }
+
 # Initialize application on startup
 @app.on_event("startup")
 async def startup():
@@ -589,9 +698,12 @@ async def startup():
     if WEBHOOK_URL:
         webhook_url = f"{WEBHOOK_URL}/webhook"
         await application.bot.set_webhook(webhook_url)
+        print(f"Webhook set to: {webhook_url}")
 
 @app.on_event("shutdown")
 async def shutdown():
     if application:
         await application.stop()
         await application.shutdown()
+
+
