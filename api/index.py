@@ -3,7 +3,7 @@ import os
 import re
 import logging
 import asyncio
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
 from telegram.constants import ChatMemberStatus
@@ -58,14 +58,8 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown
-    try:
-        if application:
-            await application.stop()
-            await application.shutdown()
-            logger.info("Application shut down successfully")
-    except Exception as e:
-        logger.error(f"Shutdown error: {e}")
+    # Shutdown - Don't stop the application here for serverless
+    logger.info("Lifespan context ending")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -87,7 +81,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def get_application():
     global application
     if application is None:
-        application = Application.builder().token(BOT_TOKEN).build()
+        # Use builder with better defaults for serverless
+        builder = Application.builder()
+        builder.token(BOT_TOKEN)
+        builder.concurrent_updates(True)  # Allow concurrent update processing
+        builder.read_timeout(30)
+        builder.write_timeout(30)
+        builder.connect_timeout(30)
+        builder.pool_timeout(30)
+        
+        application = builder.build()
         
         # Conversation handler for verifying groups
         conv_handler = ConversationHandler(
@@ -119,7 +122,7 @@ async def get_application():
     
     return application
 
-# Database helper functions
+# Database helper functions remain the same
 async def get_group(group_id: str) -> Optional[Dict]:
     """Get group from database"""
     try:
@@ -271,12 +274,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Start add group process
 async def start_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    
-    # Don't await query.answer() - just acknowledge without waiting
-    try:
-        asyncio.create_task(query.answer())
-    except Exception as e:
-        logger.error(f"Error answering callback query: {e}")
+    await query.answer()
     
     # Create the add to group link
     add_to_group_link = f"https://t.me/{BOT_USERNAME}?startgroup=true"
@@ -286,21 +284,18 @@ async def start_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel_add")]
     ]
     
-    try:
-        await query.edit_message_text(
-            "📝 To add me to your group:\n\n"
-            "1️⃣ Click the 'Add Bot to Group' button below\n"
-            "2️⃣ Select the group you want to add me to\n"
-            "3️⃣ Make me an admin with these permissions:\n"
-            "   • Delete messages\n"
-            "   • Ban users\n\n"
-            "4️⃣ After adding me, come back here and click /start\n"
-            "5️⃣ Forward any message from that group to verify\n\n"
-            "⚠️ Important: You must be an admin of the group!",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    except Exception as e:
-        logger.error(f"Error editing message: {e}")
+    await query.edit_message_text(
+        "📝 To add me to your group:\n\n"
+        "1️⃣ Click the 'Add Bot to Group' button below\n"
+        "2️⃣ Select the group you want to add me to\n"
+        "3️⃣ Make me an admin with these permissions:\n"
+        "   • Delete messages\n"
+        "   • Ban users\n\n"
+        "4️⃣ After adding me, come back here and click /start\n"
+        "5️⃣ Forward any message from that group to verify\n\n"
+        "⚠️ Important: You must be an admin of the group!",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
     
     return ConversationHandler.END
 
@@ -321,12 +316,12 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 # Store as pending group
                 pending_groups[admin_id] = group_id
                 
-                # Send message to user
+                # Send message to user (don't wait for it)
+                keyboard = [
+                    [InlineKeyboardButton("✅ Verify Group Now", url=f"https://t.me/{BOT_USERNAME}")]
+                ]
+                
                 try:
-                    keyboard = [
-                        [InlineKeyboardButton("✅ Verify Group Now", url=f"https://t.me/{BOT_USERNAME}")]
-                    ]
-                    
                     await context.bot.send_message(
                         chat_id=admin_id,
                         text=f"✅ Great! I've been added to '{group_name}'!\n\n"
@@ -352,7 +347,11 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 except Exception as e:
                     logger.error(f"Error sending message to group: {e}")
 
-# Verify forwarded message from group
+# Verify forwarded message from group - rest of handlers remain the same...
+# [Copy all other handler functions as they are - verify_group_message, cancel_add_group, mygroups, settings, button_callback, filter_word, unfilter_word, list_filters, ban_user, handle_group_message]
+
+# I'll include the key ones here:
+
 async def verify_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user_id = str(message.from_user.id)
@@ -485,7 +484,7 @@ async def verify_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         
-        # Send confirmation in the group
+        # Send confirmation in the group (don't wait for it)
         try:
             await context.bot.send_message(
                 chat_id=group_id,
@@ -506,7 +505,6 @@ async def verify_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     
     return ConversationHandler.END
 
-# Cancel add group
 async def cancel_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     
@@ -526,7 +524,6 @@ async def cancel_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-# My groups command
 async def mygroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     groups = await get_user_groups(user_id)
@@ -561,7 +558,6 @@ async def mygroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# Settings command
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     groups = await get_user_groups(user_id)
@@ -613,15 +609,9 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# Toggle settings callback
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    
-    # Don't await query.answer() - just acknowledge without waiting
-    try:
-        asyncio.create_task(query.answer())
-    except Exception as e:
-        logger.error(f"Error answering callback query: {e}")
+    await query.answer()
     
     callback_data = query.data
     user_id = str(query.from_user.id)
@@ -635,21 +625,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel_add")]
         ]
         
-        try:
-            await query.edit_message_text(
-                "📝 To add me to your group:\n\n"
-                "1️⃣ Click the 'Add Bot to Group' button below\n"
-                "2️⃣ Select the group you want to add me to\n"
-                "3️⃣ Make me an admin with these permissions:\n"
-                "   • Delete messages\n"
-                "   • Ban users\n\n"
-                "4️⃣ After adding me, come back here and click /start\n"
-                "5️⃣ Forward any message from that group to verify\n\n"
-                "⚠️ Important: You must be an admin of the group!",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        except Exception as e:
-            logger.error(f"Error editing message: {e}")
+        await query.edit_message_text(
+            "📝 To add me to your group:\n\n"
+            "1️⃣ Click the 'Add Bot to Group' button below\n"
+            "2️⃣ Select the group you want to add me to\n"
+            "3️⃣ Make me an admin with these permissions:\n"
+            "   • Delete messages\n"
+            "   • Ban users\n\n"
+            "4️⃣ After adding me, come back here and click /start\n"
+            "5️⃣ Forward any message from that group to verify\n\n"
+            "⚠️ Important: You must be an admin of the group!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     
     elif callback_data == "my_groups":
         groups = await get_user_groups(user_id)
@@ -658,14 +645,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = [
                 [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
             ]
-            try:
-                await query.edit_message_text(
-                    "📋 You don't have any groups yet.\n\n"
-                    "Click the button below to add your first group:",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            except Exception as e:
-                logger.error(f"Error editing message: {e}")
+            await query.edit_message_text(
+                "📋 You don't have any groups yet.\n\n"
+                "Click the button below to add your first group:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
             return
         
         text = "📋 Your Groups:\n\n"
@@ -681,14 +665,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("➕ Add Another Group", callback_data="add_group")])
         keyboard.append([InlineKeyboardButton("⚙️ Settings", callback_data="settings")])
         
-        try:
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Error editing message: {e}")
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
     
     elif callback_data == "settings":
         groups = await get_user_groups(user_id)
@@ -697,13 +678,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = [
                 [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
             ]
-            try:
-                await query.edit_message_text(
-                    "No groups found. Add me to a group first!",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            except Exception as e:
-                logger.error(f"Error editing message: {e}")
+            await query.edit_message_text(
+                "No groups found. Add me to a group first!",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
             return
         
         group = groups[0]
@@ -740,10 +718,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "• /listfilters - View all filtered words\n\n"
         text += "Toggle settings below:"
         
-        try:
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        except Exception as e:
-            logger.error(f"Error editing message: {e}")
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     
     elif callback_data == "cancel_add":
         # Remove from pending groups if exists
@@ -755,14 +730,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📋 My Groups", callback_data="my_groups")]
         ]
         
-        try:
-            await query.edit_message_text(
-                "❌ Operation cancelled.\n\n"
-                "Use the buttons below to continue:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        except Exception as e:
-            logger.error(f"Error editing message: {e}")
+        await query.edit_message_text(
+            "❌ Operation cancelled.\n\n"
+            "Use the buttons below to continue:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     
     elif callback_data.startswith("toggle_"):
         parts = callback_data.split("_")
@@ -817,10 +789,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += "• /listfilters - View all filtered words\n\n"
             text += "Toggle settings below:"
             
-            try:
-                await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-            except Exception as e:
-                logger.error(f"Error editing message: {e}")
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # Filter command
 async def filter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1074,13 +1043,21 @@ async def webhook(request: Request):
         data = await request.json()
         update = Update.de_json(data, app_instance.bot)
         
-        # Process update without waiting for completion
-        asyncio.create_task(app_instance.process_update(update))
+        # Process update asynchronously - fire and forget
+        asyncio.create_task(process_update_safe(app_instance, update))
         
+        # Return immediately
         return {"ok": True}
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return {"ok": False, "error": str(e)}
+
+async def process_update_safe(app_instance, update):
+    """Safely process update without blocking"""
+    try:
+        await app_instance.process_update(update)
+    except Exception as e:
+        logger.error(f"Error processing update: {e}")
 
 @app.get("/")
 async def root():
