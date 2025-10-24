@@ -2,6 +2,7 @@
 import os
 import re
 import logging
+import asyncio
 from fastapi import FastAPI, Request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
@@ -548,7 +549,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             callback_data=f"toggle_join_leave_{group_id}"
         )],
         [InlineKeyboardButton(
-            f"🔗 Delete Links: {'✅' if group['delete_links'] else '❌'}
+            f"🔗 Delete Links: {'✅' if group['delete_links'] else '❌'}",
             callback_data=f"toggle_links_{group_id}"
         )],
         [InlineKeyboardButton(
@@ -803,8 +804,8 @@ async def unfilter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
         ]
-        await update.message.reply_text
-         "No groups found!",
+        await update.message.reply_text(
+            "No groups found!",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
@@ -907,11 +908,21 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, user_to_ban)
         await add_banned_user(group_id, user_to_ban)
-        await update.message.reply_text("✅ User has been banned")
+        success_msg = await update.message.reply_text("✅ User has been banned")
+        
+        # Delete the ban command message
         try:
             await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
         except Exception as e:
             logger.error(f"Error deleting command message: {e}")
+        
+        # Delete success message after 5 seconds
+        await asyncio.sleep(5)
+        try:
+            await context.bot.delete_message(update.effective_chat.id, success_msg.message_id)
+        except Exception as e:
+            logger.error(f"Error deleting success message: {e}")
+            
     except Exception as e:
         logger.error(f"Error banning user: {e}")
         await update.message.reply_text(f"Failed to ban user: {str(e)}")
@@ -952,7 +963,6 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                             text=f"⚠️ Message deleted: Contains filtered word '{word}'"
                         )
                         # Delete warning after 5 seconds
-                        import asyncio
                         await asyncio.sleep(5)
                         await context.bot.delete_message(update.effective_chat.id, warning.message_id)
                     except Exception as e:
@@ -962,7 +972,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         # Delete links
         if group["delete_links"]:
             if message.text:
-                url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+                url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\$$\$$,]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
                 if re.search(url_pattern, message.text):
                     await context.bot.delete_message(update.effective_chat.id, message.message_id)
                     return
@@ -1076,6 +1086,4 @@ async def shutdown():
             logger.info("Application shut down successfully")
     except Exception as e:
         logger.error(f"Shutdown error: {e}")
-
-
 
