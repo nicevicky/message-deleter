@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes, ConversationHandler
+    filters, ContextTypes
 )
 from telegram.constants import ChatMemberStatus
 from supabase import create_client, Client
@@ -31,14 +31,11 @@ BOT_USERNAME = os.environ.get("BOT_USERNAME", "Messagersdeleterbot")
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Conversation states
-WAITING_FOR_GROUP_VERIFICATION = 1
-
 # Global application instance
 application = None
 
-# Store pending group additions (user_id -> group_id)
-pending_groups = {}
+# Store pending group verifications (user_id -> group_id)
+pending_groups: Dict[str, str] = {}
 
 # Lifespan context manager
 @asynccontextmanager
@@ -67,10 +64,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         if isinstance(update, Update) and update.effective_message:
             await update.effective_message.reply_text(
-                "An error occurred while processing your request. Please try again later."
+                "An error occurred. Please try again later."
             )
     except Exception as e:
-        logger.error(f"Failed to send error message to user: {e}")
+        logger.error(f"Failed to send error message: {e}")
 
 # Initialize bot application
 async def get_application():
@@ -86,21 +83,7 @@ async def get_application():
         
         application = builder.build()
         
-        # === FIXED: ConversationHandler with per_message=True ===
-        conv_handler = ConversationHandler(
-            entry_points=[CallbackQueryHandler(start_add_group, pattern="^add_group$")],
-            states={
-                WAITING_FOR_GROUP_VERIFICATION: [
-                    MessageHandler(filters.ALL & ~filters.COMMAND, verify_group_message)
-                ]
-            },
-            fallbacks=[CommandHandler("cancel", cancel_add_group)],
-            per_chat=False,      # Only private chats
-            per_user=True,       # One conversation per user
-            per_message=True     # REQUIRED for CallbackQueryHandler
-        )
-        
-        # Register handlers
+        # Register handlers (NO ConversationHandler)
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("mygroups", mygroups))
         application.add_handler(CommandHandler("settings", settings))
@@ -108,10 +91,12 @@ async def get_application():
         application.add_handler(CommandHandler("unfilter", unfilter_word))
         application.add_handler(CommandHandler("listfilters", list_filters))
         application.add_handler(CommandHandler("ban", ban_user))
-        application.add_handler(conv_handler)
+        application.add_handler(CommandHandler("cancel", cancel_verification))
         application.add_handler(CallbackQueryHandler(button_callback))
         application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot_added_to_group))
-        application.add_handler(MessageHandler(filters.ALL, handle_group_message))
+        application.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, verify_forwarded_message))
+        application.add_handler(MessageHandler(filters.ChatType.PRIVATE, handle_private_message))
+        application.add_handler(MessageHandler(filters.ChatType.GROUPS | filters.ChatType.SUPERGROUPS, handle_group_message))
         
         application.add_error_handler(error_handler)
         
@@ -139,18 +124,12 @@ async def create_group(group_id: str, group_name: str, admin_user_id: str) -> bo
             "delete_links": False,
             "delete_promotions": False
         }).execute()
-        
         supabase.table("user_groups").insert({
             "user_id": admin_user_id,
             "group_id": group_id
         }).execute()
-        
-        default_words = ["scam", "fuck"]
-        for word in default_words:
-            supabase.table("filtered_words").insert({
-                "group_id": group_id,
-                "word": word
-            }).execute()
+        for word in ["scam", "fuck"]:
+            supabase.table("filtered_words").insert({"group_id": group_id, "word": word}).execute()
         return True
     except Exception as e:
         logger.error(f"Error creating group: {e}")
@@ -219,23 +198,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"Welcome back!\n\n"
                 f"I detected that you added me to '{chat.title}'.\n\n"
-                f"To complete the setup, please:\n"
-                f"1. Go to '{chat.title}'\n"
-                f"2. Send any message in that group\n"
-                f"3. Forward that message back to me\n\n"
-                f"This helps me verify that you're an admin of the group.\n\n"
-                f"Send /cancel to cancel this operation."
+                f"To complete setup, forward any message from that group here.\n\n"
+                f"Send /cancel to stop."
             )
             return
         except Exception as e:
-            logger.error(f"Error getting pending group chat: {e}")
+            logger.error(f"Error: {e}")
             del pending_groups[user_id]
     
     keyboard = [
         [InlineKeyboardButton("Add Group", callback_data="add_group")],
         [InlineKeyboardButton("My Groups", callback_data="my_groups")]
     ]
-    
     await update.message.reply_text(
         "Welcome to Group Manager Bot!\n\n"
         "Features:\n"
@@ -243,143 +217,205 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Filter banned words\n"
         "Control links & promotions\n"
         "Ban users\n\n"
-        "Click 'Add Group' to get started!",
+        "Click 'Add Group' to start!",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def start_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
-    add_to_group_link = f"https://t.me/{BOT_USERNAME}?startgroup=true"
-    keyboard = [
-        [InlineKeyboardButton("Add Bot to Group", url=add_to_group_link)],
-        [InlineKeyboardButton("Cancel", callback_data="cancel_add")]
-    ]
-    
-    await query.edit_message_text(
-        "To add me to your group:\n\n"
-        "1. Click the 'Add Bot to Group' button below\n"
-        "2. Select the group you want to add me to\n"
-        "3. Make me an admin with these permissions:\n"
-        "   • Delete messages\n"
-        "   • Ban users\n\n"
-        "4. After adding me, come back here and click /start\n"
-        "5. Forward any message from that group to verify\n\n"
-        "Important: You must be an admin of the group!",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return ConversationHandler.END
+    data = query.data
+    user_id = str(query.from_user.id)
 
+    if data == "add_group":
+        link = f"https://t.me/{BOT_USERNAME}?startgroup=true"
+        keyboard = [
+            [InlineKeyboardButton("Add Bot to Group", url=link)],
+            [InlineKeyboardButton("Cancel", callback_data="cancel_add")]
+        ]
+        await query.edit_message_text(
+            "To add me:\n\n"
+            "1. Click button below\n"
+            "2. Choose group\n"
+            "3. Make me admin (Delete + Ban)\n"
+            "4. Return here & /start\n"
+            "5. Forward a group message\n\n"
+            "You must be admin!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data == "my_groups":
+        groups = await get_user_groups(user_id)
+        if not groups:
+            keyboard = [[InlineKeyboardButton("Add Group", callback_data="add_group")]]
+            await query.edit_message_text(
+                "You don't have any groups yet.\n\n"
+                "Click below to add one:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        text = "Your Groups:\n\n"
+        keyboard = []
+        for idx, group in enumerate(groups, 1):
+            text += f"{idx}. {group['group_name']}\n"
+            text += f"   ID: `{group['group_id']}`\n"
+            text += f"   Join/Leave: {'ON' if group['delete_join_leave'] else 'OFF'}\n"
+            text += f"   Links: {'ON' if group['delete_links'] else 'OFF'}\n"
+            text += f"   Promotions: {'ON' if group['delete_promotions'] else 'OFF'}\n\n"
+        keyboard.append([InlineKeyboardButton("Add Another Group", callback_data="add_group")])
+        keyboard.append([InlineKeyboardButton("Settings", callback_data="settings")])
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "settings":
+        groups = await get_user_groups(user_id)
+        if not groups:
+            keyboard = [[InlineKeyboardButton("Add Group", callback_data="add_group")]]
+            await query.edit_message_text("No groups found. Add one first!", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+        group = groups[0]
+        group_id = group['group_id']
+        filtered_words = await get_filtered_words(group_id)
+        keyboard = [
+            [InlineKeyboardButton(
+                f"Join/Leave: {'ON' if group['delete_join_leave'] else 'OFF'}",
+                callback_data=f"toggle_join_leave_{group_id}"
+            )],
+            [InlineKeyboardButton(
+                f"Delete Links: {'ON' if group['delete_links'] else 'OFF'}",
+                callback_data=f"toggle_links_{group_id}"
+            )],
+            [InlineKeyboardButton(
+                f"Delete Promotions: {'ON' if group['delete_promotions'] else 'OFF'}",
+                callback_data=f"toggle_promotions_{group_id}"
+            )],
+            [InlineKeyboardButton("Back to My Groups", callback_data="my_groups")]
+        ]
+        filtered = ", ".join(filtered_words[:5]) if filtered_words else "None"
+        if len(filtered_words) > 5:
+            filtered += f" (+{len(filtered_words) - 5} more)"
+        text = f"Settings for '{group['group_name']}'\n\n"
+        text += f"Filtered words ({len(filtered_words)}): {filtered}\n\n"
+        text += "Commands:\n"
+        text += "• /filter <word>\n"
+        text += "• /unfilter <word>\n"
+        text += "• /listfilters\n\n"
+        text += "Toggle below:"
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "cancel_add":
+        if user_id in pending_groups:
+            del pending_groups[user_id]
+        keyboard = [
+            [InlineKeyboardButton("Add Group", callback_data="add_group")],
+            [InlineKeyboardButton("My Groups", callback_data="my_groups")]
+        ]
+        await query.edit_message_text("Operation cancelled.", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("toggle_"):
+        parts = data.split("_")
+        setting = "_".join(parts[1:-1])
+        group_id = parts[-1]
+        group = await get_group(group_id)
+        if not group:
+            await query.edit_message_text("Group not found.")
+            return
+        new_value = None
+        if setting == "join_leave":
+            new_value = not group['delete_join_leave']
+            await update_group_setting(group_id, "delete_join_leave", new_value)
+        elif setting == "links":
+            new_value = not group['delete_links']
+            await update_group_setting(group_id, "delete_links", new_value)
+        elif setting == "promotions":
+            new_value = not group['delete_promotions']
+            await update_group_setting(group_id, "delete_promotions", new_value)
+        # Refresh settings
+        await settings(update, context)
+
+# === VERIFICATION HANDLERS ===
 async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.new_chat_members:
-        for member in update.message.new_chat_members:
-            if member.id == context.bot.id:
-                group_id = str(update.effective_chat.id)
-                group_name = update.effective_chat.title
-                admin_id = str(update.message.from_user.id)
-                
-                if await get_group(group_id):
-                    return
-                
-                pending_groups[admin_id] = group_id
-                
-                keyboard = [InlineKeyboardButton("Verify Group Now", url=f"https://t.me/{BOT_USERNAME}")]
-                try:
-                    await context.bot.send_message(
-                        chat_id=admin_id,
-                        text=f"Great! I've been added to '{group_name}'!\n\n"
-                             f"Next step: Verify the group\n\n"
-                             f"1. Go to '{group_name}'\n"
-                             f"2. Send any message there\n"
-                             f"3. Forward that message to me\n\n"
-                             f"Click the button below to continue:",
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
-                except Exception as e:
-                    logger.error(f"Error sending message to user: {e}")
-                
-                try:
-                    await context.bot.send_message(
-                        chat_id=group_id,
-                        text=f"Hello! I'm Group Manager Bot.\n\n"
-                             f"Setup not complete yet!\n\n"
-                             f"The admin who added me needs to verify this group.\n\n"
-                             f"Admin: Please go to @{BOT_USERNAME} and follow the verification steps."
-                    )
-                except Exception as e:
-                    logger.error(f"Error sending message to group: {e}")
+    if not update.message.new_chat_members:
+        return
+    for member in update.message.new_chat_members:
+        if member.id == context.bot.id:
+            group_id = str(update.effective_chat.id)
+            group_name = update.effective_chat.title
+            admin_id = str(update.message.from_user.id)
+            
+            if await get_group(group_id):
+                return
+            
+            pending_groups[admin_id] = group_id
+            keyboard = [InlineKeyboardButton("Verify Now", url=f"https://t.me/{BOT_USERNAME}")]
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"Added to '{group_name}'!\n\n"
+                    f"Next: Forward any message from that group to me.\n"
+                    f"Click below to open:",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            except Exception as e:
+                logger.error(f"DM failed: {e}")
 
-async def verify_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def verify_forwarded_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user_id = str(message.from_user.id)
     
-    if not message.forward_from_chat:
-        await message.reply_text(
-            "Please forward a message from the group you want to verify.\n\n"
-            "Steps:\n"
-            "1. Go to the group where you added me\n"
-            "2. Send any message there\n"
-            "3. Forward that message to me\n\n"
-            "Send /cancel to cancel."
-        )
-        return WAITING_FOR_GROUP_VERIFICATION
+    if user_id not in pending_groups:
+        return
     
-    if message.forward_from_chat.type not in ["group", "supergroup"]:
-        await message.reply_text("The forwarded message must be from a group!\nSend /cancel to cancel.")
-        return WAITING_FOR_GROUP_VERIFICATION
+    if not message.forward_from_chat or message.forward_from_chat.type not in ["group", "supergroup"]:
+        await message.reply_text("Please forward a message from the group.")
+        return
     
     group_id = str(message.forward_from_chat.id)
+    pending_id = pending_groups[user_id]
+    
+    if group_id != pending_id:
+        await message.reply_text("Wrong group! Forward from the correct one.")
+        return
+    
     group_name = message.forward_from_chat.title
     
-    if user_id not in pending_groups:
-        await message.reply_text("No pending group verification found.\nPlease add me to a group first.")
-        return ConversationHandler.END
-    
-    pending_group_id = pending_groups[user_id]
-    if group_id != pending_group_id:
-        try:
-            pending_chat = await context.bot.get_chat(pending_group_id)
-            await message.reply_text(
-                f"Wrong group!\n\n"
-                f"You added me to '{pending_chat.title}', but you forwarded a message from '{group_name}'.\n\n"
-                f"Please forward a message from '{pending_chat.title}' instead."
-            )
-        except Exception:
-            await message.reply_text("Wrong group!\nPlease forward a message from the group where you added me.")
-        return WAITING_FOR_GROUP_VERIFICATION
-    
+    # Check bot status
     try:
         bot_member = await context.bot.get_chat_member(group_id, context.bot.id)
         if bot_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER]:
-            await message.reply_text(f"I'm not a member of '{group_name}' anymore!\nPlease add me again.")
+            await message.reply_text(f"I'm not in '{group_name}' anymore. Add me again.")
             del pending_groups[user_id]
-            return ConversationHandler.END
-        
+            return
         if bot_member.status != ChatMemberStatus.ADMINISTRATOR:
             await message.reply_text(
-                f"I'm a member of '{group_name}' but not an admin!\n\n"
-                f"Please make me an admin with:\n"
+                f"I'm in '{group_name}' but not admin!\n\n"
+                "Make me admin with:\n"
                 "• Delete messages\n"
                 "• Ban users\n\n"
-                "Then forward another message."
+                "Then forward again."
             )
-            return WAITING_FOR_GROUP_VERIFICATION
-        
+            return
+    except Exception as e:
+        logger.error(f"Bot status error: {e}")
+        await message.reply_text("Error checking my status.")
+        return
+    
+    # Check user is admin
+    try:
         user_member = await context.bot.get_chat_member(group_id, message.from_user.id)
         if user_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-            await message.reply_text(f"You must be an admin of '{group_name}' to add it!")
+            await message.reply_text(f"You must be admin of '{group_name}'.")
             del pending_groups[user_id]
-            return ConversationHandler.END
+            return
     except Exception as e:
-        logger.error(f"Error checking group status: {e}")
-        await message.reply_text("Error checking group status. Ensure I'm still in the group and have admin rights.")
-        return WAITING_FOR_GROUP_VERIFICATION
+        logger.error(f"User status error: {e}")
+        await message.reply_text("Error checking your status.")
+        return
     
+    # Finalize
     if await get_group(group_id):
-        await message.reply_text(f"'{group_name}' is already registered!\nUse /settings to configure it.")
+        await message.reply_text(f"'{group_name}' is already registered!")
         del pending_groups[user_id]
-        return ConversationHandler.END
+        return
     
     if await create_group(group_id, group_name, user_id):
         del pending_groups[user_id]
@@ -388,552 +424,193 @@ async def verify_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             [InlineKeyboardButton("View My Groups", callback_data="my_groups")]
         ]
         await message.reply_text(
-            f"Successfully verified and added '{group_name}'!\n\n"
-            f"Setup complete! Your group is now protected.\n\n"
-            f"Use /settings, /filter <word>, /mygroups, etc.",
+            f"Successfully added '{group_name}'!\n\n"
+            f"Setup complete. Bot is active.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         try:
             await context.bot.send_message(
-                chat_id=group_id,
-                text=f"Setup complete!\n\n"
-                     f"I'm now protecting this group with:\n"
-                     f"• Auto-delete join/leave messages\n"
-                     f"• Filter banned words (scam, fuck)\n"
-                     f"• Delete links\n"
-                     f"• Delete promotions\n\n"
-                     f"Admins can configure via @{BOT_USERNAME}"
+                group_id,
+                f"Setup complete!\n\n"
+                f"I'm now protecting this group.\n"
+                f"Admins: Use @{BOT_USERNAME} to configure."
             )
         except Exception as e:
-            logger.error(f"Error sending confirmation to group: {e}")
+            logger.error(f"Group confirm failed: {e}")
     else:
-        await message.reply_text("Failed to add group to database. Please try again later.")
-    
-    return ConversationHandler.END
+        await message.reply_text("Failed to save group. Try again.")
 
-async def cancel_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_verification(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     if user_id in pending_groups:
         del pending_groups[user_id]
-    
-    keyboard = [
-        [InlineKeyboardButton("Add Group", callback_data="add_group")],
-        [InlineKeyboardButton("My Groups", callback_data="my_groups")]
-    ]
-    await update.message.reply_text("Operation cancelled.", reply_markup=InlineKeyboardMarkup(keyboard))
-    return ConversationHandler.END
-
-async def mygroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.message.from_user.id)
-    groups = await get_user_groups(user_id)
-    
-    if not groups:
-        keyboard = [
-            [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
-        ]
-        await update.message.reply_text(
-            "📋 You don't have any groups yet.\n\n"
-            "Click the button below to add your first group:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
-    text = "📋 Your Groups:\n\n"
-    keyboard = []
-    
-    for idx, group in enumerate(groups, 1):
-        text += f"{idx}. {group['group_name']}\n"
-        text += f"   ID: `{group['group_id']}`\n"
-        text += f"   Join/Leave: {'✅' if group['delete_join_leave'] else '❌'}\n"
-        text += f"   Links: {'✅' if group['delete_links'] else '❌'}\n"
-        text += f"   Promotions: {'✅' if group['delete_promotions'] else '❌'}\n\n"
-    
-    keyboard.append([InlineKeyboardButton("➕ Add Another Group", callback_data="add_group")])
-    keyboard.append([InlineKeyboardButton("⚙️ Settings", callback_data="settings")])
-    
-    await update.message.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.message.from_user.id)
-    groups = await get_user_groups(user_id)
-    
-    if not groups:
-        keyboard = [
-            [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
-        ]
-        await update.message.reply_text(
-            "No groups found. Add me to a group first!",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
-    # If multiple groups, use first group
-    group = groups[0]
-    group_id = group['group_id']
-    
-    # Get filtered words
-    filtered_words = await get_filtered_words(group_id)
-    
-    keyboard = [
-        [InlineKeyboardButton(
-            f"🗑️ Join/Leave: {'✅' if group['delete_join_leave'] else '❌'}",
-            callback_data=f"toggle_join_leave_{group_id}"
-        )],
-        [InlineKeyboardButton(
-            f"🔗 Delete Links: {'✅' if group['delete_links'] else '❌'}",
-            callback_data=f"toggle_links_{group_id}"
-        )],
-        [InlineKeyboardButton(
-            f"📢 Delete Promotions: {'✅' if group['delete_promotions'] else '❌'}",
-            callback_data=f"toggle_promotions_{group_id}"
-        )],
-        [InlineKeyboardButton("📋 Back to My Groups", callback_data="my_groups")]
-    ]
-    
-    filtered = ", ".join(filtered_words[:5]) if filtered_words else "None"
-    if len(filtered_words) > 5:
-        filtered += f" (+{len(filtered_words) - 5} more)"
-    
-    text = f"⚙️ Settings for '{group['group_name']}'\n\n"
-    text += f"📝 Filtered words ({len(filtered_words)}): {filtered}\n\n"
-    text += "Commands:\n"
-    text += "• /filter <word> - Add filtered word\n"
-    text += "• /unfilter <word> - Remove filtered word\n"
-    text += "• /listfilters - View all filtered words\n\n"
-    text += "Toggle settings below:"
-    
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    callback_data = query.data
-    user_id = str(query.from_user.id)
-    
-    if callback_data == "add_group":
-        # Create the add to group link
-        add_to_group_link = f"https://t.me/{BOT_USERNAME}?startgroup=true"
-        
-        keyboard = [
-            [InlineKeyboardButton("➕ Add Bot to Group", url=add_to_group_link)],
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_add")]
-        ]
-        
-        await query.edit_message_text(
-            "📝 To add me to your group:\n\n"
-            "1️⃣ Click the 'Add Bot to Group' button below\n"
-            "2️⃣ Select the group you want to add me to\n"
-            "3️⃣ Make me an admin with these permissions:\n"
-            "   • Delete messages\n"
-            "   • Ban users\n\n"
-            "4️⃣ After adding me, come back here and click /start\n"
-            "5️⃣ Forward any message from that group to verify\n\n"
-            "⚠️ Important: You must be an admin of the group!",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    elif callback_data == "my_groups":
-        groups = await get_user_groups(user_id)
-        
-        if not groups:
-            keyboard = [
-                [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
-            ]
-            await query.edit_message_text(
-                "📋 You don't have any groups yet.\n\n"
-                "Click the button below to add your first group:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return
-        
-        text = "📋 Your Groups:\n\n"
-        keyboard = []
-        
-        for idx, group in enumerate(groups, 1):
-            text += f"{idx}. {group['group_name']}\n"
-            text += f"   ID: `{group['group_id']}`\n"
-            text += f"   Join/Leave: {'✅' if group['delete_join_leave'] else '❌'}\n"
-            text += f"   Links: {'✅' if group['delete_links'] else '❌'}\n"
-            text += f"   Promotions: {'✅' if group['delete_promotions'] else '❌'}\n\n"
-        
-        keyboard.append([InlineKeyboardButton("➕ Add Another Group", callback_data="add_group")])
-        keyboard.append([InlineKeyboardButton("⚙️ Settings", callback_data="settings")])
-        
-        await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-    
-    elif callback_data == "settings":
-        groups = await get_user_groups(user_id)
-        
-        if not groups:
-            keyboard = [
-                [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
-            ]
-            await query.edit_message_text(
-                "No groups found. Add me to a group first!",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return
-        
-        group = groups[0]
-        group_id = group['group_id']
-        
-        # Get filtered words
-        filtered_words = await get_filtered_words(group_id)
-        
-        keyboard = [
-            [InlineKeyboardButton(
-                f"🗑️ Join/Leave: {'✅' if group['delete_join_leave'] else '❌'}",
-                callback_data=f"toggle_join_leave_{group_id}"
-            )],
-            [InlineKeyboardButton(
-                f"🔗 Delete Links: {'✅' if group['delete_links'] else '❌'}",
-                callback_data=f"toggle_links_{group_id}"
-            )],
-            [InlineKeyboardButton(
-                f"📢 Delete Promotions: {'✅' if group['delete_promotions'] else '❌'}",
-                callback_data=f"toggle_promotions_{group_id}"
-            )],
-            [InlineKeyboardButton("📋 Back to My Groups", callback_data="my_groups")]
-        ]
-        
-        filtered = ", ".join(filtered_words[:5]) if filtered_words else "None"
-        if len(filtered_words) > 5:
-            filtered += f" (+{len(filtered_words) - 5} more)"
-        
-        text = f"⚙️ Settings for '{group['group_name']}'\n\n"
-        text += f"📝 Filtered words ({len(filtered_words)}): {filtered}\n\n"
-        text += "Commands:\n"
-        text += "• /filter <word> - Add filtered word\n"
-        text += "• /unfilter <word> - Remove filtered word\n"
-        text += "• /listfilters - View all filtered words\n\n"
-        text += "Toggle settings below:"
-        
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    
-    elif callback_data == "cancel_add":
-        # Remove from pending groups if exists
-        if user_id in pending_groups:
-            del pending_groups[user_id]
-        
-        keyboard = [
-            [InlineKeyboardButton("➕ Add Group", callback_data="add_group")],
-            [InlineKeyboardButton("📋 My Groups", callback_data="my_groups")]
-        ]
-        
-        await query.edit_message_text(
-            "❌ Operation cancelled.\n\n"
-            "Use the buttons below to continue:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    elif callback_data.startswith("toggle_"):
-        parts = callback_data.split("_")
-        setting = "_".join(parts[1:-1])
-        group_id = parts[-1]
-        
-        # Get current group settings
-        group = await get_group(group_id)
-        
-        if group:
-            # Toggle the setting
-            new_value = None
-            if setting == "join_leave":
-                new_value = not group['delete_join_leave']
-                await update_group_setting(group_id, "delete_join_leave", new_value)
-            elif setting == "links":
-                new_value = not group['delete_links']
-                await update_group_setting(group_id, "delete_links", new_value)
-            elif setting == "promotions":
-                new_value = not group['delete_promotions']
-                await update_group_setting(group_id, "delete_promotions", new_value)
-            
-            # Get updated group data
-            group = await get_group(group_id)
-            filtered_words = await get_filtered_words(group_id)
-            
-            keyboard = [
-                [InlineKeyboardButton(
-                    f"🗑️ Join/Leave: {'✅' if group['delete_join_leave'] else '❌'}",
-                    callback_data=f"toggle_join_leave_{group_id}"
-                )],
-                [InlineKeyboardButton(
-                    f"🔗 Delete Links: {'✅' if group['delete_links'] else '❌'}",
-                    callback_data=f"toggle_links_{group_id}"
-                )],
-                [InlineKeyboardButton(
-                    f"📢 Delete Promotions: {'✅' if group['delete_promotions'] else '❌'}",
-                    callback_data=f"toggle_promotions_{group_id}"
-                )],
-                [InlineKeyboardButton("📋 Back to My Groups", callback_data="my_groups")]
-            ]
-            
-            filtered = ", ".join(filtered_words[:5]) if filtered_words else "None"
-            if len(filtered_words) > 5:
-                filtered += f" (+{len(filtered_words) - 5} more)"
-            
-            text = f"⚙️ Settings for '{group['group_name']}'\n\n"
-            text += f"📝 Filtered words ({len(filtered_words)}): {filtered}\n\n"
-            text += "Commands:\n"
-            text += "• /filter <word> - Add filtered word\n"
-            text += "• /unfilter <word> - Remove filtered word\n"
-            text += "• /listfilters - View all filtered words\n\n"
-            text += "Toggle settings below:"
-            
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-# Filter command
-async def filter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /filter <word>")
-        return
-    
-    word = " ".join(context.args).lower()
-    user_id = str(update.message.from_user.id)
-    
-    groups = await get_user_groups(user_id)
-    
-    if not groups:
-        keyboard = [
-            [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
-        ]
-        await update.message.reply_text(
-            "No groups found!",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
-    group_id = groups[0]['group_id']
-    filtered_words = await get_filtered_words(group_id)
-    
-    if word not in filtered_words:
-        success = await add_filtered_word(group_id, word)
-        if success:
-            await update.message.reply_text(f"✅ Added '{word}' to filtered words for {groups[0]['group_name']}")
-        else:
-            await update.message.reply_text(f"❌ Failed to add '{word}'")
+        await update.message.reply_text("Verification cancelled.")
     else:
-        await update.message.reply_text(f"'{word}' is already filtered in {groups[0]['group_name']}")
+        await update.message.reply_text("Nothing to cancel.")
 
-# Unfilter command
-async def unfilter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /unfilter <word>")
-        return
-    
-    word = " ".join(context.args).lower()
+async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
-    
-    groups = await get_user_groups(user_id)
-    
-    if not groups:
-        keyboard = [
-            [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
-        ]
+    if user_id in pending_groups:
         await update.message.reply_text(
-            "No groups found!",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "Please forward a message from the group to verify.\n"
+            "Send /cancel to stop."
         )
-        return
-    
-    group_id = groups[0]['group_id']
-    filtered_words = await get_filtered_words(group_id)
-    
-    if word in filtered_words:
-        success = await remove_filtered_word(group_id, word)
-        if success:
-            await update.message.reply_text(f"✅ Removed '{word}' from filtered words for {groups[0]['group_name']}")
-        else:
-            await update.message.reply_text(f"❌ Failed to remove '{word}'")
-    else:
-        await update.message.reply_text(f"'{word}' is not in filtered words for {groups[0]['group_name']}")
 
-# List filters command
-async def list_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.message.from_user.id)
-    groups = await get_user_groups(user_id)
-    
-    if not groups:
-        keyboard = [
-            [InlineKeyboardButton("➕ Add Group", callback_data="add_group")]
-        ]
-        await update.message.reply_text(
-            "No groups found!",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-            
-    group_id = groups[0]['group_id']
-    group_name = groups[0]['group_name']
-    filtered_words = await get_filtered_words(group_id)
-    
-    if filtered_words:
-        text = f"📝 Filtered words for '{group_name}':\n\n"
-        text += "\n".join([f"• {word}" for word in filtered_words])
-        text += f"\n\nTotal: {len(filtered_words)} words"
-    else:
-        text = f"No filtered words yet for '{group_name}'\n\n"
-        text += "Use /filter <word> to add filtered words"
-    
-    await update.message.reply_text(text)
-
-# Ban command
-async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups!")
-        return
-    
-    group_id = str(update.effective_chat.id)
-    
-    # Check if group exists in database
-    group = await get_group(group_id)
-    if not group:
-        return
-    
-    # Check if user is admin
-    try:
-        member = await context.bot.get_chat_member(update.effective_chat.id, update.message.from_user.id)
-        if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-            await update.message.reply_text("Only admins can use this command!")
-            try:
-                await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-            except Exception as e:
-                logger.error(f"Error deleting command message: {e}")
-            return
-    except Exception as e:
-        logger.error(f"Error checking admin status: {e}")
-        return
-    
-    user_to_ban = None
-    
-    # Check if replying to a message
-    if update.message.reply_to_message:
-        user_to_ban = update.message.reply_to_message.from_user.id
-    # Check if username provided
-    elif context.args:
-        username = context.args[0].replace("@", "")
-        try:
-            chat = await context.bot.get_chat(f"@{username}")
-            user_to_ban = chat.id
-        except Exception as e:
-            logger.error(f"Error getting user by username: {e}")
-            await update.message.reply_text("User not found!")
-            try:
-                await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-            except Exception as e:
-                logger.error(f"Error deleting command message: {e}")
-            return
-    else:
-        await update.message.reply_text("Usage: /ban @username or reply to a message with /ban")
-        try:
-            await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-        except Exception as e:
-            logger.error(f"Error deleting command message: {e}")
-        return
-    
-    try:
-        await context.bot.ban_chat_member(update.effective_chat.id, user_to_ban)
-        await add_banned_user(group_id, user_to_ban)
-        success_msg = await update.message.reply_text("✅ User has been banned")
-        
-        # Delete the ban command message
-        try:
-            await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-        except Exception as e:
-            logger.error(f"Error deleting command message: {e}")
-        
-        # Delete success message after 5 seconds
-        await asyncio.sleep(5)
-        try:
-            await context.bot.delete_message(update.effective_chat.id, success_msg.message_id)
-        except Exception as e:
-            logger.error(f"Error deleting success message: {e}")
-            
-    except Exception as e:
-        logger.error(f"Error banning user: {e}")
-        await update.message.reply_text(f"Failed to ban user: {str(e)}")
-
-# Handle all group messages
+# === GROUP MESSAGE HANDLER ===
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
         return
-    
     group_id = str(update.effective_chat.id)
-    
-    # Get group from database
     group = await get_group(group_id)
     if not group:
         return
-    
     message = update.message
-    
+
     try:
-        # Delete join/leave messages
-        if group["delete_join_leave"]:
-            if message.new_chat_members or message.left_chat_member:
-                await context.bot.delete_message(update.effective_chat.id, message.message_id)
-                return
-        
-        # Check filtered words
+        if group["delete_join_leave"] and (message.new_chat_members or message.left_chat_member):
+            await context.bot.delete_message(update.effective_chat.id, message.message_id)
+            return
+
         if message.text:
             text_lower = message.text.lower()
             filtered_words = await get_filtered_words(group_id)
-            
             for word in filtered_words:
                 if word in text_lower:
                     await context.bot.delete_message(update.effective_chat.id, message.message_id)
-                    # Optionally warn the user
-                    try:
-                        warning = await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=f"⚠️ Message deleted: Contains filtered word '{word}'"
-                        )
-                        # Delete warning after 5 seconds
-                        await asyncio.sleep(5)
-                        await context.bot.delete_message(update.effective_chat.id, warning.message_id)
-                    except Exception as e:
-                        logger.error(f"Error sending/deleting warning: {e}")
+                    warning = await context.bot.send_message(
+                        update.effective_chat.id,
+                        f"Message deleted: Contains filtered word '{word}'"
+                    )
+                    await asyncio.sleep(5)
+                    await context.bot.delete_message(update.effective_chat.id, warning.message_id)
                     return
-        
-        # Delete links
+
         if group["delete_links"]:
-            if message.text:
-                url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*$$$$,]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
-                if re.search(url_pattern, message.text):
-                    await context.bot.delete_message(update.effective_chat.id, message.message_id)
-                    return
-            
+            if message.text and re.search(r'http[s]?://', message.text):
+                await context.bot.delete_message(update.effective_chat.id, message.message_id)
+                return
             if message.entities:
                 for entity in message.entities:
                     if entity.type in ["url", "text_link"]:
                         await context.bot.delete_message(update.effective_chat.id, message.message_id)
                         return
-        
-        # Delete promotions
+
         if group["delete_promotions"]:
             if message.forward_from or message.forward_from_chat:
                 await context.bot.delete_message(update.effective_chat.id, message.message_id)
                 return
-            
             if message.text:
-                promo_keywords = ["join", "channel", "group", "subscribe", "follow", "t.me"]
-                text_lower = message.text.lower()
-                for keyword in promo_keywords:
-                    if keyword in text_lower:
-                        await context.bot.delete_message(update.effective_chat.id, message.message_id)
-                        return
-    
+                promo = ["join", "channel", "group", "subscribe", "follow", "t.me"]
+                if any(k in text_lower for k in promo):
+                    await context.bot.delete_message(update.effective_chat.id, message.message_id)
+                    return
     except Exception as e:
-        logger.error(f"Error handling message: {e}")
+        logger.error(f"Message handling error: {e}")
 
+# === FILTER COMMANDS ===
+async def filter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /filter <word>")
+        return
+    word = " ".join(context.args).lower()
+    user_id = str(update.message.from_user.id)
+    groups = await get_user_groups(user_id)
+    if not groups:
+        await update.message.reply_text("No groups. Add one first!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Add Group", callback_data="add_group")]]))
+        return
+    group_id = groups[0]['group_id']
+    if word not in await get_filtered_words(group_id):
+        if await add_filtered_word(group_id, word):
+            await update.message.reply_text(f"Added '{word}' to filters.")
+        else:
+            await update.message.reply_text("Failed to add word.")
+    else:
+        await update.message.reply_text(f"'{word}' already filtered.")
+
+async def unfilter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /unfilter <word>")
+        return
+    word = " ".join(context.args).lower()
+    user_id = str(update.message.from_user.id)
+    groups = await get_user_groups(user_id)
+    if not groups:
+        await update.message.reply_text("No groups.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Add Group", callback_data="add_group")]]))
+        return
+    group_id = groups[0]['group_id']
+    if word in await get_filtered_words(group_id):
+        if await remove_filtered_word(group_id, word):
+            await update.message.reply_text(f"Removed '{word}'.")
+        else:
+            await update.message.reply_text("Failed to remove.")
+    else:
+        await update.message.reply_text(f"'{word}' not filtered.")
+
+async def list_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user.id)
+    groups = await get_user_groups(user_id)
+    if not groups:
+        await update.message.reply_text("No groups.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Add Group", callback_data="add_group")]]))
+        return
+    words = await get_filtered_words(groups[0]['group_id'])
+    if words:
+        text = f"Filtered words:\n\n" + "\n".join([f"• {w}" for w in words]) + f"\n\nTotal: {len(words)}"
+    else:
+        text = "No filtered words.\nUse /filter <word>"
+    await update.message.reply_text(text)
+
+async def mygroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await button_callback(update, context)  # Reuse logic
+
+async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await button_callback(update, context)  # Reuse logic
+
+# === BAN COMMAND ===
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("Use in groups only.")
+        return
+    group_id = str(update.effective_chat.id)
+    group = await get_group(group_id)
+    if not group:
+        return
+    try:
+        member = await context.bot.get_chat_member(update.effective_chat.id, update.message.from_user.id)
+        if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+            await update.message.reply_text("Admins only!")
+            await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
+            return
+    except Exception as e:
+        logger.error(f"Admin check failed: {e}")
+        return
+
+    user_to_ban = None
+    if update.message.reply_to_message:
+        user_to_ban = update.message.reply_to_message.from_user.id
+    elif context.args:
+        username = context.args[0].lstrip("@")
+        try:
+            chat = await context.bot.get_chat(f"@{username}")
+            user_to_ban = chat.id
+        except Exception:
+            await update.message.reply_text("User not found.")
+            return
+    else:
+        await update.message.reply_text("Reply to a message or use /ban @username")
+        return
+
+    try:
+        await context.bot.ban_chat_member(update.effective_chat.id, user_to_ban)
+        await add_banned_user(group_id, user_to_ban)
+        msg = await update.message.reply_text("User banned.")
+        await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
+        await asyncio.sleep(5)
+        await context.bot.delete_message(update.effective_chat.id, msg.message_id)
+    except Exception as e:
+        logger.error(f"Ban failed: {e}")
+        await update.message.reply_text("Failed to ban.")
+
+# === WEBHOOK ===
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
@@ -950,47 +627,20 @@ async def process_update_safe(app_instance, update):
     try:
         await app_instance.process_update(update)
     except Exception as e:
-        logger.error(f"Error processing update: {e}")
+        logger.error(f"Update error: {e}")
 
 @app.get("/")
 async def root():
-    return {
-        "status": "Bot is running",
-        "bot": "Group Manager Bot",
-        "bot_username": BOT_USERNAME,
-        "add_to_group": f"https://t.me/{BOT_USERNAME}?startgroup=true"
-    }
-
-@app.get("/setwebhook")
-async def set_webhook():
-    try:
-        app_instance = await get_application()
-        webhook_url = f"{WEBHOOK_URL}/webhook"
-        await app_instance.bot.set_webhook(webhook_url)
-        return {"status": "Webhook set", "url": webhook_url}
-    except Exception as e:
-        logger.error(f"Error setting webhook: {e}")
-        return {"status": "Failed", "error": str(e)}
+    return {"status": "Bot running", "bot_username": BOT_USERNAME}
 
 @app.get("/health")
 async def health_check():
     try:
         supabase.table("groups").select("count").limit(1).execute()
-        return {"status": "healthy", "database": "connected", "pending": len(pending_groups)}
+        return {"status": "healthy", "pending": len(pending_groups)}
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
         return {"status": "unhealthy", "error": str(e)}
 
 @app.get("/pending")
 async def get_pending():
-    return {"pending_groups": pending_groups, "count": len(pending_groups)}
-
-@app.get("/deletewebhook")
-async def delete_webhook():
-    try:
-        app_instance = await get_application()
-        await app_instance.bot.delete_webhook()
-        return {"status": "Webhook deleted"}
-    except Exception as e:
-        logger.error(f"Error deleting webhook: {e}")
-        return {"status": "Failed", "error": str(e)}
+    return {"pending": pending_groups, "count": len(pending_groups)}
