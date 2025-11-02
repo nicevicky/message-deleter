@@ -83,7 +83,7 @@ async def get_application():
         
         application = builder.build()
         
-        # Register handlers (NO ConversationHandler)
+        # Register handlers
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("mygroups", mygroups))
         application.add_handler(CommandHandler("settings", settings))
@@ -96,7 +96,11 @@ async def get_application():
         application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot_added_to_group))
         application.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, verify_forwarded_message))
         application.add_handler(MessageHandler(filters.ChatType.PRIVATE, handle_private_message))
-        application.add_handler(MessageHandler(filters.ChatType.GROUPS | filters.ChatType.SUPERGROUPS, handle_group_message))
+        # Fixed: SUPERGROUPS → SUPERGROUP
+        application.add_handler(MessageHandler(
+            filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP,
+            handle_group_message
+        ))
         
         application.add_error_handler(error_handler)
         
@@ -458,6 +462,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
 # === GROUP MESSAGE HANDLER ===
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Skip private chats
     if update.effective_chat.type == "private":
         return
     group_id = str(update.effective_chat.id)
@@ -467,10 +472,12 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     message = update.message
 
     try:
+        # Delete join/leave
         if group["delete_join_leave"] and (message.new_chat_members or message.left_chat_member):
             await context.bot.delete_message(update.effective_chat.id, message.message_id)
             return
 
+        # Filter words
         if message.text:
             text_lower = message.text.lower()
             filtered_words = await get_filtered_words(group_id)
@@ -485,6 +492,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     await context.bot.delete_message(update.effective_chat.id, warning.message_id)
                     return
 
+        # Delete links
         if group["delete_links"]:
             if message.text and re.search(r'http[s]?://', message.text):
                 await context.bot.delete_message(update.effective_chat.id, message.message_id)
@@ -495,6 +503,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                         await context.bot.delete_message(update.effective_chat.id, message.message_id)
                         return
 
+        # Delete promotions
         if group["delete_promotions"]:
             if message.forward_from or message.forward_from_chat:
                 await context.bot.delete_message(update.effective_chat.id, message.message_id)
@@ -560,10 +569,10 @@ async def list_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 async def mygroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await button_callback(update, context)  # Reuse logic
+    await button_callback(update, context)
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await button_callback(update, context)  # Reuse logic
+    await button_callback(update, context)
 
 # === BAN COMMAND ===
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
