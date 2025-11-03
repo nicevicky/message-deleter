@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
+from mangum import Mangum
 import os
 import asyncio
-import aiohttp
+import httpx
 from typing import Optional
 
 app = FastAPI()
@@ -16,26 +17,25 @@ async def delete_message_after_delay(chat_id: int, message_id: int, delay: int =
     """Delete a message after specified delay (in seconds)"""
     await asyncio.sleep(delay)
     
-    async with aiohttp.ClientSession() as session:
+    async with httpx.AsyncClient() as client:
         delete_url = f"{TELEGRAM_API_URL}/deleteMessage"
         params = {
             "chat_id": chat_id,
             "message_id": message_id
         }
         try:
-            async with session.post(delete_url, json=params) as response:
-                if response.status == 200:
-                    print(f"Message {message_id} deleted successfully")
-                else:
-                    error_text = await response.text()
-                    print(f"Failed to delete message: {error_text}")
+            response = await client.post(delete_url, json=params)
+            if response.status_code == 200:
+                print(f"Message {message_id} deleted successfully")
+            else:
+                print(f"Failed to delete message: {response.text}")
         except Exception as e:
             print(f"Error deleting message: {str(e)}")
 
 
 async def send_welcome_message(chat_id: int, username: str, first_name: str):
     """Send welcome message and schedule deletion"""
-    async with aiohttp.ClientSession() as session:
+    async with httpx.AsyncClient() as client:
         # Create welcome message
         display_name = f"@{username}" if username else first_name
         welcome_text = f"Welcome {display_name}! 👋"
@@ -48,18 +48,17 @@ async def send_welcome_message(chat_id: int, username: str, first_name: str):
         }
         
         try:
-            async with session.post(send_url, json=params) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    message_id = result["result"]["message_id"]
-                    print(f"Welcome message sent: {message_id}")
-                    
-                    # Schedule deletion after 3 seconds
-                    asyncio.create_task(delete_message_after_delay(chat_id, message_id, 3))
-                    return message_id
-                else:
-                    error_text = await response.text()
-                    print(f"Failed to send message: {error_text}")
+            response = await client.post(send_url, json=params)
+            if response.status_code == 200:
+                result = response.json()
+                message_id = result["result"]["message_id"]
+                print(f"Welcome message sent: {message_id}")
+                
+                # Schedule deletion after 3 seconds
+                asyncio.create_task(delete_message_after_delay(chat_id, message_id, 3))
+                return message_id
+            else:
+                print(f"Failed to send message: {response.text}")
         except Exception as e:
             print(f"Error sending message: {str(e)}")
     
@@ -87,6 +86,16 @@ async def handle_left_member(chat_id: int, left_message_id: int):
 @app.get("/")
 async def root():
     """Root endpoint"""
+    return {
+        "status": "Bot is running",
+        "bot": "Telegram Join/Leave Message Handler",
+        "version": "1.0.0"
+    }
+
+
+@app.get("/api")
+async def api_root():
+    """API root endpoint"""
     return {
         "status": "Bot is running",
         "bot": "Telegram Join/Leave Message Handler",
@@ -154,7 +163,7 @@ async def set_webhook(request: Request):
     base_url = str(request.base_url).rstrip('/')
     webhook_url = f"{base_url}/webhook"
     
-    async with aiohttp.ClientSession() as session:
+    async with httpx.AsyncClient() as client:
         set_webhook_url = f"{TELEGRAM_API_URL}/setWebhook"
         params = {
             "url": webhook_url,
@@ -162,9 +171,9 @@ async def set_webhook(request: Request):
         }
         
         try:
-            async with session.post(set_webhook_url, json=params) as response:
-                result = await response.json()
-                return result
+            response = await client.post(set_webhook_url, json=params)
+            result = response.json()
+            return result
         except Exception as e:
             return {"error": str(e)}
 
@@ -176,16 +185,16 @@ async def webhook_info():
     if not BOT_TOKEN:
         return {"error": "BOT_TOKEN not configured"}
     
-    async with aiohttp.ClientSession() as session:
+    async with httpx.AsyncClient() as client:
         info_url = f"{TELEGRAM_API_URL}/getWebhookInfo"
         
         try:
-            async with session.get(info_url) as response:
-                result = await response.json()
-                return result
+            response = await client.get(info_url)
+            result = response.json()
+            return result
         except Exception as e:
             return {"error": str(e)}
 
 
-# Vercel serverless function handler
-handler = app
+# Mangum handler for Vercel
+handler = Mangum(app)
