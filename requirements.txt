@@ -1,4 +1,3 @@
 fastapi
+aiohttp
 uvicorn
-httpx
-pydantic
