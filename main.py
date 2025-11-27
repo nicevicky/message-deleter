@@ -1,405 +1,550 @@
-# api/index.py
 import os
-import json
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember, ChatMemberAdministrator
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ChatMemberHandler,
+    filters,
+    ContextTypes,
+)
+from telegram.constants import ChatType, ChatMemberStatus
+from supabase import create_client, Client
+from dotenv import load_dotenv
 import re
-from fastapi import FastAPI, Request
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from telegram.constants import ChatMemberStatus
 
-app = FastAPI()
+# Load environment variables
+load_dotenv()
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-DATA_FILE = "/tmp/settings.json"
+# Initialize Supabase
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# Initialize bot application
-application = Application.builder().token(BOT_TOKEN).build()
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Load/Save JSON data
-def load_data():
+# Database helper functions
+async def init_database():
+    """Initialize database tables if they don't exist"""
     try:
-        with open(DATA_FILE, 'r') as f:
-            return json.load(f)
-    except:
-        return {"groups": {}, "user_groups": {}}
+        # Groups table
+        supabase.table('groups').select("*").limit(1).execute()
+    except Exception as e:
+        logger.info("Creating database schema...")
+        # Tables should be created in Supabase dashboard with following structure:
+        # groups: id (bigint), chat_id (bigint), chat_title (text), added_by (bigint), added_by_username (text), bot_is_admin (boolean), delete_promotions (boolean), created_at (timestamp)
+        # banned_words: id (serial), chat_id (bigint), word (text), added_by (bigint), created_at (timestamp)
+        # group_admins: id (serial), chat_id (bigint), user_id (bigint), username (text), created_at (timestamp)
 
-def save_data(data):
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username: str, bot_is_admin: bool):
+    """Add a group to the database"""
+    try:
+        data = {
+            "chat_id": chat_id,
+            "chat_title": chat_title,
+            "added_by": added_by,
+            "added_by_username": username,
+            "bot_is_admin": bot_is_admin,
+            "delete_promotions": False
+        }
+        result = supabase.table('groups').upsert(data, on_conflict='chat_id').execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error adding group to DB: {e}")
+        return None
 
-# Start command
+async def get_user_groups(user_id: int):
+    """Get all groups added by a specific user"""
+    try:
+        result = supabase.table('groups').select("*").eq('added_by', user_id).execute()
+        return result.data
+    except Exception as e:
+        logger.error(f"Error getting user groups: {e}")
+        return []
+
+async def get_group_settings(chat_id: int):
+    """Get group settings"""
+    try:
+        result = supabase.table('groups').select("*").eq('chat_id', chat_id).execute()
+        if result.data:
+            return result.data[0]
+        return None
+    except Exception as e:
+        logger.error(f"Error getting group settings: {e}")
+        return None
+
+async def add_banned_word(chat_id: int, word: str, added_by: int):
+    """Add a banned word for a group"""
+    try:
+        data = {
+            "chat_id": chat_id,
+            "word": word.lower(),
+            "added_by": added_by
+        }
+        result = supabase.table('banned_words').insert(data).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error adding banned word: {e}")
+        return None
+
+async def remove_banned_word(chat_id: int, word: str):
+    """Remove a banned word for a group"""
+    try:
+        result = supabase.table('banned_words').delete().eq('chat_id', chat_id).eq('word', word.lower()).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error removing banned word: {e}")
+        return None
+
+async def get_banned_words(chat_id: int):
+    """Get all banned words for a group"""
+    try:
+        result = supabase.table('banned_words').select("word").eq('chat_id', chat_id).execute()
+        return [item['word'] for item in result.data]
+    except Exception as e:
+        logger.error(f"Error getting banned words: {e}")
+        return []
+
+async def update_promotion_setting(chat_id: int, delete_promotions: bool):
+    """Update promotion deletion setting"""
+    try:
+        result = supabase.table('groups').update({"delete_promotions": delete_promotions}).eq('chat_id', chat_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error updating promotion setting: {e}")
+        return None
+
+# Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome to Group Manager Bot!\n\n"
-        "Features:\n"
-        "✅ Delete join/leave messages\n"
-        "✅ Filter banned words\n"
-        "✅ Control links & promotions\n"
-        "✅ Ban users\n\n"
-        "Setup:\n"
-        "1. Add me to your group\n"
-        "2. Make me admin (delete messages & ban users)\n"
-        "3. Use /mygroups to see your groups\n"
-        "4. Use /settings to configure"
-    )
-
-# Bot added to group
-async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.new_chat_members:
-        for member in update.message.new_chat_members:
-            if member.id == context.bot.id:
-                data = load_data()
-                group_id = str(update.effective_chat.id)
-                group_name = update.effective_chat.title
-                admin_id = str(update.message.from_user.id)
-                
-                data["groups"][group_id] = {
-                    "group_name": group_name,
-                    "admin_user_id": admin_id,
-                    "settings": {
-                        "delete_join_leave": True,
-                        "delete_links": False,
-                        "delete_promotions": False
-                    },
-                    "filtered_words": ["scam", "fuck"],
-                    "banned_users": []
-                }
-                
-                if admin_id not in data["user_groups"]:
-                    data["user_groups"][admin_id] = []
-                data["user_groups"][admin_id].append(group_id)
-                
-                save_data(data)
-                
-                try:
-                    await context.bot.send_message(
-                        chat_id=admin_id,
-                        text=f"✅ I've been added to '{group_name}'!\nUse /settings to configure me."
-                    )
-                except:
-                    pass
-
-# My groups command
-async def mygroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    user_id = str(update.message.from_user.id)
-    
-    if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
-        await update.message.reply_text("You don't have any groups with this bot yet.")
-        return
-    
-    text = "📋 Your Groups:\n\n"
-    for group_id in data["user_groups"][user_id]:
-        if group_id in data["groups"]:
-            text += f"• {data['groups'][group_id]['group_name']}\n"
-    
-    await update.message.reply_text(text)
-
-# Settings command
-async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    user_id = str(update.message.from_user.id)
-    
-    if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
-        await update.message.reply_text("No groups found. Add me to a group first!")
-        return
-    
-    group_id = data["user_groups"][user_id][0]
-    group = data["groups"][group_id]
+    """Handle /start command"""
+    user = update.effective_user
     
     keyboard = [
-        [InlineKeyboardButton(
-            f"🗑️ Join/Leave: {'✅' if group['settings']['delete_join_leave'] else '❌'}",
-            callback_data=f"toggle_join_leave_{group_id}"
-        )],
-        [InlineKeyboardButton(
-            f"🔗 Delete Links: {'✅' if group['settings']['delete_links'] else '❌'}",
-            callback_data=f"toggle_links_{group_id}"
-        )],
-        [InlineKeyboardButton(
-            f"📢 Delete Promotions: {'✅' if group['settings']['delete_promotions'] else '❌'}",
-            callback_data=f"toggle_promotions_{group_id}"
-        )]
+        [InlineKeyboardButton("➕ Add Bot to Group", url=f"https://t.me/{context.bot.username}?startgroup=true")],
+        [InlineKeyboardButton("📋 My Groups", callback_data="my_groups")],
+        [InlineKeyboardButton("❓ Help", callback_data="help")]
     ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    filtered = ", ".join(group['filtered_words'])
-    text = f"⚙️ Settings for '{group['group_name']}'\n\n"
-    text += f"Filtered words: {filtered}\n\n"
-    text += "Use /filter <word> to add\nUse /unfilter <word> to remove\nUse /listfilters to view all"
-    
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    welcome_text = f"""
+👋 Welcome {user.mention_html()}!
 
-# Toggle settings callback
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+I'm a powerful group moderation bot that helps you:
+
+✅ Delete messages with banned words
+✅ Send welcome messages to new members
+✅ Delete promotional/forwarded messages
+✅ Keep your group clean and organized
+
+🚀 Get started by adding me to your group!
+
+⚠️ Make sure:
+• You are an admin in the group
+• I am made an admin with "Delete Messages" permission
+    """
+    
+    await update.message.reply_html(welcome_text, reply_markup=reply_markup)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
+    help_text = """
+📚 <b>Bot Commands & Features</b>
+
+<b>Commands (Use in private chat):</b>
+/start - Start the bot and see main menu
+/mygroups - View your groups
+/help - Show this help message
+
+<b>How to use:</b>
+1️⃣ Add me to your group as admin
+2️⃣ Click "My Groups" to manage settings
+3️⃣ Add banned words for each group
+4️⃣ Enable/disable promotional message deletion
+
+<b>Features:</b>
+• Automatic message deletion for banned words
+• Welcome new members with personalized messages
+• Delete promotional/forwarded messages
+• Works with anonymous admins
+
+<b>Support:</b>
+If you need help, contact the bot developer.
+    """
+    
+    if update.message:
+        await update.message.reply_html(help_text)
+    else:
+        await update.callback_query.message.edit_text(help_text, parse_mode='HTML')
+
+async def my_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user's groups"""
+    user_id = update.effective_user.id
+    groups = await get_user_groups(user_id)
+    
+    if not groups:
+        text = "❌ You haven't added me to any groups yet!\n\nClick the button below to add me to a group."
+        keyboard = [[InlineKeyboardButton("➕ Add to Group", url=f"https://t.me/{context.bot.username}?startgroup=true")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+    else:
+        text = "📋 <b>Your Groups:</b>\n\nSelect a group to manage settings:"
+        keyboard = []
+        for group in groups:
+            keyboard.append([InlineKeyboardButton(
+                f"🔧 {group['chat_title']}", 
+                callback_data=f"group_settings_{group['chat_id']}"
+            )])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_main")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    else:
+        await update.message.reply_html(text, reply_markup=reply_markup)
+
+async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show group settings"""
     query = update.callback_query
     await query.answer()
     
-    data = load_data()
-    callback_data = query.data
+    chat_id = int(query.data.split("_")[2])
+    settings = await get_group_settings(chat_id)
     
-    if callback_data.startswith("toggle_"):
-        parts = callback_data.split("_")
-        setting = "_".join(parts[1:-1])
-        group_id = parts[-1]
-        
-        if group_id in data["groups"]:
-            if setting == "join_leave":
-                data["groups"][group_id]["settings"]["delete_join_leave"] = not data["groups"][group_id]["settings"]["delete_join_leave"]
-            elif setting == "links":
-                data["groups"][group_id]["settings"]["delete_links"] = not data["groups"][group_id]["settings"]["delete_links"]
-            elif setting == "promotions":
-                data["groups"][group_id]["settings"]["delete_promotions"] = not data["groups"][group_id]["settings"]["delete_promotions"]
-            
-            save_data(data)
-            
-            group = data["groups"][group_id]
-            keyboard = [
-                [InlineKeyboardButton(
-                    f"🗑️ Join/Leave: {'✅' if group['settings']['delete_join_leave'] else '❌'}",
-                    callback_data=f"toggle_join_leave_{group_id}"
-                )],
-                [InlineKeyboardButton(
-                    f"🔗 Delete Links: {'✅' if group['settings']['delete_links'] else '❌'}",
-                    callback_data=f"toggle_links_{group_id}"
-                )],
-                [InlineKeyboardButton(
-                    f"📢 Delete Promotions: {'✅' if group['settings']['delete_promotions'] else '❌'}",
-                    callback_data=f"toggle_promotions_{group_id}"
-                )]
-            ]
-            
-            filtered = ", ".join(group['filtered_words'])
-            text = f"⚙️ Settings for '{group['group_name']}'\n\n"
-            text += f"Filtered words: {filtered}\n\n"
-            text += "Use /filter <word> to add\nUse /unfilter <word> to remove\nUse /listfilters to view all"
-            
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    if not settings:
+        await query.message.edit_text("❌ Group not found!")
+        return
+    
+    banned_words = await get_banned_words(chat_id)
+    banned_words_text = ", ".join(banned_words) if banned_words else "None"
+    
+    promo_status = "✅ Enabled" if settings.get('delete_promotions', False) else "❌ Disabled"
+    
+    text = f"""
+⚙️ <b>Group Settings</b>
 
-# Filter command
-async def filter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /filter <word>")
+📱 Group: {settings['chat_title']}
+👤 Added by: @{settings['added_by_username']}
+
+🚫 <b>Banned Words:</b>
+{banned_words_text}
+
+🔗 <b>Delete Promotions:</b> {promo_status}
+    """
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Banned Word", callback_data=f"add_word_{chat_id}")],
+        [InlineKeyboardButton("➖ Remove Banned Word", callback_data=f"remove_word_{chat_id}")],
+        [InlineKeyboardButton("📋 View All Banned Words", callback_data=f"view_words_{chat_id}")],
+        [InlineKeyboardButton(
+            "🔗 Toggle Promotion Deletion", 
+            callback_data=f"toggle_promo_{chat_id}"
+        )],
+        [InlineKeyboardButton("🔙 Back to Groups", callback_data="my_groups")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
+async def add_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle add banned word"""
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = int(query.data.split("_")[2])
+    context.user_data['awaiting_word'] = chat_id
+    context.user_data['action'] = 'add'
+    
+    text = "✍️ Please send the word you want to ban in this group.\n\n💡 Send /cancel to cancel."
+    await query.message.edit_text(text)
+
+async def remove_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle remove banned word"""
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = int(query.data.split("_")[2])
+    banned_words = await get_banned_words(chat_id)
+    
+    if not banned_words:
+        await query.answer("No banned words to remove!", show_alert=True)
         return
     
-    word = context.args[0].lower()
-    data = load_data()
-    user_id = str(update.message.from_user.id)
+    context.user_data['awaiting_word'] = chat_id
+    context.user_data['action'] = 'remove'
     
-    if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
-        await update.message.reply_text("No groups found!")
-        return
+    text = f"✍️ Current banned words:\n{', '.join(banned_words)}\n\nSend the word you want to remove.\n\n💡 Send /cancel to cancel."
+    await query.message.edit_text(text)
+
+async def view_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View all banned words"""
+    query = update.callback_query
+    await query.answer()
     
-    group_id = data["user_groups"][user_id][0]
+    chat_id = int(query.data.split("_")[2])
+    banned_words = await get_banned_words(chat_id)
     
-    if word not in data["groups"][group_id]["filtered_words"]:
-        data["groups"][group_id]["filtered_words"].append(word)
-        save_data(data)
-        await update.message.reply_text(f"✅ Added '{word}' to filtered words")
+    if not banned_words:
+        text = "📝 No banned words set for this group."
     else:
-        await update.message.reply_text(f"'{word}' is already filtered")
+        words_list = "\n".join([f"• {word}" for word in banned_words])
+        text = f"🚫 <b>Banned Words:</b>\n\n{words_list}"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data=f"group_settings_{chat_id}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
-# Unfilter command
-async def unfilter_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /unfilter <word>")
-        return
+async def toggle_promo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle promotion deletion"""
+    query = update.callback_query
+    await query.answer()
     
-    word = context.args[0].lower()
-    data = load_data()
-    user_id = str(update.message.from_user.id)
+    chat_id = int(query.data.split("_")[2])
+    settings = await get_group_settings(chat_id)
     
-    if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
-        await update.message.reply_text("No groups found!")
-        return
+    new_value = not settings.get('delete_promotions', False)
+    await update_promotion_setting(chat_id, new_value)
     
-    group_id = data["user_groups"][user_id][0]
+    status = "enabled" if new_value else "disabled"
+    await query.answer(f"Promotion deletion {status}!", show_alert=True)
     
-    if word in data["groups"][group_id]["filtered_words"]:
-        data["groups"][group_id]["filtered_words"].remove(word)
-        save_data(data)
-        await update.message.reply_text(f"✅ Removed '{word}' from filtered words")
-    else:
-        await update.message.reply_text(f"'{word}' is not in filtered words")
+    # Refresh settings page
+    await group_settings_handler(update, context)
 
-# List filters command
-async def list_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    user_id = str(update.message.from_user.id)
-    
-    if user_id not in data["user_groups"] or not data["user_groups"][user_id]:
-        await update.message.reply_text("No groups found!")
+async def handle_word_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle word input for add/remove"""
+    if 'awaiting_word' not in context.user_data:
         return
     
-    group_id = data["user_groups"][user_id][0]
-    filtered = data["groups"][group_id]["filtered_words"]
+    chat_id = context.user_data['awaiting_word']
+    action = context.user_data['action']
+    word = update.message.text.strip().lower()
     
-    if filtered:
-        text = "📝 Filtered words:\n" + "\n".join([f"• {word}" for word in filtered])
-    else:
-        text = "No filtered words yet"
+    if action == 'add':
+        await add_banned_word(chat_id, word, update.effective_user.id)
+        text = f"✅ Word '<b>{word}</b>' added to banned words!"
+    else:  # remove
+        await remove_banned_word(chat_id, word)
+        text = f"✅ Word '<b>{word}</b>' removed from banned words!"
     
-    await update.message.reply_text(text)
+    # Clear user data
+    del context.user_data['awaiting_word']
+    del context.user_data['action']
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back to Settings", callback_data=f"group_settings_{chat_id}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_html(text, reply_markup=reply_markup)
 
-# Ban command
-async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("This command only works in groups!")
-        return
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel current operation"""
+    if 'awaiting_word' in context.user_data:
+        del context.user_data['awaiting_word']
+        del context.user_data['action']
     
-    data = load_data()
-    group_id = str(update.effective_chat.id)
-    
-    if group_id not in data["groups"]:
-        return
-    
-    # Check if user is admin
-    member = await context.bot.get_chat_member(update.effective_chat.id, update.message.from_user.id)
-    if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-        await update.message.reply_text("Only admins can use this command!")
-        await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-        return
-    
-    user_to_ban = None
-    
-    # Check if replying to a message
-    if update.message.reply_to_message:
-        user_to_ban = update.message.reply_to_message.from_user.id
-    # Check if username provided
-    elif context.args:
-            username = context.args[0].replace("@", "")
-        try:
-            chat = await context.bot.get_chat(f"@{username}")
-            user_to_ban = chat.id
-        except:
-            await update.message.reply_text("User not found!")
-            await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-            return
-    else:
-        await update.message.reply_text("Usage: /ban @username or reply to a message with /ban")
-        await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-        return
-    
-    try:
-        await context.bot.ban_chat_member(update.effective_chat.id, user_to_ban)
-        data["groups"][group_id]["banned_users"].append(user_to_ban)
-        save_data(data)
-        await update.message.reply_text("✅ User has been banned")
-        await context.bot.delete_message(update.effective_chat.id, update.message.message_id)
-    except Exception as e:
-        await update.message.reply_text(f"Failed to ban user: {str(e)}")
+    await update.message.reply_text("✅ Operation cancelled.")
 
-# Handle all group messages
-async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        return
-    
-    data = load_data()
-    group_id = str(update.effective_chat.id)
-    
-    if group_id not in data["groups"]:
-        return
-    
-    group = data["groups"][group_id]
+# Group handlers
+async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle new members joining the group"""
     message = update.message
+    chat = message.chat
     
-    try:
-        # Delete join/leave messages
-        if group["settings"]["delete_join_leave"]:
-            if message.new_chat_members or message.left_chat_member:
-                await context.bot.delete_message(update.effective_chat.id, message.message_id)
-                return
-        
-        # Check filtered words
-        if message.text:
-            text_lower = message.text.lower()
-            for word in group["filtered_words"]:
-                if word in text_lower:
-                    await context.bot.delete_message(update.effective_chat.id, message.message_id)
-                    return
-        
-        # Delete links
-        if group["settings"]["delete_links"]:
-            if message.text:
-                url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
-                if re.search(url_pattern, message.text):
-                    await context.bot.delete_message(update.effective_chat.id, message.message_id)
-                    return
+    for new_member in message.new_chat_members:
+        # If the bot was added
+        if new_member.id == context.bot.id:
+            added_by = message.from_user
             
-            if message.entities:
-                for entity in message.entities:
-                    if entity.type in ["url", "text_link"]:
-                        await context.bot.delete_message(update.effective_chat.id, message.message_id)
-                        return
-        
-        # Delete promotions
-        if group["settings"]["delete_promotions"]:
-            if message.forward_from or message.forward_from_chat:
-                await context.bot.delete_message(update.effective_chat.id, message.message_id)
+            # Check if the person adding is an admin
+            try:
+                member = await chat.get_member(added_by.id)
+                if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                    await message.reply_text("⚠️ Only group admins can add me!")
+                    await chat.leave()
+                    return
+            except Exception as e:
+                logger.error(f"Error checking admin status: {e}")
+                await chat.leave()
                 return
             
-            if message.text:
-                promo_keywords = ["join", "channel", "group", "subscribe", "follow", "t.me"]
-                text_lower = message.text.lower()
-                for keyword in promo_keywords:
-                    if keyword in text_lower:
-                        await context.bot.delete_message(update.effective_chat.id, message.message_id)
-                        return
-    
-    except Exception as e:
-        print(f"Error handling message: {e}")
+            # Check if bot is admin
+            try:
+                bot_member = await chat.get_member(context.bot.id)
+                bot_is_admin = bot_member.status == ChatMemberStatus.ADMINISTRATOR
+            except Exception:
+                bot_is_admin = False
+            
+            if not bot_is_admin:
+                await message.reply_text(
+                    "⚠️ Please make me an admin with 'Delete Messages' permission!\n\n"
+                    "I'll leave now, add me again after making me admin."
+                )
+                await chat.leave()
+                return
+            
+            # Add to database
+            username = added_by.username or f"user_{added_by.id}"
+            await add_group_to_db(chat.id, chat.title, added_by.id, username, bot_is_admin)
+            
+            welcome_text = f"""
+🎉 Thank you for adding me!
 
-# Register handlers
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("mygroups", mygroups))
-application.add_handler(CommandHandler("settings", settings))
-application.add_handler(CommandHandler("filter", filter_word))
-application.add_handler(CommandHandler("unfilter", unfilter_word))
-application.add_handler(CommandHandler("listfilters", list_filters))
-application.add_handler(CommandHandler("ban", ban_user))
-application.add_handler(CallbackQueryHandler(button_callback))
-application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot_added_to_group))
-application.add_handler(MessageHandler(filters.ALL, handle_group_message))
+✅ I'm now protecting this group!
 
-# FastAPI webhook endpoint
-@app.post("/webhook")
-async def webhook(request: Request):
-    try:
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.process_update(update)
-        return {"ok": True}
-    except Exception as e:
-        print(f"Webhook error: {e}")
-        return {"ok": False, "error": str(e)}
+👤 Added by: @{username}
 
-@app.get("/")
-async def root():
-    return {"status": "Bot is running", "bot": "Group Manager Bot"}
+⚙️ To configure settings, open a private chat with me and click "My Groups".
 
-@app.get("/setwebhook")
-async def set_webhook():
-    try:
-        webhook_url = f"{WEBHOOK_URL}/webhook"
-        await application.bot.set_webhook(webhook_url)
-        return {"status": "Webhook set", "url": webhook_url}
-    except Exception as e:
-        return {"status": "Failed", "error": str(e)}
-
-# Initialize application on startup
-@app.on_event("startup")
-async def startup():
-    await application.initialize()
-    await application.start()
-    # Set webhook
-    if WEBHOOK_URL:
-        webhook_url = f"{WEBHOOK_URL}/webhook"
-        await application.bot.set_webhook(webhook_url)
-
-@app.on_event("shutdown")
-async def shutdown():
-    await application.stop()
-    await application.shutdown()
-
+Features enabled:
+• Banned word filtering
+• Welcome messages for new members
+• Optional promotional message deletion
+            """
+            await message.reply_text(welcome_text)
         
+        # Welcome other new members
+        else:
+            username = new_member.username or new_member.first_name
+            welcome_text = f"""
+👋 Welcome {new_member.mention_html()} to {chat.title}!
+
+We're glad to have you here! 🎉
+            """
+            await message.reply_html(welcome_text)
+
+async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check messages for banned words and promotions"""
+    message = update.message
+    if not message or not message.text:
+        return
+    
+    chat = message.chat
+    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        return
+    
+    # Get group settings
+    settings = await get_group_settings(chat.id)
+    if not settings:
+        return
+    
+    # Check for forwarded/promotional messages
+    if settings.get('delete_promotions', False):
+        if message.forward_from or message.forward_from_chat or message.forward_sender_name:
+            try:
+                await message.delete()
+                username = message.from_user.username or message.from_user.first_name
+                warning = f"⚠️ @{username}, your forwarded message was deleted as promotional content is not allowed."
+                warning_msg = await chat.send_message(warning)
+                # Delete warning after 5 seconds
+                context.job_queue.run_once(
+                    lambda ctx: warning_msg.delete(),
+                    5,
+                    name=f"delete_warning_{warning_msg.message_id}"
+                )
+                return
+            except Exception as e:
+                logger.error(f"Error deleting promotional message: {e}")
+    
+    # Check for banned words
+    banned_words = await get_banned_words(chat.id)
+    if not banned_words:
+        return
+    
+    message_text = message.text.lower()
+    
+    # Check if message contains any banned word
+    for word in banned_words:
+        # Use word boundary matching to avoid partial matches
+        pattern = r'\b' + re.escape(word) + r'\b'
+        if re.search(pattern, message_text):
+            try:
+                await message.delete()
+                username = message.from_user.username or message.from_user.first_name
+                warning = f"⚠️ @{username}, your message was hidden because it contained a banned word."
+                warning_msg = await chat.send_message(warning)
+                # Delete warning after 5 seconds
+                context.job_queue.run_once(
+                    lambda ctx: warning_msg.delete(),
+                    5,
+                    name=f"delete_warning_{warning_msg.message_id}"
+                )
+                return
+            except Exception as e:
+                logger.error(f"Error deleting message with banned word: {e}")
+                return
+
+async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route callback queries"""
+    query = update.callback_query
+    data = query.data
+    
+    if data == "my_groups":
+        await my_groups_handler(update, context)
+    elif data == "help":
+        await help_command(update, context)
+    elif data == "back_to_main":
+        await start(update, context)
+    elif data.startswith("group_settings_"):
+        await group_settings_handler(update, context)
+    elif data.startswith("add_word_"):
+        await add_word_handler(update, context)
+    elif data.startswith("remove_word_"):
+        await remove_word_handler(update, context)
+    elif data.startswith("view_words_"):
+        await view_words_handler(update, context)
+    elif data.startswith("toggle_promo_"):
+        await toggle_promo_handler(update, context)
+
+# Main function
+def main():
+    """Start the bot"""
+    # Create application
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Command handlers
+    application.add_handler(CommandHandler("start", start, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("help", help_command, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("mygroups", my_groups_handler, filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("cancel", cancel_handler, filters.ChatType.PRIVATE))
+    
+    # Callback query handler
+    application.add_handler(CallbackQueryHandler(callback_query_router))
+    
+    # Message handlers for private chat (word input)
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+        handle_word_input
+    ))
+    
+    # Group message handlers
+    application.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS,
+        new_chat_member_handler
+    ))
+    
+    application.add_handler(MessageHandler(
+        filters.TEXT & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
+        check_message
+    ))
+    
+    # Start the bot
+    logger.info("Bot started!")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+# Vercel serverless handler
+async def handler(request):
+    """Handler for Vercel serverless function"""
+    # This is for webhook mode on Vercel
+    # You'll need to set up webhook after deployment
+    pass
+
+if __name__ == "__main__":
+    main()
