@@ -486,6 +486,9 @@ async def telegram_webhook(request: Request):
         logger.error(f"Error in webhook: {e}")
         return Response(status_code=500)
 
-@app.get("/")
+# FIX: Changed @app.get("/") to @app.api_route("/", methods=["GET", "POST"])
+# to allow POST requests (which Vercel often sends for health/ping checks)
+# and resolve the 405 errors.
+@app.api_route("/", methods=["GET", "POST"])
 async def health_check():
     return {"status": "ok", "message": "Bot is running"}
