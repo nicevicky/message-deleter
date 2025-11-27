@@ -1,7 +1,9 @@
 import os
 import logging
 from fastapi import FastAPI, Request, Response
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberStatus
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+# FIX: ChatMemberStatus is imported from telegram.constants in ptb v20+
+from telegram.constants import ChatType, ChatMemberStatus # Added ChatMemberStatus here
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -10,7 +12,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.constants import ChatType
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import re
@@ -328,6 +329,7 @@ async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_
             added_by = message.from_user
             try:
                 member = await chat.get_member(added_by.id)
+                # Use ChatMemberStatus imported from telegram.constants
                 if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
                     await message.reply_text("⚠️ Only group admins can add me!")
                     await chat.leave()
@@ -339,6 +341,7 @@ async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_
             
             try:
                 bot_member = await chat.get_member(context.bot.id)
+                # Use ChatMemberStatus imported from telegram.constants
                 bot_is_admin = bot_member.status == ChatMemberStatus.ADMINISTRATOR
             except Exception:
                 bot_is_admin = False
