@@ -1,3 +1,3 @@
-fastapi
-httpx
-mangum
+python-telegram-bot
+supabase
+python-dotenv
