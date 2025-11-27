@@ -1,16 +1,16 @@
 import os
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember, ChatMemberAdministrator
+from fastapi import FastAPI, Request, Response
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberStatus
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ChatMemberHandler,
-    filters,
     ContextTypes,
+    filters,
 )
-from telegram.constants import ChatType, ChatMemberStatus
+from telegram.constants import ChatType
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import re
@@ -32,18 +32,13 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Database helper functions
-async def init_database():
-    """Initialize database tables if they don't exist"""
-    try:
-        # Groups table
-        supabase.table('groups').select("*").limit(1).execute()
-    except Exception as e:
-        logger.info("Creating database schema...")
-        # Tables should be created in Supabase dashboard with following structure:
-        # groups: id (bigint), chat_id (bigint), chat_title (text), added_by (bigint), added_by_username (text), bot_is_admin (boolean), delete_promotions (boolean), created_at (timestamp)
-        # banned_words: id (serial), chat_id (bigint), word (text), added_by (bigint), created_at (timestamp)
-        # group_admins: id (serial), chat_id (bigint), user_id (bigint), username (text), created_at (timestamp)
+# Initialize FastAPI
+app = FastAPI()
+
+# Global variable to store the Telegram Application
+ptb_application = None
+
+# --- DATABASE HELPER FUNCTIONS ---
 
 async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username: str, bot_is_admin: bool):
     """Add a group to the database"""
@@ -123,7 +118,8 @@ async def update_promotion_setting(chat_id: int, delete_promotions: bool):
         logger.error(f"Error updating promotion setting: {e}")
         return None
 
-# Command handlers
+# --- BOT COMMAND HANDLERS ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user = update.effective_user
@@ -254,116 +250,82 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
     await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
 async def add_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle add banned word"""
     query = update.callback_query
     await query.answer()
-    
     chat_id = int(query.data.split("_")[2])
     context.user_data['awaiting_word'] = chat_id
     context.user_data['action'] = 'add'
-    
     text = "✍️ Please send the word you want to ban in this group.\n\n💡 Send /cancel to cancel."
     await query.message.edit_text(text)
 
 async def remove_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle remove banned word"""
     query = update.callback_query
     await query.answer()
-    
     chat_id = int(query.data.split("_")[2])
     banned_words = await get_banned_words(chat_id)
-    
     if not banned_words:
         await query.answer("No banned words to remove!", show_alert=True)
         return
-    
     context.user_data['awaiting_word'] = chat_id
     context.user_data['action'] = 'remove'
-    
     text = f"✍️ Current banned words:\n{', '.join(banned_words)}\n\nSend the word you want to remove.\n\n💡 Send /cancel to cancel."
     await query.message.edit_text(text)
 
 async def view_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """View all banned words"""
     query = update.callback_query
     await query.answer()
-    
     chat_id = int(query.data.split("_")[2])
     banned_words = await get_banned_words(chat_id)
-    
     if not banned_words:
         text = "📝 No banned words set for this group."
     else:
         words_list = "\n".join([f"• {word}" for word in banned_words])
         text = f"🚫 <b>Banned Words:</b>\n\n{words_list}"
-    
     keyboard = [[InlineKeyboardButton("🔙 Back", callback_data=f"group_settings_{chat_id}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
     await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
 
 async def toggle_promo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle promotion deletion"""
     query = update.callback_query
     await query.answer()
-    
     chat_id = int(query.data.split("_")[2])
     settings = await get_group_settings(chat_id)
-    
     new_value = not settings.get('delete_promotions', False)
     await update_promotion_setting(chat_id, new_value)
-    
     status = "enabled" if new_value else "disabled"
     await query.answer(f"Promotion deletion {status}!", show_alert=True)
-    
-    # Refresh settings page
     await group_settings_handler(update, context)
 
 async def handle_word_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle word input for add/remove"""
     if 'awaiting_word' not in context.user_data:
         return
-    
     chat_id = context.user_data['awaiting_word']
     action = context.user_data['action']
     word = update.message.text.strip().lower()
-    
     if action == 'add':
         await add_banned_word(chat_id, word, update.effective_user.id)
         text = f"✅ Word '<b>{word}</b>' added to banned words!"
-    else:  # remove
+    else: 
         await remove_banned_word(chat_id, word)
         text = f"✅ Word '<b>{word}</b>' removed from banned words!"
-    
-    # Clear user data
     del context.user_data['awaiting_word']
     del context.user_data['action']
-    
     keyboard = [[InlineKeyboardButton("🔙 Back to Settings", callback_data=f"group_settings_{chat_id}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
     await update.message.reply_html(text, reply_markup=reply_markup)
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel current operation"""
     if 'awaiting_word' in context.user_data:
         del context.user_data['awaiting_word']
         del context.user_data['action']
-    
     await update.message.reply_text("✅ Operation cancelled.")
 
-# Group handlers
 async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle new members joining the group"""
     message = update.message
     chat = message.chat
-    
     for new_member in message.new_chat_members:
-        # If the bot was added
         if new_member.id == context.bot.id:
             added_by = message.from_user
-            
-            # Check if the person adding is an admin
             try:
                 member = await chat.get_member(added_by.id)
                 if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
@@ -375,7 +337,6 @@ async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_
                 await chat.leave()
                 return
             
-            # Check if bot is admin
             try:
                 bot_member = await chat.get_member(context.bot.id)
                 bot_is_admin = bot_member.status == ChatMemberStatus.ADMINISTRATOR
@@ -390,7 +351,6 @@ async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_
                 await chat.leave()
                 return
             
-            # Add to database
             username = added_by.username or f"user_{added_by.id}"
             await add_group_to_db(chat.id, chat.title, added_by.id, username, bot_is_admin)
             
@@ -402,48 +362,32 @@ async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_
 👤 Added by: @{username}
 
 ⚙️ To configure settings, open a private chat with me and click "My Groups".
-
-Features enabled:
-• Banned word filtering
-• Welcome messages for new members
-• Optional promotional message deletion
             """
             await message.reply_text(welcome_text)
-        
-        # Welcome other new members
         else:
             username = new_member.username or new_member.first_name
-            welcome_text = f"""
-👋 Welcome {new_member.mention_html()} to {chat.title}!
-
-We're glad to have you here! 🎉
-            """
+            welcome_text = f"👋 Welcome {new_member.mention_html()} to {chat.title}!"
             await message.reply_html(welcome_text)
 
 async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check messages for banned words and promotions"""
     message = update.message
     if not message or not message.text:
         return
-    
     chat = message.chat
     if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
         return
     
-    # Get group settings
     settings = await get_group_settings(chat.id)
     if not settings:
         return
     
-    # Check for forwarded/promotional messages
     if settings.get('delete_promotions', False):
         if message.forward_from or message.forward_from_chat or message.forward_sender_name:
             try:
                 await message.delete()
                 username = message.from_user.username or message.from_user.first_name
-                warning = f"⚠️ @{username}, your forwarded message was deleted as promotional content is not allowed."
+                warning = f"⚠️ @{username}, your forwarded message was deleted."
                 warning_msg = await chat.send_message(warning)
-                # Delete warning after 5 seconds
                 context.job_queue.run_once(
                     lambda ctx: warning_msg.delete(),
                     5,
@@ -452,17 +396,13 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             except Exception as e:
                 logger.error(f"Error deleting promotional message: {e}")
-    
-    # Check for banned words
+
     banned_words = await get_banned_words(chat.id)
     if not banned_words:
         return
     
     message_text = message.text.lower()
-    
-    # Check if message contains any banned word
     for word in banned_words:
-        # Use word boundary matching to avoid partial matches
         pattern = r'\b' + re.escape(word) + r'\b'
         if re.search(pattern, message_text):
             try:
@@ -470,7 +410,6 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 username = message.from_user.username or message.from_user.first_name
                 warning = f"⚠️ @{username}, your message was hidden because it contained a banned word."
                 warning_msg = await chat.send_message(warning)
-                # Delete warning after 5 seconds
                 context.job_queue.run_once(
                     lambda ctx: warning_msg.delete(),
                     5,
@@ -482,10 +421,8 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
 async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Route callback queries"""
     query = update.callback_query
     data = query.data
-    
     if data == "my_groups":
         await my_groups_handler(update, context)
     elif data == "help":
@@ -503,48 +440,49 @@ async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TY
     elif data.startswith("toggle_promo_"):
         await toggle_promo_handler(update, context)
 
-# Main function
-def main():
-    """Start the bot"""
-    # Create application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Command handlers
-    application.add_handler(CommandHandler("start", start, filters.ChatType.PRIVATE))
-    application.add_handler(CommandHandler("help", help_command, filters.ChatType.PRIVATE))
-    application.add_handler(CommandHandler("mygroups", my_groups_handler, filters.ChatType.PRIVATE))
-    application.add_handler(CommandHandler("cancel", cancel_handler, filters.ChatType.PRIVATE))
-    
-    # Callback query handler
-    application.add_handler(CallbackQueryHandler(callback_query_router))
-    
-    # Message handlers for private chat (word input)
-    application.add_handler(MessageHandler(
-        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
-        handle_word_input
-    ))
-    
-    # Group message handlers
-    application.add_handler(MessageHandler(
-        filters.StatusUpdate.NEW_CHAT_MEMBERS,
-        new_chat_member_handler
-    ))
-    
-    application.add_handler(MessageHandler(
-        filters.TEXT & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
-        check_message
-    ))
-    
-    # Start the bot
-    logger.info("Bot started!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+# --- VERCEL / FASTAPI SETUP ---
 
-# Vercel serverless handler
-async def handler(request):
-    """Handler for Vercel serverless function"""
-    # This is for webhook mode on Vercel
-    # You'll need to set up webhook after deployment
-    pass
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the bot when the server starts"""
+    global ptb_application
+    if ptb_application is None:
+        ptb_application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-if __name__ == "__main__":
-    main()
+        # Add handlers
+        ptb_application.add_handler(CommandHandler("start", start, filters.ChatType.PRIVATE))
+        ptb_application.add_handler(CommandHandler("help", help_command, filters.ChatType.PRIVATE))
+        ptb_application.add_handler(CommandHandler("mygroups", my_groups_handler, filters.ChatType.PRIVATE))
+        ptb_application.add_handler(CommandHandler("cancel", cancel_handler, filters.ChatType.PRIVATE))
+        ptb_application.add_handler(CallbackQueryHandler(callback_query_router))
+        ptb_application.add_handler(MessageHandler(
+            filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+            handle_word_input
+        ))
+        ptb_application.add_handler(MessageHandler(
+            filters.StatusUpdate.NEW_CHAT_MEMBERS,
+            new_chat_member_handler
+        ))
+        ptb_application.add_handler(MessageHandler(
+            filters.TEXT & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
+            check_message
+        ))
+
+        await ptb_application.initialize()
+        await ptb_application.start()
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    """Handle incoming Telegram updates"""
+    try:
+        data = await request.json()
+        update = Update.de_json(data, ptb_application.bot)
+        await ptb_application.process_update(update)
+        return Response(status_code=200)
+    except Exception as e:
+        logger.error(f"Error in webhook: {e}")
+        return Response(status_code=500)
+
+@app.get("/")
+async def health_check():
+    return {"status": "ok", "message": "Bot is running"}
