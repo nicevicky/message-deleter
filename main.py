@@ -547,9 +547,12 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if settings.get('delete_promotions', False):
         is_promotion = False
         
-        # Check if forwarded from anywhere
-        if message.forward_from or message.forward_from_chat or message.forward_sender_name:
+        # --- FIXED CODE START ---
+        # Update for Python-Telegram-Bot v20+: Use forward_origin to detect forwards
+        # Old attributes like forward_from are removed.
+        if message.forward_origin:
             is_promotion = True
+        # --- FIXED CODE END ---
             
         # Check if sent via an inline bot
         if message.via_bot:
