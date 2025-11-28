@@ -3,9 +3,9 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Response
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 from telegram.constants import ChatType, ChatMemberStatus
-from telegram.error import BadRequest  # <--- Added Import
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -61,11 +61,13 @@ async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username
         
         # Default settings
         delete_promotions = False
+        delete_links = False  # <--- NEW DEFAULT
         warning_timer = 30
 
         # If group exists, use its current settings instead of defaults
         if existing_group:
             delete_promotions = existing_group.get('delete_promotions', False)
+            delete_links = existing_group.get('delete_links', False) # <--- PRESERVE SETTING
             warning_timer = existing_group.get('warning_timer', 30)
 
         data = {
@@ -75,6 +77,7 @@ async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username
             "added_by_username": username,
             "bot_is_admin": bot_is_admin,
             "delete_promotions": delete_promotions,
+            "delete_links": delete_links, # <--- ADDED TO DB UPDATE
             "warning_timer": warning_timer 
         }
         
@@ -132,6 +135,15 @@ async def update_promotion_setting(chat_id: int, delete_promotions: bool):
         return result
     except Exception as e:
         logger.error(f"Error updating promotion setting: {e}")
+        return None
+
+async def update_link_setting(chat_id: int, delete_links: bool):
+    """Update link deletion setting"""
+    try:
+        result = supabase.table('groups').update({"delete_links": delete_links}).eq('chat_id', chat_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error updating link setting: {e}")
         return None
 
 async def update_warning_timer(chat_id: int, seconds: int):
@@ -194,7 +206,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 I'm a powerful group moderation bot that helps you:
 
 ✅ Delete messages with banned words
-✅ Send welcome messages to new members
+✅ Delete links and URLs
 ✅ Delete promotional/forwarded messages
 ✅ Auto-delete warning messages after set time
 
@@ -215,20 +227,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 <b>Features:</b>
 • <b>Banned Words:</b> Auto-delete specific words.
-• <b>Timer:</b> Set how long warning messages stay visible (e.g., 10s, 1m).
-• <b>Anti-Promo:</b> Delete forwarded messages.
+• <b>Links:</b> Auto-delete messages containing http/https/t.me links.
+• <b>Anti-Promo:</b> Delete forwarded messages from channels/bots.
+• <b>Timer:</b> Set how long warning messages stay visible.
 
-<b>Timer Format:</b>
-When setting the timer, you can type:
-• <code>30</code> (for 30 seconds)
-• <code>10s</code> (for 10 seconds)
-• <code>5m</code> (for 5 minutes)
+<b>Note:</b> Admins and Anonymous Admins are exempt from deletion.
     """
     
     if update.message:
         await update.message.reply_html(help_text)
     else:
-        # Wrapped in try-except to handle double clicks
         try:
             await update.callback_query.message.edit_text(help_text, parse_mode='HTML')
         except BadRequest as e:
@@ -287,6 +295,7 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
     banned_words_text = ", ".join(banned_words) if banned_words else "None"
     
     promo_status = "✅ Enabled" if settings.get('delete_promotions', False) else "❌ Disabled"
+    link_status = "✅ Enabled" if settings.get('delete_links', False) else "❌ Disabled"
     
     # Format current timer display
     timer_val = settings.get('warning_timer', 30)
@@ -304,7 +313,8 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
 🚫 <b>Banned Words:</b>
 {banned_words_text}
 
-🔗 <b>Delete Promotions:</b> {promo_status}
+🔗 <b>Delete Promotions (Forwards/Bots):</b> {promo_status}
+🌐 <b>Delete Links (URLs):</b> {link_status}
 ⏱ <b>Warning Delete Timer:</b> {timer_display}
     """
     
@@ -313,18 +323,20 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton("➖ Remove Banned Word", callback_data=f"remove_word_{chat_id}")],
         [InlineKeyboardButton("⏱ Set Warning Timer", callback_data=f"set_timer_{chat_id}")],
         [InlineKeyboardButton(
-            "🔗 Toggle Promotion Deletion", 
+            "📢 Toggle Promotion Deletion", 
             callback_data=f"toggle_promo_{chat_id}"
+        )],
+        [InlineKeyboardButton(
+            "🌐 Toggle Link Deletion", 
+            callback_data=f"toggle_links_{chat_id}"
         )],
         [InlineKeyboardButton("🔙 Back to Groups", callback_data="my_groups")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # --- FIX APPLIED HERE ---
     try:
         await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
     except BadRequest as e:
-        # Ignore error if message content is identical
         if "Message is not modified" in str(e):
             pass 
         else:
@@ -380,6 +392,18 @@ async def toggle_promo_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await update_promotion_setting(chat_id, new_value)
     status = "enabled" if new_value else "disabled"
     await query.answer(f"Promotion deletion {status}!", show_alert=True)
+    await group_settings_handler(update, context)
+
+async def toggle_links_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle toggling link deletion"""
+    query = update.callback_query
+    await query.answer()
+    chat_id = int(query.data.split("_")[2])
+    settings = await get_group_settings(chat_id)
+    new_value = not settings.get('delete_links', False)
+    await update_link_setting(chat_id, new_value)
+    status = "enabled" if new_value else "disabled"
+    await query.answer(f"Link deletion {status}!", show_alert=True)
     await group_settings_handler(update, context)
 
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -497,21 +521,84 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get warning timer setting (default 30s if not set)
     warning_timer = settings.get('warning_timer', 30)
 
-    # 1. Check Promotions
+    # --- EXEMPTION LOGIC FOR ADMINS AND ANONYMOUS ADMINS ---
+    is_admin_or_exempt = False
+    
+    # Check if sender is anonymous group admin (Telegram ID 1087968824 is GroupAnonymousBot)
+    if message.from_user.id == 1087968824 or message.sender_chat and message.sender_chat.id == chat.id:
+        is_admin_or_exempt = True
+    else:
+        # Check actual admin status
+        try:
+            member = await chat.get_member(message.from_user.id)
+            if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                is_admin_or_exempt = True
+        except Exception:
+            pass
+
+    # If user is admin/exempt, we do NOT delete links or promotions
+    # However, we MIGHT still delete banned words depending on preference, 
+    # but usually admins are allowed to say anything. 
+    # Assuming admins are exempt from everything for now.
+    if is_admin_or_exempt:
+        return
+
+    # 1. Check Promotions (Forwards / Bots / Channels)
     if settings.get('delete_promotions', False):
+        is_promotion = False
+        
+        # Check if forwarded from anywhere
         if message.forward_from or message.forward_from_chat or message.forward_sender_name:
+            is_promotion = True
+            
+        # Check if sent via an inline bot
+        if message.via_bot:
+            is_promotion = True
+            
+        # Check if user is a bot (spam bots)
+        if message.from_user.is_bot:
+            is_promotion = True
+
+        if is_promotion:
             try:
                 await message.delete()
                 username = message.from_user.username or message.from_user.first_name
-                warning = f"⚠️ @{username}, your forwarded message was deleted."
+                warning = f"⚠️ @{username}, promotional content/forwards are not allowed."
                 warning_msg = await chat.send_message(warning)
-                # Schedule deletion via DB
                 await schedule_message_deletion(chat.id, warning_msg.message_id, warning_timer)
                 return
             except Exception as e:
                 logger.error(f"Error deleting promotional message: {e}")
 
-    # 2. Check Banned Words
+    # 2. Check Links (New Feature)
+    if settings.get('delete_links', False):
+        # Regex for common links (http, https, www, t.me)
+        link_pattern = r'(https?://\S+|www\.\S+|t\.me/\S+)'
+        has_link = False
+        
+        if re.search(link_pattern, message.text):
+            has_link = True
+        
+        # Also check entities for hidden links
+        if message.entities:
+            for entity in message.entities:
+                if entity.type in [MessageEntity.URL, MessageEntity.TEXT_LINK, MessageEntity.MENTION]:
+                    # Strict mode: treat all URL entities as links
+                    if entity.type == MessageEntity.URL or entity.type == MessageEntity.TEXT_LINK:
+                        has_link = True
+
+        if has_link:
+            try:
+                await message.delete()
+                username = message.from_user.username or message.from_user.first_name
+                warning = f"⚠️ @{username}, links are not allowed in this group."
+                warning_msg = await chat.send_message(warning)
+                await schedule_message_deletion(chat.id, warning_msg.message_id, warning_timer)
+                return
+            except Exception as e:
+                logger.error(f"Error deleting link message: {e}")
+
+    # 3. Check Banned Words
     banned_words = await get_banned_words(chat.id)
     if not banned_words:
         return
@@ -525,7 +612,6 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 username = message.from_user.username or message.from_user.first_name
                 warning = f"⚠️ @{username}, your message was hidden because it contained a banned word."
                 warning_msg = await chat.send_message(warning)
-                # Schedule deletion via DB
                 await schedule_message_deletion(chat.id, warning_msg.message_id, warning_timer)
                 return
             except Exception as e:
@@ -551,6 +637,8 @@ async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TY
         await set_timer_handler(update, context)
     elif data.startswith("toggle_promo_"):
         await toggle_promo_handler(update, context)
+    elif data.startswith("toggle_links_"):
+        await toggle_links_handler(update, context)
 
 # --- VERCEL / FASTAPI SETUP ---
 
