@@ -1,9 +1,9 @@
 import os
 import logging
+import re
 from fastapi import FastAPI, Request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-# FIX: ChatMemberStatus is imported from telegram.constants in ptb v20+
-from telegram.constants import ChatType, ChatMemberStatus # Added ChatMemberStatus here
+from telegram.constants import ChatType, ChatMemberStatus
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,7 +14,6 @@ from telegram.ext import (
 )
 from supabase import create_client, Client
 from dotenv import load_dotenv
-import re
 
 # Load environment variables
 load_dotenv()
@@ -31,7 +30,11 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Ensure Supabase credentials exist to avoid immediate crash
+if not SUPABASE_URL or not SUPABASE_KEY:
+    logger.warning("Supabase credentials missing! Database features will fail.")
+
+supabase: Client = create_client(SUPABASE_URL or "", SUPABASE_KEY or "")
 
 # Initialize FastAPI
 app = FastAPI()
@@ -329,7 +332,7 @@ async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_
             added_by = message.from_user
             try:
                 member = await chat.get_member(added_by.id)
-                # Use ChatMemberStatus imported from telegram.constants
+                # Correctly using imported ChatMemberStatus
                 if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
                     await message.reply_text("⚠️ Only group admins can add me!")
                     await chat.leave()
@@ -341,7 +344,7 @@ async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_
             
             try:
                 bot_member = await chat.get_member(context.bot.id)
-                # Use ChatMemberStatus imported from telegram.constants
+                # Correctly using imported ChatMemberStatus
                 bot_is_admin = bot_member.status == ChatMemberStatus.ADMINISTRATOR
             except Exception:
                 bot_is_admin = False
@@ -486,9 +489,6 @@ async def telegram_webhook(request: Request):
         logger.error(f"Error in webhook: {e}")
         return Response(status_code=500)
 
-# FIX: Changed @app.get("/") to @app.api_route("/", methods=["GET", "POST"])
-# to allow POST requests (which Vercel often sends for health/ping checks)
-# and resolve the 405 errors.
 @app.api_route("/", methods=["GET", "POST"])
 async def health_check():
     return {"status": "ok", "message": "Bot is running"}
