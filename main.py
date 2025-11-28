@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType, ChatMemberStatus
+from telegram.error import BadRequest  # <--- Added Import
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -41,18 +42,42 @@ ptb_application = None
 
 # --- DATABASE HELPER FUNCTIONS ---
 
-async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username: str, bot_is_admin: bool):
-    """Add a group to the database"""
+async def get_group_settings(chat_id: int):
+    """Get group settings"""
     try:
+        result = supabase.table('groups').select("*").eq('chat_id', chat_id).execute()
+        if result.data:
+            return result.data[0]
+        return None
+    except Exception as e:
+        logger.error(f"Error getting group settings: {e}")
+        return None
+
+async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username: str, bot_is_admin: bool):
+    """Add a group to the database, preserving settings if it already exists"""
+    try:
+        # Check if group exists to preserve custom settings
+        existing_group = await get_group_settings(chat_id)
+        
+        # Default settings
+        delete_promotions = False
+        warning_timer = 30
+
+        # If group exists, use its current settings instead of defaults
+        if existing_group:
+            delete_promotions = existing_group.get('delete_promotions', False)
+            warning_timer = existing_group.get('warning_timer', 30)
+
         data = {
             "chat_id": chat_id,
             "chat_title": chat_title,
             "added_by": added_by,
             "added_by_username": username,
             "bot_is_admin": bot_is_admin,
-            "delete_promotions": False,
-            "warning_timer": 30 # Default 30 seconds
+            "delete_promotions": delete_promotions,
+            "warning_timer": warning_timer 
         }
+        
         result = supabase.table('groups').upsert(data, on_conflict='chat_id').execute()
         return result
     except Exception as e:
@@ -67,17 +92,6 @@ async def get_user_groups(user_id: int):
     except Exception as e:
         logger.error(f"Error getting user groups: {e}")
         return []
-
-async def get_group_settings(chat_id: int):
-    """Get group settings"""
-    try:
-        result = supabase.table('groups').select("*").eq('chat_id', chat_id).execute()
-        if result.data:
-            return result.data[0]
-        return None
-    except Exception as e:
-        logger.error(f"Error getting group settings: {e}")
-        return None
 
 async def add_banned_word(chat_id: int, word: str, added_by: int):
     """Add a banned word for a group"""
@@ -214,7 +228,14 @@ When setting the timer, you can type:
     if update.message:
         await update.message.reply_html(help_text)
     else:
-        await update.callback_query.message.edit_text(help_text, parse_mode='HTML')
+        # Wrapped in try-except to handle double clicks
+        try:
+            await update.callback_query.message.edit_text(help_text, parse_mode='HTML')
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                pass
+            else:
+                logger.error(f"Error in help command: {e}")
 
 async def my_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user's groups"""
@@ -237,7 +258,13 @@ async def my_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
     
     if update.callback_query:
-        await update.callback_query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        try:
+            await update.callback_query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                pass
+            else:
+                logger.error(f"Error in my_groups: {e}")
     else:
         await update.message.reply_html(text, reply_markup=reply_markup)
 
@@ -250,7 +277,10 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
     settings = await get_group_settings(chat_id)
     
     if not settings:
-        await query.message.edit_text("❌ Group not found!")
+        try:
+            await query.message.edit_text("❌ Group not found!")
+        except BadRequest:
+            pass
         return
     
     banned_words = await get_banned_words(chat_id)
@@ -258,9 +288,9 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     promo_status = "✅ Enabled" if settings.get('delete_promotions', False) else "❌ Disabled"
     
-    # Format current timer display - fixed to show actual value
+    # Format current timer display
     timer_val = settings.get('warning_timer', 30)
-    if timer_val >= 60 and timer_val % 60 == 0:
+    if timer_val >= 60:
         timer_display = f"{timer_val // 60}m"
     else:
         timer_display = f"{timer_val}s"
@@ -290,7 +320,15 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    # --- FIX APPLIED HERE ---
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest as e:
+        # Ignore error if message content is identical
+        if "Message is not modified" in str(e):
+            pass 
+        else:
+            logger.error(f"Error editing message in settings: {e}")
 
 async def add_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -350,32 +388,32 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = context.user_data['awaiting_input']
     action = context.user_data['action']
-    user_text = update.message.text.strip()
+    user_text = update.message.text.strip().lower()
     
     if action == 'add_word':
-        await add_banned_word(chat_id, user_text.lower(), update.effective_user.id)
+        await add_banned_word(chat_id, user_text, update.effective_user.id)
         text = f"✅ Word '<b>{user_text}</b>' added to banned words!"
         
     elif action == 'remove_word':
-        await remove_banned_word(chat_id, user_text.lower())
+        await remove_banned_word(chat_id, user_text)
         text = f"✅ Word '<b>{user_text}</b>' removed from banned words!"
         
     elif action == 'set_timer':
         # Parse time input (1s, 1m, 30)
-        match = re.match(r'^(\d+)\s*(s|m)?$', user_text.lower())
+        match = re.match(r'^(\d+)\s*(s|m)?$', user_text)
         if match:
             value = int(match.group(1))
-            unit = match.group(2) if match.group(2) else 's'
+            unit = match.group(2)
             
             if unit == 'm':
                 seconds = value * 60
-                display_text = f"{value} minute{'s' if value != 1 else ''}"
+                display_unit = "minutes"
             else:
                 seconds = value
-                display_text = f"{value} second{'s' if value != 1 else ''}"
+                display_unit = "seconds"
                 
             await update_warning_timer(chat_id, seconds)
-            text = f"✅ Warning deletion timer set to <b>{display_text}</b>!"
+            text = f"✅ Warning deletion timer set to <b>{value} {display_unit}</b>!"
         else:
             text = "❌ Invalid format! Please use '10s' for seconds or '1m' for minutes."
 
