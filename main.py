@@ -543,13 +543,8 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reason = "promotional content"
         
         # A. Strict Forward Detection (Covers new and old forward types)
+        # UPDATED HERE: Removed legacy checks for forward_date/forward_from as they cause errors in v20+
         if message.forward_origin:
-            is_promotion = True
-            reason = "forwarded message"
-        elif message.forward_date: # Legacy/fallback check
-            is_promotion = True
-            reason = "forwarded message"
-        elif message.forward_from or message.forward_from_chat:
             is_promotion = True
             reason = "forwarded message"
             
