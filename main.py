@@ -1,9 +1,10 @@
 import os
 import logging
+import re
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-# FIX: ChatMemberStatus is imported from telegram.constants in ptb v20+
-from telegram.constants import ChatType, ChatMemberStatus # Added ChatMemberStatus here
+from telegram.constants import ChatType, ChatMemberStatus
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,7 +15,6 @@ from telegram.ext import (
 )
 from supabase import create_client, Client
 from dotenv import load_dotenv
-import re
 
 # Load environment variables
 load_dotenv()
@@ -50,7 +50,8 @@ async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username
             "added_by": added_by,
             "added_by_username": username,
             "bot_is_admin": bot_is_admin,
-            "delete_promotions": False
+            "delete_promotions": False,
+            "warning_timer": 30 # Default 30 seconds
         }
         result = supabase.table('groups').upsert(data, on_conflict='chat_id').execute()
         return result
@@ -119,6 +120,47 @@ async def update_promotion_setting(chat_id: int, delete_promotions: bool):
         logger.error(f"Error updating promotion setting: {e}")
         return None
 
+async def update_warning_timer(chat_id: int, seconds: int):
+    """Update the warning deletion timer"""
+    try:
+        result = supabase.table('groups').update({"warning_timer": seconds}).eq('chat_id', chat_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error updating warning timer: {e}")
+        return None
+
+async def schedule_message_deletion(chat_id: int, message_id: int, delay_seconds: int):
+    """Schedule a message for deletion via DB (for Cron)"""
+    try:
+        # Calculate delete time (UTC)
+        delete_time = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        data = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "delete_at": delete_time.isoformat()
+        }
+        supabase.table('pending_deletions').insert(data).execute()
+    except Exception as e:
+        logger.error(f"Error scheduling deletion: {e}")
+
+async def get_due_deletions():
+    """Get messages that are ready to be deleted"""
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        # Select messages where delete_at is older than or equal to now
+        result = supabase.table('pending_deletions').select("*").lte('delete_at', now).execute()
+        return result.data
+    except Exception as e:
+        logger.error(f"Error getting due deletions: {e}")
+        return []
+
+async def remove_pending_deletion(row_id: int):
+    """Remove entry from pending_deletions table"""
+    try:
+        supabase.table('pending_deletions').delete().eq('id', row_id).execute()
+    except Exception as e:
+        logger.error(f"Error removing pending deletion row: {e}")
+
 # --- BOT COMMAND HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -140,13 +182,9 @@ I'm a powerful group moderation bot that helps you:
 ✅ Delete messages with banned words
 ✅ Send welcome messages to new members
 ✅ Delete promotional/forwarded messages
-✅ Keep your group clean and organized
+✅ Auto-delete warning messages after set time
 
 🚀 Get started by adding me to your group!
-
-⚠️ Make sure:
-• You are an admin in the group
-• I am made an admin with "Delete Messages" permission
     """
     
     await update.message.reply_html(welcome_text, reply_markup=reply_markup)
@@ -161,20 +199,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /mygroups - View your groups
 /help - Show this help message
 
-<b>How to use:</b>
-1️⃣ Add me to your group as admin
-2️⃣ Click "My Groups" to manage settings
-3️⃣ Add banned words for each group
-4️⃣ Enable/disable promotional message deletion
-
 <b>Features:</b>
-• Automatic message deletion for banned words
-• Welcome new members with personalized messages
-• Delete promotional/forwarded messages
-• Works with anonymous admins
+• <b>Banned Words:</b> Auto-delete specific words.
+• <b>Timer:</b> Set how long warning messages stay visible (e.g., 10s, 1m).
+• <b>Anti-Promo:</b> Delete forwarded messages.
 
-<b>Support:</b>
-If you need help, contact the bot developer.
+<b>Timer Format:</b>
+When setting the timer, you can type:
+• <code>30</code> (for 30 seconds)
+• <code>10s</code> (for 10 seconds)
+• <code>5m</code> (for 5 minutes)
     """
     
     if update.message:
@@ -224,6 +258,13 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     promo_status = "✅ Enabled" if settings.get('delete_promotions', False) else "❌ Disabled"
     
+    # Format current timer display
+    timer_val = settings.get('warning_timer', 30)
+    if timer_val >= 60:
+        timer_display = f"{timer_val // 60}m"
+    else:
+        timer_display = f"{timer_val}s"
+    
     text = f"""
 ⚙️ <b>Group Settings</b>
 
@@ -234,12 +275,13 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
 {banned_words_text}
 
 🔗 <b>Delete Promotions:</b> {promo_status}
+⏱ <b>Warning Delete Timer:</b> {timer_display}
     """
     
     keyboard = [
         [InlineKeyboardButton("➕ Add Banned Word", callback_data=f"add_word_{chat_id}")],
         [InlineKeyboardButton("➖ Remove Banned Word", callback_data=f"remove_word_{chat_id}")],
-        [InlineKeyboardButton("📋 View All Banned Words", callback_data=f"view_words_{chat_id}")],
+        [InlineKeyboardButton("⏱ Set Warning Timer", callback_data=f"set_timer_{chat_id}")],
         [InlineKeyboardButton(
             "🔗 Toggle Promotion Deletion", 
             callback_data=f"toggle_promo_{chat_id}"
@@ -254,9 +296,9 @@ async def add_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = int(query.data.split("_")[2])
-    context.user_data['awaiting_word'] = chat_id
-    context.user_data['action'] = 'add'
-    text = "✍️ Please send the word you want to ban in this group.\n\n💡 Send /cancel to cancel."
+    context.user_data['awaiting_input'] = chat_id
+    context.user_data['action'] = 'add_word'
+    text = "✍️ Please send the word you want to ban.\n\n💡 Send /cancel to cancel."
     await query.message.edit_text(text)
 
 async def remove_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -267,24 +309,29 @@ async def remove_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not banned_words:
         await query.answer("No banned words to remove!", show_alert=True)
         return
-    context.user_data['awaiting_word'] = chat_id
-    context.user_data['action'] = 'remove'
+    context.user_data['awaiting_input'] = chat_id
+    context.user_data['action'] = 'remove_word'
     text = f"✍️ Current banned words:\n{', '.join(banned_words)}\n\nSend the word you want to remove.\n\n💡 Send /cancel to cancel."
     await query.message.edit_text(text)
 
-async def view_words_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_timer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = int(query.data.split("_")[2])
-    banned_words = await get_banned_words(chat_id)
-    if not banned_words:
-        text = "📝 No banned words set for this group."
-    else:
-        words_list = "\n".join([f"• {word}" for word in banned_words])
-        text = f"🚫 <b>Banned Words:</b>\n\n{words_list}"
-    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data=f"group_settings_{chat_id}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    context.user_data['awaiting_input'] = chat_id
+    context.user_data['action'] = 'set_timer'
+    text = """
+⏱ <b>Set Warning Deletion Time</b>
+
+How long should warning messages stay before deleting?
+Examples:
+• <code>5s</code> (5 seconds)
+• <code>1m</code> (1 minute)
+• <code>30</code> (30 seconds)
+
+✍️ Send the time duration now.
+    """
+    await query.message.edit_text(text, parse_mode='HTML')
 
 async def toggle_promo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -297,27 +344,54 @@ async def toggle_promo_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer(f"Promotion deletion {status}!", show_alert=True)
     await group_settings_handler(update, context)
 
-async def handle_word_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if 'awaiting_word' not in context.user_data:
+async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'awaiting_input' not in context.user_data:
         return
-    chat_id = context.user_data['awaiting_word']
+    
+    chat_id = context.user_data['awaiting_input']
     action = context.user_data['action']
-    word = update.message.text.strip().lower()
-    if action == 'add':
-        await add_banned_word(chat_id, word, update.effective_user.id)
-        text = f"✅ Word '<b>{word}</b>' added to banned words!"
-    else: 
-        await remove_banned_word(chat_id, word)
-        text = f"✅ Word '<b>{word}</b>' removed from banned words!"
-    del context.user_data['awaiting_word']
-    del context.user_data['action']
+    user_text = update.message.text.strip().lower()
+    
+    if action == 'add_word':
+        await add_banned_word(chat_id, user_text, update.effective_user.id)
+        text = f"✅ Word '<b>{user_text}</b>' added to banned words!"
+        
+    elif action == 'remove_word':
+        await remove_banned_word(chat_id, user_text)
+        text = f"✅ Word '<b>{user_text}</b>' removed from banned words!"
+        
+    elif action == 'set_timer':
+        # Parse time input (1s, 1m, 30)
+        match = re.match(r'^(\d+)\s*(s|m)?$', user_text)
+        if match:
+            value = int(match.group(1))
+            unit = match.group(2)
+            
+            if unit == 'm':
+                seconds = value * 60
+                display_unit = "minutes"
+            else:
+                seconds = value
+                display_unit = "seconds"
+                
+            await update_warning_timer(chat_id, seconds)
+            text = f"✅ Warning deletion timer set to <b>{value} {display_unit}</b>!"
+        else:
+            text = "❌ Invalid format! Please use '10s' for seconds or '1m' for minutes."
+
+    # Clear state
+    if 'awaiting_input' in context.user_data:
+        del context.user_data['awaiting_input']
+    if 'action' in context.user_data:
+        del context.user_data['action']
+        
     keyboard = [[InlineKeyboardButton("🔙 Back to Settings", callback_data=f"group_settings_{chat_id}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_html(text, reply_markup=reply_markup)
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if 'awaiting_word' in context.user_data:
-        del context.user_data['awaiting_word']
+    if 'awaiting_input' in context.user_data:
+        del context.user_data['awaiting_input']
         del context.user_data['action']
     await update.message.reply_text("✅ Operation cancelled.")
 
@@ -329,7 +403,6 @@ async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_
             added_by = message.from_user
             try:
                 member = await chat.get_member(added_by.id)
-                # Use ChatMemberStatus imported from telegram.constants
                 if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
                     await message.reply_text("⚠️ Only group admins can add me!")
                     await chat.leave()
@@ -341,7 +414,6 @@ async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_
             
             try:
                 bot_member = await chat.get_member(context.bot.id)
-                # Use ChatMemberStatus imported from telegram.constants
                 bot_is_admin = bot_member.status == ChatMemberStatus.ADMINISTRATOR
             except Exception:
                 bot_is_admin = False
@@ -361,7 +433,6 @@ async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_
 🎉 Thank you for adding me!
 
 ✅ I'm now protecting this group!
-
 👤 Added by: @{username}
 
 ⚙️ To configure settings, open a private chat with me and click "My Groups".
@@ -370,6 +441,7 @@ async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_
         else:
             username = new_member.username or new_member.first_name
             welcome_text = f"👋 Welcome {new_member.mention_html()} to {chat.title}!"
+            # Welcome messages usually stay, so we don't schedule delete here unless requested
             await message.reply_html(welcome_text)
 
 async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -384,6 +456,10 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not settings:
         return
     
+    # Get warning timer setting (default 30s if not set)
+    warning_timer = settings.get('warning_timer', 30)
+
+    # 1. Check Promotions
     if settings.get('delete_promotions', False):
         if message.forward_from or message.forward_from_chat or message.forward_sender_name:
             try:
@@ -391,15 +467,13 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 username = message.from_user.username or message.from_user.first_name
                 warning = f"⚠️ @{username}, your forwarded message was deleted."
                 warning_msg = await chat.send_message(warning)
-                context.job_queue.run_once(
-                    lambda ctx: warning_msg.delete(),
-                    5,
-                    name=f"delete_warning_{warning_msg.message_id}"
-                )
+                # Schedule deletion via DB
+                await schedule_message_deletion(chat.id, warning_msg.message_id, warning_timer)
                 return
             except Exception as e:
                 logger.error(f"Error deleting promotional message: {e}")
 
+    # 2. Check Banned Words
     banned_words = await get_banned_words(chat.id)
     if not banned_words:
         return
@@ -413,11 +487,8 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 username = message.from_user.username or message.from_user.first_name
                 warning = f"⚠️ @{username}, your message was hidden because it contained a banned word."
                 warning_msg = await chat.send_message(warning)
-                context.job_queue.run_once(
-                    lambda ctx: warning_msg.delete(),
-                    5,
-                    name=f"delete_warning_{warning_msg.message_id}"
-                )
+                # Schedule deletion via DB
+                await schedule_message_deletion(chat.id, warning_msg.message_id, warning_timer)
                 return
             except Exception as e:
                 logger.error(f"Error deleting message with banned word: {e}")
@@ -438,8 +509,8 @@ async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TY
         await add_word_handler(update, context)
     elif data.startswith("remove_word_"):
         await remove_word_handler(update, context)
-    elif data.startswith("view_words_"):
-        await view_words_handler(update, context)
+    elif data.startswith("set_timer_"):
+        await set_timer_handler(update, context)
     elif data.startswith("toggle_promo_"):
         await toggle_promo_handler(update, context)
 
@@ -460,7 +531,7 @@ async def startup_event():
         ptb_application.add_handler(CallbackQueryHandler(callback_query_router))
         ptb_application.add_handler(MessageHandler(
             filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
-            handle_word_input
+            handle_input
         ))
         ptb_application.add_handler(MessageHandler(
             filters.StatusUpdate.NEW_CHAT_MEMBERS,
@@ -474,7 +545,6 @@ async def startup_event():
         await ptb_application.initialize()
         await ptb_application.start()
 
-# UPDATED: Changed path from "/webhook" to "/webhook/webhook" to match your error logs
 @app.post("/webhook/webhook")
 async def telegram_webhook(request: Request):
     """Handle incoming Telegram updates"""
@@ -487,9 +557,39 @@ async def telegram_webhook(request: Request):
         logger.error(f"Error in webhook: {e}")
         return Response(status_code=500)
 
-# FIX: Changed @app.get("/") to @app.api_route("/", methods=["GET", "POST"])
-# to allow POST requests (which Vercel often sends for health/ping checks)
-# and resolve the 405 errors.
 @app.api_route("/", methods=["GET", "POST"])
 async def health_check():
     return {"status": "ok", "message": "Bot is running"}
+
+# --- CRON JOB ENDPOINT ---
+# Provide this URL to cron-job.org
+@app.get("/run-cleanup")
+async def run_cleanup_job():
+    """Check database for warnings that need to be deleted"""
+    # Ensure bot is initialized
+    if ptb_application is None:
+        await startup_event()
+        
+    due_items = await get_due_deletions()
+    
+    if not due_items:
+        return {"status": "ok", "deleted_count": 0}
+        
+    deleted_count = 0
+    for item in due_items:
+        chat_id = item['chat_id']
+        message_id = item['message_id']
+        row_id = item['id']
+        
+        try:
+            # Delete from Telegram
+            await ptb_application.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            deleted_count += 1
+        except Exception as e:
+            # Message might already be deleted or bot kicked
+            logger.error(f"Failed to delete message {message_id} in chat {chat_id}: {e}")
+        
+        # Remove from DB regardless of success (to stop trying)
+        await remove_pending_deletion(row_id)
+        
+    return {"status": "ok", "deleted_count": deleted_count}
