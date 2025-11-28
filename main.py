@@ -3,7 +3,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Response
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, MessageOrigin
 from telegram.constants import ChatType, ChatMemberStatus
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -600,7 +600,7 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Error deleting promotional message: {e}")
 
-    # 2. Check Links (Updated for mini messages)
+    # 2. Check Links (Updated for mini messages and TEXT_MENTION origin)
     if settings.get('delete_links', False):
         # Regex for common links (http, https, www, t.me)
         link_pattern = r'(https?://\S+|www\.\S+|t\.me/\S+)'
@@ -612,9 +612,10 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Also check entities for hidden links
         if message.entities:
             for entity in message.entities:
-                if entity.type in [MessageEntity.URL, MessageEntity.TEXT_LINK, MessageEntity.MENTION]:
+                # Added TEXT_MENTION here (it links to a User/Origin without username, often used in spam)
+                if entity.type in [MessageEntity.URL, MessageEntity.TEXT_LINK, MessageEntity.MENTION, MessageEntity.TEXT_MENTION]:
                     # Strict mode: treat all URL entities as links
-                    if entity.type == MessageEntity.URL or entity.type == MessageEntity.TEXT_LINK:
+                    if entity.type == MessageEntity.URL or entity.type == MessageEntity.TEXT_LINK or entity.type == MessageEntity.TEXT_MENTION:
                         has_link = True
 
         if has_link:
