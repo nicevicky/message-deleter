@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") # Add this to your env variables
 
 # Ensure Supabase credentials exist to avoid immediate crash
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -332,7 +333,6 @@ async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_
             added_by = message.from_user
             try:
                 member = await chat.get_member(added_by.id)
-                # Correctly using imported ChatMemberStatus
                 if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
                     await message.reply_text("⚠️ Only group admins can add me!")
                     await chat.leave()
@@ -344,7 +344,6 @@ async def new_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_
             
             try:
                 bot_member = await chat.get_member(context.bot.id)
-                # Correctly using imported ChatMemberStatus
                 bot_is_admin = bot_member.status == ChatMemberStatus.ADMINISTRATOR
             except Exception:
                 bot_is_admin = False
@@ -456,11 +455,14 @@ async def startup_event():
         ptb_application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
         # Add handlers
+        # Fixed: filters.ChatType.PRIVATE is the correct usage in V20 for chat types
         ptb_application.add_handler(CommandHandler("start", start, filters.ChatType.PRIVATE))
         ptb_application.add_handler(CommandHandler("help", help_command, filters.ChatType.PRIVATE))
         ptb_application.add_handler(CommandHandler("mygroups", my_groups_handler, filters.ChatType.PRIVATE))
         ptb_application.add_handler(CommandHandler("cancel", cancel_handler, filters.ChatType.PRIVATE))
         ptb_application.add_handler(CallbackQueryHandler(callback_query_router))
+        
+        # Fixed: Message handlers
         ptb_application.add_handler(MessageHandler(
             filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
             handle_word_input
@@ -476,6 +478,14 @@ async def startup_event():
 
         await ptb_application.initialize()
         await ptb_application.start()
+
+        # AUTOMATIC WEBHOOK SETUP
+        # If WEBHOOK_URL is set in env, we set it on Telegram automatically
+        if WEBHOOK_URL:
+            logger.info(f"Setting webhook to: {WEBHOOK_URL}")
+            await ptb_application.bot.set_webhook(url=WEBHOOK_URL)
+        else:
+            logger.warning("WEBHOOK_URL not set in environment variables. Bot may not respond.")
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
