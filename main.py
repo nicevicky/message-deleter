@@ -258,9 +258,9 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     promo_status = "✅ Enabled" if settings.get('delete_promotions', False) else "❌ Disabled"
     
-    # Format current timer display
+    # Format current timer display - fixed to show actual value
     timer_val = settings.get('warning_timer', 30)
-    if timer_val >= 60:
+    if timer_val >= 60 and timer_val % 60 == 0:
         timer_display = f"{timer_val // 60}m"
     else:
         timer_display = f"{timer_val}s"
@@ -350,32 +350,32 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = context.user_data['awaiting_input']
     action = context.user_data['action']
-    user_text = update.message.text.strip().lower()
+    user_text = update.message.text.strip()
     
     if action == 'add_word':
-        await add_banned_word(chat_id, user_text, update.effective_user.id)
+        await add_banned_word(chat_id, user_text.lower(), update.effective_user.id)
         text = f"✅ Word '<b>{user_text}</b>' added to banned words!"
         
     elif action == 'remove_word':
-        await remove_banned_word(chat_id, user_text)
+        await remove_banned_word(chat_id, user_text.lower())
         text = f"✅ Word '<b>{user_text}</b>' removed from banned words!"
         
     elif action == 'set_timer':
         # Parse time input (1s, 1m, 30)
-        match = re.match(r'^(\d+)\s*(s|m)?$', user_text)
+        match = re.match(r'^(\d+)\s*(s|m)?$', user_text.lower())
         if match:
             value = int(match.group(1))
-            unit = match.group(2)
+            unit = match.group(2) if match.group(2) else 's'
             
             if unit == 'm':
                 seconds = value * 60
-                display_unit = "minutes"
+                display_text = f"{value} minute{'s' if value != 1 else ''}"
             else:
                 seconds = value
-                display_unit = "seconds"
+                display_text = f"{value} second{'s' if value != 1 else ''}"
                 
             await update_warning_timer(chat_id, seconds)
-            text = f"✅ Warning deletion timer set to <b>{value} {display_unit}</b>!"
+            text = f"✅ Warning deletion timer set to <b>{display_text}</b>!"
         else:
             text = "❌ Invalid format! Please use '10s' for seconds or '1m' for minutes."
 
