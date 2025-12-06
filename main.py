@@ -722,7 +722,7 @@ async def startup_event():
        
         await ptb_application.initialize()
         await ptb_application.start()
-@app.post("/webhook/webhook")
+@app.post("/webhook")
 async def telegram_webhook(request: Request):
     """Handle incoming Telegram updates"""
     try:
