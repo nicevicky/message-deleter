@@ -721,7 +721,8 @@ async def user_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     new_member = chat_member_update.new_chat_member
     old_member = chat_member_update.old_chat_member
-    if old_member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED] and new_member.status == ChatMemberStatus.MEMBER:
+    # FIXED: Use ChatMemberStatus.BANNED instead of non-existent .KICKED
+    if old_member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED] and new_member.status == ChatMemberStatus.MEMBER:
         logger.info(f"New member {new_member.user.id} ({new_member.user.first_name}) joined group {chat.id}")
         settings = await get_group_settings(chat.id)
         await send_welcome_message(chat, new_member.user, context, settings)
@@ -922,10 +923,8 @@ async def startup_event():
                 logger.info(f"Webhook successfully set to {WEBHOOK_URL} with chat_member updates")
             except RetryAfter as e:
                 logger.warning(f"Rate limited when setting webhook. Will retry in {e.retry_after} seconds...")
-                # The bot will continue running and process updates via webhook if already set
             except Exception as e:
                 logger.error(f"Failed to set webhook: {e}")
-                # Continue anyway – if webhook was already set previously, it will still work
         else:
             logger.error("WEBHOOK_URL is not set! Please add it to your .env file.")
 
