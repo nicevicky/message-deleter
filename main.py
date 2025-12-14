@@ -3,7 +3,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Response
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, ChatMember
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 from telegram.constants import ChatType, ChatMemberStatus
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -17,23 +17,32 @@ from telegram.ext import (
 )
 from supabase import create_client, Client
 from dotenv import load_dotenv
+
 # Load environment variables
 load_dotenv()
+
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
 # Initialize Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # REQUIRED: Add to .env → https://your-domain.vercel.app/webhook/webhook
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 # Initialize FastAPI
 app = FastAPI()
+
 # Global variable to store the Telegram Application
 ptb_application = None
+
+
 def is_forwarded_or_channel_message(message) -> bool:
     """
     Detects forwarded messages (including hidden channel forwards) and direct channel posts.
@@ -52,6 +61,8 @@ def is_forwarded_or_channel_message(message) -> bool:
             if first_entity.type == 'text_link' and 't.me' in (first_entity.url or ''):
                 return True
     return False
+
+
 # --- DATABASE HELPER FUNCTIONS ---
 async def get_group_settings(chat_id: int):
     """Get group settings"""
@@ -63,20 +74,22 @@ async def get_group_settings(chat_id: int):
     except Exception as e:
         logger.error(f"Error getting group settings: {e}")
         return None
+
+
 async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username: str, bot_is_admin: bool):
     """Add a group to the database, preserving settings if it already exists"""
     try:
         # Check if group exists to preserve custom settings
         existing_group = await get_group_settings(chat_id)
-    
+
         # Default settings
         delete_promotions = False
         delete_links = False
         warning_timer = 30
-        max_word_count = 0 # 0 means disabled (unlimited)
+        max_word_count = 0  # 0 means disabled (unlimited)
         welcome_message = None
         welcome_timer = 0
-    
+
         # If group exists, use its current settings instead of defaults
         if existing_group:
             delete_promotions = existing_group.get('delete_promotions', False)
@@ -85,7 +98,7 @@ async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username
             max_word_count = existing_group.get('max_word_count', 0)
             welcome_message = existing_group.get('welcome_message', None)
             welcome_timer = existing_group.get('welcome_timer', 0)
-    
+
         data = {
             "chat_id": chat_id,
             "chat_title": chat_title,
@@ -99,12 +112,14 @@ async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username
             "welcome_message": welcome_message,
             "welcome_timer": welcome_timer
         }
-    
+
         result = supabase.table('groups').upsert(data, on_conflict='chat_id').execute()
         return result
     except Exception as e:
         logger.error(f"Error adding group to DB: {e}")
         return None
+
+
 async def get_user_groups(user_id: int):
     """Get all groups added by a specific user"""
     try:
@@ -113,6 +128,8 @@ async def get_user_groups(user_id: int):
     except Exception as e:
         logger.error(f"Error getting user groups: {e}")
         return []
+
+
 async def add_banned_word(chat_id: int, word: str, added_by: int):
     """Add a banned word for a group"""
     try:
@@ -126,6 +143,8 @@ async def add_banned_word(chat_id: int, word: str, added_by: int):
     except Exception as e:
         logger.error(f"Error adding banned word: {e}")
         return None
+
+
 async def remove_banned_word(chat_id: int, word: str):
     """Remove a banned word for a group"""
     try:
@@ -134,6 +153,8 @@ async def remove_banned_word(chat_id: int, word: str):
     except Exception as e:
         logger.error(f"Error removing banned word: {e}")
         return None
+
+
 async def get_banned_words(chat_id: int):
     """Get all banned words for a group"""
     try:
@@ -142,6 +163,8 @@ async def get_banned_words(chat_id: int):
     except Exception as e:
         logger.error(f"Error getting banned words: {e}")
         return []
+
+
 async def update_promotion_setting(chat_id: int, delete_promotions: bool):
     """Update promotion deletion setting"""
     try:
@@ -150,6 +173,8 @@ async def update_promotion_setting(chat_id: int, delete_promotions: bool):
     except Exception as e:
         logger.error(f"Error updating promotion setting: {e}")
         return None
+
+
 async def update_link_setting(chat_id: int, delete_links: bool):
     """Update link deletion setting"""
     try:
@@ -158,6 +183,8 @@ async def update_link_setting(chat_id: int, delete_links: bool):
     except Exception as e:
         logger.error(f"Error updating link setting: {e}")
         return None
+
+
 async def update_warning_timer(chat_id: int, seconds: int):
     """Update the warning deletion timer"""
     try:
@@ -166,6 +193,8 @@ async def update_warning_timer(chat_id: int, seconds: int):
     except Exception as e:
         logger.error(f"Error updating warning timer: {e}")
         return None
+
+
 async def update_word_limit(chat_id: int, limit: int):
     """Update the max word count limit (0 = disabled)"""
     try:
@@ -174,6 +203,8 @@ async def update_word_limit(chat_id: int, limit: int):
     except Exception as e:
         logger.error(f"Error updating word limit: {e}")
         return None
+
+
 async def update_welcome_message(chat_id: int, welcome_html: str, timer: int):
     """Update welcome message and timer"""
     try:
@@ -185,6 +216,8 @@ async def update_welcome_message(chat_id: int, welcome_html: str, timer: int):
     except Exception as e:
         logger.error(f"Error updating welcome message: {e}")
         return None
+
+
 async def schedule_message_deletion(chat_id: int, message_id: int, delay_seconds: int):
     """Schedule a message for deletion via DB (for Cron)"""
     try:
@@ -198,6 +231,8 @@ async def schedule_message_deletion(chat_id: int, message_id: int, delay_seconds
         supabase.table('pending_deletions').insert(data).execute()
     except Exception as e:
         logger.error(f"Error scheduling deletion: {e}")
+
+
 async def get_due_deletions():
     """Get messages that are ready to be deleted"""
     try:
@@ -208,22 +243,25 @@ async def get_due_deletions():
     except Exception as e:
         logger.error(f"Error getting due deletions: {e}")
         return []
+
+
 async def remove_pending_deletion(row_id: int):
     """Remove entry from pending_deletions table"""
     try:
         supabase.table('pending_deletions').delete().eq('id', row_id).execute()
     except Exception as e:
         logger.error(f"Error removing pending deletion row: {e}")
+
+
 async def is_channel_linked_to_group(context: ContextTypes.DEFAULT_TYPE, channel_id: int, chat_id: int) -> bool:
     """Check if a channel is linked to a group"""
     try:
-        # Try to get the channel info via the bot
         channel_chat = await context.bot.get_chat(channel_id)
-        # If the channel is linked to the group, the linked_chat_forum will match
-        # This is a basic check; you may need to adjust based on Telegram's API
-        return True # Simplified - adjust based on your needs
+        return True  # Simplified - adjust based on your needs
     except Exception:
         return False
+
+
 # --- BOT COMMAND HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
@@ -246,6 +284,8 @@ I'm a powerful group moderation bot that helps you:
 🚀 Get started by adding me to your group!
     """
     await update.message.reply_html(welcome_text, reply_markup=reply_markup)
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
     help_text = """
@@ -273,6 +313,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             else:
                 logger.error(f"Error in help command: {e}")
+
+
 async def my_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user's groups"""
     user_id = update.effective_user.id
@@ -301,6 +343,8 @@ async def my_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Error in my_groups: {e}")
     else:
         await update.message.reply_html(text, reply_markup=reply_markup)
+
+
 async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show group settings"""
     query = update.callback_query
@@ -317,17 +361,13 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
     banned_words_text = ", ".join(banned_words) if banned_words else "None"
     promo_status = "✅ Enabled" if settings.get('delete_promotions', False) else "❌ Disabled"
     link_status = "✅ Enabled" if settings.get('delete_links', False) else "❌ Disabled"
-    # Check word limit settings
     word_limit = settings.get('max_word_count', 0)
     word_limit_status = f"{word_limit} words" if word_limit > 0 else "❌ Disabled (Unlimited)"
-    # Format current timer display
     timer_val = settings.get('warning_timer', 30)
     if timer_val >= 60:
         timer_display = f"{timer_val // 60}m"
     else:
         timer_display = f"{timer_val}s"
- 
-    # Welcome message status
     welcome_msg = settings.get('welcome_message', None)
     welcome_status = "✅ Enabled" if welcome_msg else "❌ Not Set"
     welcome_timer_val = settings.get('welcome_timer', 0)
@@ -362,6 +402,8 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
             pass
         else:
             logger.error(f"Error editing message in settings: {e}")
+
+
 async def set_welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle welcome message setup"""
     query = update.callback_query
@@ -369,7 +411,6 @@ async def set_welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = int(query.data.split("_")[2])
     context.user_data['awaiting_input'] = chat_id
     context.user_data['action'] = 'set_welcome'
- 
     text = """
 🎉 <b>Set Welcome Message</b>
 You can use HTML formatting and variables:
@@ -388,11 +429,12 @@ Button Format: <code>[Button Text](https://link)</code>
 ✍️ Send your welcome message HTML now:
     """
     await query.message.edit_text(text, parse_mode='HTML')
+
+
 async def set_welcome_timer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle welcome timer setup"""
     chat_id = context.user_data['awaiting_input']
     context.user_data['action'] = 'set_welcome_timer'
- 
     text = """
 ⏱ <b>Set Welcome Message Auto-Delete Timer</b>
 How long should welcome messages stay before deleting?
@@ -404,6 +446,8 @@ Examples:
 ✍️ Send the time now:
     """
     await update.message.reply_html(text)
+
+
 async def add_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -412,6 +456,8 @@ async def add_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['action'] = 'add_word'
     text = "✍️ Please send the word you want to ban.\n\n💡 Send /cancel to cancel."
     await query.message.edit_text(text)
+
+
 async def remove_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -424,6 +470,8 @@ async def remove_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data['action'] = 'remove_word'
     text = f"✍️ Current banned words:\n{', '.join(banned_words)}\n\nSend the word you want to remove.\n\n💡 Send /cancel to cancel."
     await query.message.edit_text(text)
+
+
 async def set_timer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -440,6 +488,8 @@ Examples:
 ✍️ Send the time duration now.
     """
     await query.message.edit_text(text, parse_mode='HTML')
+
+
 async def set_word_limit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -457,6 +507,8 @@ Examples:
 ✍️ Send the maximum number of words allowed now.
     """
     await query.message.edit_text(text, parse_mode='HTML')
+
+
 async def toggle_promo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -467,6 +519,8 @@ async def toggle_promo_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     status = "enabled" if new_value else "disabled"
     await query.answer(f"Promotion deletion {status}!", show_alert=True)
     await group_settings_handler(update, context)
+
+
 async def toggle_links_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle toggling link deletion"""
     query = update.callback_query
@@ -478,6 +532,8 @@ async def toggle_links_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     status = "enabled" if new_value else "disabled"
     await query.answer(f"Link deletion {status}!", show_alert=True)
     await group_settings_handler(update, context)
+
+
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'awaiting_input' not in context.user_data:
         return
@@ -485,10 +541,8 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = context.user_data['action']
     user_text = update.message.text.strip()
     if action == 'set_welcome':
-        # Store the welcome message HTML and move to timer step
         context.user_data['welcome_message_html'] = user_text
         context.user_data['action'] = 'set_welcome_timer'
-     
         text = """
 ⏱ <b>Set Welcome Message Auto-Delete Timer</b>
 How long should welcome messages stay before deleting?
@@ -501,60 +555,47 @@ Examples:
         """
         await update.message.reply_html(text)
         return
- 
     elif action == 'set_welcome_timer':
-        # Parse timer and save both
         welcome_html = context.user_data.get('welcome_message_html', '')
-     
-        # Parse time input
         match = re.match(r'^(\d+)\s*(s|m)?$', user_text.strip())
         if match:
             value = int(match.group(1))
             unit = match.group(2)
-        
             if unit == 'm':
                 timer_seconds = value * 60
                 display_unit = "minutes"
             else:
                 timer_seconds = value
                 display_unit = "seconds"
-         
             await update_welcome_message(chat_id, welcome_html, timer_seconds)
             text = f"✅ Welcome message set! Auto-delete in <b>{value} {display_unit}</b>"
         else:
             text = "❌ Invalid format! Please use '0', '30s', or '1m'"
             await update.message.reply_html(text)
             return
- 
     elif action == 'add_word':
         user_text_lower = user_text.lower()
         await add_banned_word(chat_id, user_text_lower, update.effective_user.id)
         text = f"✅ Word '<b>{user_text_lower}</b>' added to banned words!"
-    
     elif action == 'remove_word':
         user_text_lower = user_text.lower()
         await remove_banned_word(chat_id, user_text_lower)
         text = f"✅ Word '<b>{user_text_lower}</b>' removed from banned words!"
-    
     elif action == 'set_timer':
-        # Parse time input (1s, 1m, 30)
         match = re.match(r'^(\d+)\s*(s|m)?$', user_text)
         if match:
             value = int(match.group(1))
             unit = match.group(2)
-        
             if unit == 'm':
                 seconds = value * 60
                 display_unit = "minutes"
             else:
                 seconds = value
                 display_unit = "seconds"
-            
             await update_warning_timer(chat_id, seconds)
             text = f"✅ Warning deletion timer set to <b>{value} {display_unit}</b>!"
         else:
             text = "❌ Invalid format! Please use '10s' for seconds or '1m' for minutes."
-        
     elif action == 'set_word_limit':
         if user_text.isdigit():
             limit = int(user_text)
@@ -564,8 +605,7 @@ Examples:
             else:
                 text = f"✅ Max word count set to <b>{limit} words</b>!"
         else:
-             text = "❌ Invalid number! Please send a number like 100, 35, or 2."
- 
+            text = "❌ Invalid number! Please send a number like 100, 35, or 2."
     # Clear state
     if 'awaiting_input' in context.user_data:
         del context.user_data['awaiting_input']
@@ -573,10 +613,11 @@ Examples:
         del context.user_data['action']
     if 'welcome_message_html' in context.user_data:
         del context.user_data['welcome_message_html']
-    
     keyboard = [[InlineKeyboardButton("🔙 Back to Settings", callback_data=f"group_settings_{chat_id}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_html(text, reply_markup=reply_markup)
+
+
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'awaiting_input' in context.user_data:
         del context.user_data['awaiting_input']
@@ -584,69 +625,52 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'welcome_message_html' in context.user_data:
         del context.user_data['welcome_message_html']
     await update.message.reply_text("✅ Operation cancelled.")
+
+
 def parse_welcome_message(html_template: str, bot_name: str, user_name: str, user_id: int) -> tuple:
     """Parse welcome message template and extract buttons"""
-    # Replace variables
     message = html_template.replace('{BOT_NAME}', bot_name)
     message = message.replace('{USER_NAME}', user_name)
     message = message.replace('{USER_ID}', str(user_id))
- 
-    # Extract buttons: [Text](URL)
     button_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
     buttons = re.findall(button_pattern, message)
- 
-    # Remove button syntax from message
     message = re.sub(button_pattern, '', message).strip()
- 
     return message, buttons
+
+
 async def send_welcome_message(chat: any, new_member: any, context: ContextTypes.DEFAULT_TYPE, settings: dict):
     """Send custom welcome message to new member"""
     try:
         if settings and settings.get('welcome_message'):
-            # Parse and send custom welcome message
             welcome_html = settings['welcome_message']
             bot_name = context.bot.username or "Bot"
             user_name = new_member.first_name or new_member.username or "Member"
             user_id = new_member.id
-         
-            # Parse message and extract buttons
             message_text, buttons = parse_welcome_message(welcome_html, bot_name, user_name, user_id)
-         
-            # Create keyboard with buttons (left/right layout)
             keyboard = []
             if buttons:
-                # Add buttons in pairs (left/right)
                 for i in range(0, len(buttons), 2):
                     row = []
                     btn_text, btn_url = buttons[i]
                     row.append(InlineKeyboardButton(btn_text, url=btn_url))
-                 
-                    # Add second button if exists
                     if i + 1 < len(buttons):
                         btn_text2, btn_url2 = buttons[i + 1]
                         row.append(InlineKeyboardButton(btn_text2, url=btn_url2))
-                 
                     keyboard.append(row)
-         
             reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-         
             try:
                 welcome_msg = await chat.send_message(message_text, reply_markup=reply_markup, parse_mode='HTML')
-             
-                # Schedule deletion if timer is set
                 welcome_timer = settings.get('welcome_timer', 0)
                 if welcome_timer > 0:
                     await schedule_message_deletion(chat.id, welcome_msg.message_id, welcome_timer)
             except BadRequest as e:
                 logger.error(f"Error sending welcome message: {e}")
-                # Fallback to simple message
                 default_welcome = f"👋 Welcome {new_member.mention_html()} to {chat.title}!"
                 try:
                     welcome_msg = await chat.send_message(default_welcome, parse_mode='HTML')
                 except Exception as ex:
                     logger.error(f"Error sending fallback welcome: {ex}")
         else:
-            # Default welcome message if none set
             default_welcome = f"👋 Welcome {new_member.mention_html()} to {chat.title}!"
             try:
                 welcome_msg = await chat.send_message(default_welcome, parse_mode='HTML')
@@ -654,19 +678,16 @@ async def send_welcome_message(chat: any, new_member: any, context: ContextTypes
                 logger.error(f"Error sending default welcome: {e}")
     except Exception as e:
         logger.error(f"Error in send_welcome_message: {e}")
+
+
 async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Track when users join or leave the group"""
+    """Track when bot is added/removed from group"""
     my_chat_member = update.my_chat_member
     chat = my_chat_member.chat
-  
-    # Only handle groups
     if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
         return
-  
     new_member = my_chat_member.new_chat_member
     old_member = my_chat_member.old_chat_member
-  
-    # If bot was added to group
     if old_member.status == ChatMemberStatus.LEFT and new_member.status != ChatMemberStatus.LEFT:
         added_by = my_chat_member.from_user
         try:
@@ -679,13 +700,11 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error checking admin status: {e}")
             await chat.leave()
             return
-    
         try:
             bot_member = await chat.get_member(context.bot.id)
             bot_is_admin = bot_member.status == ChatMemberStatus.ADMINISTRATOR
         except Exception:
             bot_is_admin = False
-    
         if not bot_is_admin:
             await chat.send_message(
                 "⚠️ Please make me an admin with 'Delete Messages' permission!\n\n"
@@ -693,10 +712,8 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await chat.leave()
             return
-    
         username = added_by.username or f"user_{added_by.id}"
         await add_group_to_db(chat.id, chat.title, added_by.id, username, bot_is_admin)
-    
         welcome_text = f"""
 🎉 Thank you for adding me!
 ✅ I'm now protecting this group!
@@ -705,6 +722,8 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📝 You can also set a custom welcome message for new members!
         """
         await chat.send_message(welcome_text)
+
+
 async def user_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle when any user joins or leaves the group"""
     chat_member_update = update.chat_member
@@ -715,12 +734,12 @@ async def user_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     new_member = chat_member_update.new_chat_member
     old_member = chat_member_update.old_chat_member
-    # Check if user joined (from not member to member)
     if old_member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED] and new_member.status == ChatMemberStatus.MEMBER:
-        # User joined
         logger.info(f"New member {new_member.user.id} ({new_member.user.first_name}) joined group {chat.id}")
         settings = await get_group_settings(chat.id)
         await send_welcome_message(chat, new_member.user, context, settings)
+
+
 async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
@@ -731,35 +750,23 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = await get_group_settings(chat.id)
     if not settings:
         return
-    # Get warning timer setting (default 30s if not set)
     warning_timer = settings.get('warning_timer', 30)
- 
-    # --- EXEMPTION LOGIC FOR ADMINS AND ANONYMOUS ADMINS ---
     is_admin_or_exempt = False
-    # Check if sender is anonymous group admin (Telegram ID 1087968824 is GroupAnonymousBot)
     if message.from_user.id == 1087968824 or (message.sender_chat and message.sender_chat.id == chat.id):
         is_admin_or_exempt = True
     else:
-        # Check actual admin status
         try:
             member = await chat.get_member(message.from_user.id)
             if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
                 is_admin_or_exempt = True
         except Exception:
             pass
- 
-    # Check if message sender is from linked channel (also admin)
     if message.sender_chat and message.sender_chat.type == ChatType.CHANNEL:
         is_admin_or_exempt = True
- 
-    # If user is admin/exempt, we do NOT delete links, promotions, or long messages
     if is_admin_or_exempt:
         return
- 
-    # 1. Check Max Word Count (NEW FEATURE)
     max_word_count = settings.get('max_word_count', 0)
     if max_word_count > 0:
-        # Split text by whitespace to count words
         word_count = len(message.text.split())
         if word_count > max_word_count:
             try:
@@ -771,47 +778,37 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             except Exception as e:
                 logger.error(f"Error deleting long message: {e}")
- 
-    # 2. Check Promotions (Forwards / Bots / Spam Content / High Emoji Usage)
     if settings.get('delete_promotions', False):
         is_promotion = False
         reason = "promotional content"
-        # A. Forwarded or Channel Message Detection
         if is_forwarded_or_channel_message(message):
             is_promotion = True
             reason = "forwarded or channel message"
-        # B. Bot Check
         elif message.via_bot:
             is_promotion = True
             reason = "sent via bot"
         elif message.from_user and message.from_user.is_bot:
             is_promotion = True
             reason = "bot message"
-        # C. Spam Text Analysis (Expanded your regexes for better coverage)
         elif message.text:
             text_lower = message.text.lower()
-            # Combined spam patterns (your originals + common additions)
             spam_patterns = [
                 r'(?i)(dm to buy|dm for|price\s*[\-:)]|accounts?\s*(available|for sale)|cheap\s*accounts?)',
                 r'(?i)(c\s*x\s*p|p\s*[0o@$]\s*r\s*n|n\s*[u#]\s*d\s*e|r\s*[@a]\s*x\s*p\s*e|h\s*@\s*r\s*d|f\s*o\s*r\s*c\s*e\s*d|t\s*@\s*r\s*c\s*h\s*[u₹]\s*r)',
                 r'(?i)(daily\s*offer|limited\s*stock|buy\s*for\s*resell|all\s*in\s*one\s*pack|full\s*(pack|cp|cxp|nude))',
-                r'(\d+[\ufe0f\u20e3\u0030-\u0039]\s*[\w\s/]+✅)', # List format spam
+                r'(\d+[\ufe0f\u20e3\u0030-\u0039]\s*[\w\s/]+✅)',
             ]
             if any(re.search(p, text_lower) for p in spam_patterns):
                 is_promotion = True
                 reason = "spam keywords"
-        # D. Emoji/Sticker Flood Detection (Improved regex for broader emoji coverage)
         if message.text:
-            # Updated emoji pattern (covers more Unicode ranges, including skin tones and combos)
             emoji_pattern = r'[\U0001F000-\U0001FFFF]|[\U00002600-\U000027BF]|[\U0001F600-\U0001F64F]|[\U0001F300-\U0001F5FF]|[\U0001F680-\U0001F6FF]|[\u200d\u2600-\u26FF\u2700-\u27BF]'
             emojis = re.findall(emoji_pattern, message.text)
             emoji_count = len(emojis)
             text_len = len(message.text)
-            # Threshold: >15 emojis OR >40% of message is emojis (for short spam messages)
             if emoji_count > 15 or (text_len > 10 and (emoji_count / text_len) > 0.4):
                 is_promotion = True
                 reason = "too many emojis"
-        # If promotion detected, delete and warn
         if is_promotion:
             try:
                 await message.delete()
@@ -822,24 +819,15 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             except Exception as e:
                 logger.error(f"Error deleting promotional message: {e}")
- 
-    # 3. Check Links (Updated for mini messages)
     if settings.get('delete_links', False):
-        # Regex for common links (http, https, www, t.me)
         link_pattern = r'(https?://\S+|www\.\S+|t\.me/\S+)'
         has_link = False
-    
         if re.search(link_pattern, message.text):
             has_link = True
-    
-        # Also check entities for hidden links
         if message.entities:
             for entity in message.entities:
-                if entity.type in [MessageEntity.URL, MessageEntity.TEXT_LINK, MessageEntity.MENTION]:
-                    # Strict mode: treat all URL entities as links
-                    if entity.type == MessageEntity.URL or entity.type == MessageEntity.TEXT_LINK:
-                        has_link = True
-    
+                if entity.type in [MessageEntity.URL, MessageEntity.TEXT_LINK]:
+                    has_link = True
         if has_link:
             try:
                 await message.delete()
@@ -850,8 +838,6 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             except Exception as e:
                 logger.error(f"Error deleting link message: {e}")
- 
-    # 4. Check Banned Words
     banned_words = await get_banned_words(chat.id)
     if not banned_words:
         return
@@ -869,6 +855,8 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Error deleting message with banned word: {e}")
                 return
+
+
 async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -894,47 +882,60 @@ async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TY
         await toggle_promo_handler(update, context)
     elif data.startswith("toggle_links_"):
         await toggle_links_handler(update, context)
-# --- VERCEL / FASTAPI SETUP ---
+
+
+# --- FASTAPI / WEBHOOK SETUP ---
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the bot when the server starts"""
+    """Initialize the bot and set webhook with required allowed_updates"""
     global ptb_application
     if ptb_application is None:
         ptb_application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-        # Add handlers
+
+        # Add all handlers
         ptb_application.add_handler(CommandHandler("start", start, filters.ChatType.PRIVATE))
         ptb_application.add_handler(CommandHandler("help", help_command, filters.ChatType.PRIVATE))
         ptb_application.add_handler(CommandHandler("mygroups", my_groups_handler, filters.ChatType.PRIVATE))
         ptb_application.add_handler(CommandHandler("cancel", cancel_handler, filters.ChatType.PRIVATE))
-    
         ptb_application.add_handler(CallbackQueryHandler(callback_query_router))
-    
         ptb_application.add_handler(MessageHandler(
             filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
             handle_input
         ))
-    
-        # NEW: Chat member handler (for tracking when users join/leave)
         ptb_application.add_handler(ChatMemberHandler(
             track_chat_member,
             ChatMemberHandler.MY_CHAT_MEMBER
         ))
-    
-        # User chat member handler
         ptb_application.add_handler(ChatMemberHandler(
             user_chat_member,
             ChatMemberHandler.CHAT_MEMBER
         ))
-    
-        # Group messages handler
         ptb_application.add_handler(MessageHandler(
             filters.TEXT & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
             check_message
         ))
-    
+
         await ptb_application.initialize()
         await ptb_application.start()
+
+        # Set webhook with chat_member updates enabled
+        if WEBHOOK_URL:
+            await ptb_application.bot.set_webhook(
+                url=WEBHOOK_URL,
+                allowed_updates=[
+                    "message",
+                    "edited_message",
+                    "callback_query",
+                    "my_chat_member",
+                    "chat_member",          # Critical for detecting user joins
+                    "chat_join_request",
+                ]
+            )
+            logger.info(f"Webhook successfully set to {WEBHOOK_URL} with chat_member updates")
+        else:
+            logger.error("WEBHOOK_URL is not set! Please add it to your .env file.")
+
+
 @app.post("/webhook/webhook")
 async def telegram_webhook(request: Request):
     """Handle incoming Telegram updates"""
@@ -946,36 +947,31 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         logger.error(f"Error in webhook: {e}")
         return Response(status_code=500)
+
+
 @app.api_route("/", methods=["GET", "POST"])
 async def health_check():
     return {"status": "ok", "message": "Bot is running"}
+
+
 # --- CRON JOB ENDPOINT ---
 @app.get("/run-cleanup")
 async def run_cleanup_job():
     """Check database for warnings and welcome messages that need to be deleted"""
-    # Ensure bot is initialized
     if ptb_application is None:
         await startup_event()
-    
     due_items = await get_due_deletions()
     if not due_items:
         return {"status": "ok", "deleted_count": 0}
-    
     deleted_count = 0
     for item in due_items:
         chat_id = item['chat_id']
         message_id = item['message_id']
         row_id = item['id']
-    
         try:
-            # Delete from Telegram
             await ptb_application.bot.delete_message(chat_id=chat_id, message_id=message_id)
             deleted_count += 1
         except Exception as e:
-            # Message might already be deleted or bot kicked
             logger.error(f"Failed to delete message {message_id} in chat {chat_id}: {e}")
-    
-        # Remove from DB regardless of success (to stop trying)
         await remove_pending_deletion(row_id)
-    
     return {"status": "ok", "deleted_count": deleted_count}
