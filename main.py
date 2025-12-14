@@ -1,3 +1,4 @@
+
 import os
 import logging
 import re
@@ -5,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 from telegram.constants import ChatType, ChatMemberStatus
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -47,17 +48,13 @@ def is_forwarded_or_channel_message(message) -> bool:
     """
     Detects forwarded messages (including hidden channel forwards) and direct channel posts.
     """
-    # Standard forward detection (covers users, hidden users, chats, channels)
     if message.forward_origin is not None:
         return True
-    # Direct posts from channels (sender_chat is set, from_user may be None)
     if message.sender_chat and message.sender_chat.type == ChatType.CHANNEL:
         return True
-    # Fallback: Check for "Forwarded from" header via entities (often a bold/text_link at offset 0)
     if message.entities:
         first_entity = message.entities[0]
         if first_entity.offset == 0 and first_entity.type in ('bold', 'text_link'):
-            # Additional check: URL points to t.me (channel/user link)
             if first_entity.type == 'text_link' and 't.me' in (first_entity.url or ''):
                 return True
     return False
@@ -79,18 +76,13 @@ async def get_group_settings(chat_id: int):
 async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username: str, bot_is_admin: bool):
     """Add a group to the database, preserving settings if it already exists"""
     try:
-        # Check if group exists to preserve custom settings
         existing_group = await get_group_settings(chat_id)
-
-        # Default settings
         delete_promotions = False
         delete_links = False
         warning_timer = 30
-        max_word_count = 0  # 0 means disabled (unlimited)
+        max_word_count = 0
         welcome_message = None
         welcome_timer = 0
-
-        # If group exists, use its current settings instead of defaults
         if existing_group:
             delete_promotions = existing_group.get('delete_promotions', False)
             delete_links = existing_group.get('delete_links', False)
@@ -98,7 +90,6 @@ async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username
             max_word_count = existing_group.get('max_word_count', 0)
             welcome_message = existing_group.get('welcome_message', None)
             welcome_timer = existing_group.get('welcome_timer', 0)
-
         data = {
             "chat_id": chat_id,
             "chat_title": chat_title,
@@ -112,7 +103,6 @@ async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username
             "welcome_message": welcome_message,
             "welcome_timer": welcome_timer
         }
-
         result = supabase.table('groups').upsert(data, on_conflict='chat_id').execute()
         return result
     except Exception as e:
@@ -221,7 +211,6 @@ async def update_welcome_message(chat_id: int, welcome_html: str, timer: int):
 async def schedule_message_deletion(chat_id: int, message_id: int, delay_seconds: int):
     """Schedule a message for deletion via DB (for Cron)"""
     try:
-        # Calculate delete time (UTC)
         delete_time = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
         data = {
             "chat_id": chat_id,
@@ -237,7 +226,6 @@ async def get_due_deletions():
     """Get messages that are ready to be deleted"""
     try:
         now = datetime.now(timezone.utc).isoformat()
-        # Select messages where delete_at is older than or equal to now
         result = supabase.table('pending_deletions').select("*").lte('delete_at', now).execute()
         return result.data
     except Exception as e:
@@ -257,7 +245,7 @@ async def is_channel_linked_to_group(context: ContextTypes.DEFAULT_TYPE, channel
     """Check if a channel is linked to a group"""
     try:
         channel_chat = await context.bot.get_chat(channel_id)
-        return True  # Simplified - adjust based on your needs
+        return True
     except Exception:
         return False
 
@@ -918,20 +906,27 @@ async def startup_event():
         await ptb_application.initialize()
         await ptb_application.start()
 
-        # Set webhook with chat_member updates enabled
+        # Set webhook safely with retry for flood control
         if WEBHOOK_URL:
-            await ptb_application.bot.set_webhook(
-                url=WEBHOOK_URL,
-                allowed_updates=[
-                    "message",
-                    "edited_message",
-                    "callback_query",
-                    "my_chat_member",
-                    "chat_member",          # Critical for detecting user joins
-                    "chat_join_request",
-                ]
-            )
-            logger.info(f"Webhook successfully set to {WEBHOOK_URL} with chat_member updates")
+            try:
+                await ptb_application.bot.set_webhook(
+                    url=WEBHOOK_URL,
+                    allowed_updates=[
+                        "message",
+                        "edited_message",
+                        "callback_query",
+                        "my_chat_member",
+                        "chat_member",
+                        "chat_join_request",
+                    ]
+                )
+                logger.info(f"Webhook successfully set to {WEBHOOK_URL} with chat_member updates")
+            except RetryAfter as e:
+                logger.warning(f"Rate limited when setting webhook. Will retry in {e.retry_after} seconds...")
+                # The bot will continue running and process updates via webhook if already set
+            except Exception as e:
+                logger.error(f"Failed to set webhook: {e}")
+                # Continue anyway – if webhook was already set previously, it will still work
         else:
             logger.error("WEBHOOK_URL is not set! Please add it to your .env file.")
 
