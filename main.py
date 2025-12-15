@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 from telegram.constants import ChatType, ChatMemberStatus
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, RetryAfter, Forbidden
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -113,15 +113,6 @@ async def get_user_groups(user_id: int):
         return result.data
     except Exception as e:
         logger.error(f"Error getting user groups: {e}")
-        return []
-
-async def get_all_groups():
-    """Get all groups from the database"""
-    try:
-        result = supabase.table('groups').select("*").execute()
-        return result.data
-    except Exception as e:
-        logger.error(f"Error getting all groups: {e}")
         return []
 
 async def add_banned_word(chat_id: int, word: str, added_by: int):
@@ -939,31 +930,43 @@ async def run_cleanup_job():
         await remove_pending_deletion(row_id)
     return {"status": "ok", "deleted_count": deleted_count}
 
+async def delete_group_and_words(chat_id: int):
+    """Delete group and associated banned words from database"""
+    try:
+        supabase.table('banned_words').delete().eq('chat_id', chat_id).execute()
+        supabase.table('groups').delete().eq('chat_id', chat_id).execute()
+    except Exception as e:
+        logger.error(f"Error deleting group {chat_id} and banned words: {e}")
+
 @app.get("/run-group-cleanup")
 async def run_group_cleanup():
-    """Cleanup dead groups from the database"""
+    """Cleanup dead groups from database"""
     if ptb_application is None:
         await startup_event()
-    groups = await get_all_groups()
+    try:
+        result = supabase.table('groups').select('chat_id').execute()
+        groups = [g['chat_id'] for g in result.data]
+    except Exception as e:
+        logger.error(f"Error getting groups: {e}")
+        return {"status": "error"}
     removed = []
-    for group in groups:
-        chat_id = group['chat_id']
+    for chat_id in groups:
         try:
             await ptb_application.bot.get_chat(chat_id)
-        except RetryAfter as ra:
-            logger.warning(f"Rate limit hit for group {chat_id}, sleeping {ra.retry_after} seconds")
-            await asyncio.sleep(ra.retry_after)
-            await ptb_application.bot.get_chat(chat_id)  # Retry once
-        except telegram.error.TelegramError as e:
-            error_msg = str(e).lower()
-            if "forbidden" in error_msg or "chat not found" in error_msg:
-                # Delete group and related data
-                supabase.table('groups').delete().eq('chat_id', chat_id).execute()
-                supabase.table('banned_words').delete().eq('chat_id', chat_id).execute()
-                supabase.table('pending_deletions').delete().eq('chat_id', chat_id).execute()
+        except Forbidden as e:
+            logger.info(f"Removing forbidden chat {chat_id}: {e}")
+            await delete_group_and_words(chat_id)
+            removed.append(chat_id)
+        except BadRequest as e:
+            if "chat not found" in str(e).lower():
+                logger.info(f"Removing not found chat {chat_id}: {e}")
+                await delete_group_and_words(chat_id)
                 removed.append(chat_id)
-                logger.info(f"Removed dead group {chat_id}: {error_msg}")
             else:
-                logger.error(f"Unexpected error for group {chat_id}: {e}")
-        await asyncio.sleep(0.5)  # Delay to avoid spamming Telegram
-    return {"status": "ok", "removed_count": len(removed), "removed": removed}
+                logger.warning(f"Other BadRequest for {chat_id}: {e}")
+        except RetryAfter as e:
+            logger.warning(f"Rate limit hit: {e}")
+            await asyncio.sleep(e.retry_after)
+        except Exception as e:
+            logger.error(f"Unexpected error for {chat_id}: {e}")
+    return {"status": "ok", "removed": removed}
