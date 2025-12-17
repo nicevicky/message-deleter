@@ -18,6 +18,8 @@ from telegram.ext import (
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import asyncio
+import requests
+import json
 # Load environment variables
 load_dotenv()
 # Configure logging
@@ -31,6 +33,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") # REQUIRED: Add to .env → https://your-domain.vercel.app/webhook/webhook
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Initialize FastAPI
 app = FastAPI()
@@ -567,6 +570,37 @@ async def send_welcome_message(chat: any, new_member: any, context: ContextTypes
             user_name = new_member.first_name or new_member.username or "Member"
             user_id = new_member.id
             message_text, buttons = parse_welcome_message(welcome_html, bot_name, user_name, user_id, chat.title)
+            # Translation logic
+            user_lang = new_member.language_code or 'en'
+            if user_lang != 'en':
+                # Prepare texts to translate: message_text and button texts
+                texts_to_translate = [message_text]
+                for btn_text, _ in buttons:
+                    texts_to_translate.append(btn_text)
+                text_to_translate = "\n---\n".join(texts_to_translate)
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+                prompt = f"Translate the following texts to {user_lang}, preserving all HTML tags, emojis, and formatting intact. Each section separated by --- should be translated separately and output in the same order separated by ---:\n{text_to_translate}"
+                payload = {
+                    "contents": [{
+                        "parts": [{
+                            "text": prompt
+                        }]
+                    }]
+                }
+                headers = {"Content-Type": "application/json"}
+                try:
+                    response = requests.post(url, headers=headers, data=json.dumps(payload))
+                    if response.status_code == 200:
+                        result = response.json()
+                        translated_text = result['candidates'][0]['content']['parts'][0]['text']
+                        translated_parts = translated_text.split("\n---\n")
+                        if len(translated_parts) == len(texts_to_translate):
+                            message_text = translated_parts[0]
+                            for i in range(len(buttons)):
+                                buttons[i] = (translated_parts[i+1], buttons[i][1])
+                except Exception as e:
+                    logger.error(f"Error translating welcome message: {e}")
+                    # Fallback to English
             keyboard = []
             if buttons:
                 for i in range(0, len(buttons), 2):
