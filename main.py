@@ -3,7 +3,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Response
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, ChatPermissions
 from telegram.constants import ChatType, ChatMemberStatus
 from telegram.error import BadRequest, RetryAfter, Forbidden
 from telegram.ext import (
@@ -74,6 +74,7 @@ async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username
         max_word_count = 0
         welcome_message = None
         welcome_timer = 0
+        delete_join_messages = True
         if existing_group:
             delete_promotions = existing_group.get('delete_promotions', False)
             delete_links = existing_group.get('delete_links', False)
@@ -81,6 +82,7 @@ async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username
             max_word_count = existing_group.get('max_word_count', 0)
             welcome_message = existing_group.get('welcome_message', None)
             welcome_timer = existing_group.get('welcome_timer', 0)
+            delete_join_messages = existing_group.get('delete_join_messages', True)
         data = {
             "chat_id": chat_id,
             "chat_title": chat_title,
@@ -92,7 +94,8 @@ async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username
             "warning_timer": warning_timer,
             "max_word_count": max_word_count,
             "welcome_message": welcome_message,
-            "welcome_timer": welcome_timer
+            "welcome_timer": welcome_timer,
+            "delete_join_messages": delete_join_messages
         }
         result = supabase.table('groups').upsert(data, on_conflict='chat_id').execute()
         return result
@@ -179,6 +182,14 @@ async def update_welcome_message(chat_id: int, welcome_html: str, timer: int):
     except Exception as e:
         logger.error(f"Error updating welcome message: {e}")
         return None
+async def update_join_messages_setting(chat_id: int, value: bool):
+    """Update join messages deletion setting"""
+    try:
+        result = supabase.table('groups').update({"delete_join_messages": value}).eq('chat_id', chat_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error updating join messages setting: {e}")
+        return None
 async def schedule_message_deletion(chat_id: int, message_id: int, delay_seconds: int):
     """Schedule a message for deletion via DB (for Cron)"""
     try:
@@ -206,6 +217,32 @@ async def remove_pending_deletion(row_id: int):
         supabase.table('pending_deletions').delete().eq('id', row_id).execute()
     except Exception as e:
         logger.error(f"Error removing pending deletion row: {e}")
+async def get_user_status(chat_id: int, user_id: int):
+    """Get user moderation status"""
+    try:
+        result = supabase.table('user_moderation').select("*").eq('chat_id', chat_id).eq('user_id', user_id).execute()
+        if result.data:
+            return result.data[0]
+        return {'status': 'normal', 'reason': ''}
+    except Exception as e:
+        logger.error(f"Error getting user status: {e}")
+        return {'status': 'normal', 'reason': ''}
+async def update_user_status(chat_id: int, user_id: int, status: str, reason: str, admin_id: int):
+    """Update user moderation status"""
+    try:
+        data = {
+            'chat_id': chat_id,
+            'user_id': user_id,
+            'status': status,
+            'reason': reason,
+            'moderated_by': admin_id,
+            'moderated_at': datetime.now(timezone.utc).isoformat()
+        }
+        result = supabase.table('user_moderation').upsert(data, on_conflict=['chat_id', 'user_id']).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error updating user status: {e}")
+        return None
 async def is_channel_linked_to_group(context: ContextTypes.DEFAULT_TYPE, channel_id: int, chat_id: int) -> bool:
     """Check if a channel is linked to a group"""
     try:
@@ -317,6 +354,7 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
     welcome_status = "✅ Enabled" if welcome_msg else "❌ Not Set"
     welcome_timer_val = settings.get('welcome_timer', 0)
     welcome_timer_display = f"{welcome_timer_val}s" if welcome_timer_val > 0 else "Never"
+    joins_status = "✅ Enabled" if settings.get('delete_join_messages', True) else "❌ Disabled"
     text = f"""
 ⚙️ <b>Group Settings</b>
 📱 Group: {settings['chat_title']}
@@ -327,6 +365,7 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
 📝 <b>Max Word Limit:</b> {word_limit_status}
 🔗 <b>Delete Promotions (Forwards/Bots/Spam):</b> {promo_status}
 🌐 <b>Delete Links (URLs):</b> {link_status}
+🧹 <b>Delete Join Messages:</b> {joins_status}
 ⏱ <b>Warning Delete Timer:</b> {timer_display}
     """
     keyboard = [
@@ -337,6 +376,7 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
          InlineKeyboardButton("⏱ Warning Timer", callback_data=f"set_timer_{chat_id}")],
         [InlineKeyboardButton("📢 Toggle Promotions", callback_data=f"toggle_promo_{chat_id}"),
          InlineKeyboardButton("🌐 Toggle Links", callback_data=f"toggle_links_{chat_id}")],
+        [InlineKeyboardButton("🧹 Toggle Join Deletes", callback_data=f"toggle_joins_{chat_id}")],
         [InlineKeyboardButton("🔙 Back to Groups", callback_data="my_groups")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -461,6 +501,16 @@ async def toggle_links_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await update_link_setting(chat_id, new_value)
     status = "enabled" if new_value else "disabled"
     await query.answer(f"Link deletion {status}!", show_alert=True)
+    await group_settings_handler(update, context)
+async def toggle_joins_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = int(query.data.split("_")[2])
+    settings = await get_group_settings(chat_id)
+    new_value = not settings.get('delete_join_messages', True)
+    await update_join_messages_setting(chat_id, new_value)
+    status = "enabled" if new_value else "disabled"
+    await query.answer(f"Join message deletion {status}!", show_alert=True)
     await group_settings_handler(update, context)
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'awaiting_input' not in context.user_data:
@@ -689,6 +739,17 @@ async def user_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"New member {new_member.user.id} ({new_member.user.first_name}) joined group {chat.id}")
         settings = await get_group_settings(chat.id)
         await send_welcome_message(chat, new_member.user, context, settings)
+async def delete_join_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    chat_id = message.chat_id
+    settings = await get_group_settings(chat_id)
+    if settings and settings.get('delete_join_messages', True):
+        try:
+            await message.delete()
+        except Exception as e:
+            logger.error(f"Error deleting join message: {e}")
 async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
@@ -804,6 +865,409 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Error deleting message with banned word: {e}")
                 return
+async def warn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        return
+    user = update.effective_user
+    message = update.message
+    member = await chat.get_member(user.id)
+    if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+        try:
+            await message.delete()
+        except:
+            pass
+        return
+    target_user = None
+    reason = ""
+    target_id = None
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
+        reason = ' '.join(context.args)
+    else:
+        if context.args:
+            first_arg = context.args[0]
+            reason = ' '.join(context.args[1:])
+            if first_arg.isdigit():
+                target_id = int(first_arg)
+            elif first_arg.startswith('@'):
+                username = first_arg[1:]
+                try:
+                    target_user = await context.bot.get_chat(f'@{username}')
+                    target_id = target_user.id
+                except:
+                    await message.reply_text("User not found.")
+                    return
+            else:
+                try:
+                    target_user = await context.bot.get_chat(f'@{first_arg}')
+                    target_id = target_user.id
+                except:
+                    await message.reply_text("User not found.")
+                    return
+            if target_id:
+                try:
+                    target_member = await chat.get_member(target_id)
+                    target_user = target_member.user
+                except:
+                    await message.reply_text("User not found in group.")
+                    return
+        else:
+            await message.reply_text("Please reply to a message or provide user ID/username.")
+            return
+    if not target_user:
+        return
+    if target_user.id == context.bot.id:
+        await message.reply_text("Can't warn myself.")
+        return
+    target_member = await chat.get_member(target_user.id)
+    if target_member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+        await message.reply_text("Can't warn admins.")
+        return
+    try:
+        username = target_user.username or target_user.first_name
+        text = f"⚠️ {username} has been warned for: {reason}" if reason else f"⚠️ {username} has been warned."
+        await message.reply_text(text)
+    except Exception as e:
+        await message.reply_text(f"Error: {str(e)}")
+async def mute_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        return
+    user = update.effective_user
+    message = update.message
+    member = await chat.get_member(user.id)
+    if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+        try:
+            await message.delete()
+        except:
+            pass
+        return
+    target_user = None
+    reason = ""
+    target_id = None
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
+        reason = ' '.join(context.args)
+    else:
+        if context.args:
+            first_arg = context.args[0]
+            reason = ' '.join(context.args[1:])
+            if first_arg.isdigit():
+                target_id = int(first_arg)
+            elif first_arg.startswith('@'):
+                username = first_arg[1:]
+                try:
+                    target_user = await context.bot.get_chat(f'@{username}')
+                    target_id = target_user.id
+                except:
+                    await message.reply_text("User not found.")
+                    return
+            else:
+                try:
+                    target_user = await context.bot.get_chat(f'@{first_arg}')
+                    target_id = target_user.id
+                except:
+                    await message.reply_text("User not found.")
+                    return
+            if target_id:
+                try:
+                    target_member = await chat.get_member(target_id)
+                    target_user = target_member.user
+                except:
+                    await message.reply_text("User not found in group.")
+                    return
+        else:
+            await message.reply_text("Please reply to a message or provide user ID/username.")
+            return
+    if not target_user:
+        return
+    if target_user.id == context.bot.id:
+        await message.reply_text("Can't mute myself.")
+        return
+    target_member = await chat.get_member(target_user.id)
+    if target_member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+        await message.reply_text("Can't mute admins.")
+        return
+    try:
+        permissions = ChatPermissions(
+            can_send_messages=False,
+            can_send_media_messages=False,
+            can_send_polls=False,
+            can_send_other_messages=False,
+            can_add_web_page_previews=False,
+            can_change_info=False,
+            can_invite_users=False,
+            can_pin_messages=False,
+        )
+        await chat.restrict_member(target_user.id, permissions)
+        await update_user_status(chat.id, target_user.id, 'muted', reason, user.id)
+        username = target_user.username or target_user.first_name
+        text = f"🔇 {username} has been muted for: {reason}" if reason else f"🔇 {username} has been muted."
+        keyboard = [[InlineKeyboardButton("Unmute", callback_data=f"unmute_{target_user.id}_{chat.id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await message.reply_text(text, reply_markup=reply_markup)
+    except Exception as e:
+        await message.reply_text(f"Error: {str(e)}")
+async def unmute_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        return
+    user = update.effective_user
+    message = update.message
+    member = await chat.get_member(user.id)
+    if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+        try:
+            await message.delete()
+        except:
+            pass
+        return
+    target_user = None
+    target_id = None
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
+    else:
+        if context.args:
+            first_arg = context.args[0]
+            if first_arg.isdigit():
+                target_id = int(first_arg)
+            elif first_arg.startswith('@'):
+                username = first_arg[1:]
+                try:
+                    target_user = await context.bot.get_chat(f'@{username}')
+                    target_id = target_user.id
+                except:
+                    await message.reply_text("User not found.")
+                    return
+            else:
+                try:
+                    target_user = await context.bot.get_chat(f'@{first_arg}')
+                    target_id = target_user.id
+                except:
+                    await message.reply_text("User not found.")
+                    return
+            if target_id:
+                try:
+                    target_member = await chat.get_member(target_id)
+                    target_user = target_member.user
+                except:
+                    await message.reply_text("User not found in group.")
+                    return
+        else:
+            await message.reply_text("Please reply to a message or provide user ID/username.")
+            return
+    if not target_user:
+        return
+    if target_user.id == context.bot.id:
+        await message.reply_text("Can't unmute myself.")
+        return
+    try:
+        permissions = ChatPermissions(
+            can_send_messages=True,
+            can_send_media_messages=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+            can_change_info=False,
+            can_invite_users=True,
+            can_pin_messages=False,
+        )
+        await chat.restrict_member(target_user.id, permissions)
+        await update_user_status(chat.id, target_user.id, 'normal', '', user.id)
+        username = target_user.username or target_user.first_name
+        text = f"🔊 {username} has been unmuted."
+        await message.reply_text(text)
+    except Exception as e:
+        await message.reply_text(f"Error: {str(e)}")
+async def ban_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        return
+    user = update.effective_user
+    message = update.message
+    member = await chat.get_member(user.id)
+    if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+        try:
+            await message.delete()
+        except:
+            pass
+        return
+    target_user = None
+    reason = ""
+    target_id = None
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
+        reason = ' '.join(context.args)
+    else:
+        if context.args:
+            first_arg = context.args[0]
+            reason = ' '.join(context.args[1:])
+            if first_arg.isdigit():
+                target_id = int(first_arg)
+            elif first_arg.startswith('@'):
+                username = first_arg[1:]
+                try:
+                    target_user = await context.bot.get_chat(f'@{username}')
+                    target_id = target_user.id
+                except:
+                    await message.reply_text("User not found.")
+                    return
+            else:
+                try:
+                    target_user = await context.bot.get_chat(f'@{first_arg}')
+                    target_id = target_user.id
+                except:
+                    await message.reply_text("User not found.")
+                    return
+            if target_id:
+                try:
+                    target_member = await chat.get_member(target_id)
+                    target_user = target_member.user
+                except:
+                    await message.reply_text("User not found in group.")
+                    return
+        else:
+            await message.reply_text("Please reply to a message or provide user ID/username.")
+            return
+    if not target_user:
+        return
+    if target_user.id == context.bot.id:
+        await message.reply_text("Can't ban myself.")
+        return
+    target_member = await chat.get_member(target_user.id)
+    if target_member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+        await message.reply_text("Can't ban admins.")
+        return
+    try:
+        await chat.ban_member(target_user.id)
+        await update_user_status(chat.id, target_user.id, 'banned', reason, user.id)
+        username = target_user.username or target_user.first_name
+        text = f"🚫 {username} has been banned for: {reason}" if reason else f"🚫 {username} has been banned."
+        keyboard = [[InlineKeyboardButton("Unban", callback_data=f"unban_{target_user.id}_{chat.id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await message.reply_text(text, reply_markup=reply_markup)
+    except Exception as e:
+        await message.reply_text(f"Error: {str(e)}")
+async def unban_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        return
+    user = update.effective_user
+    message = update.message
+    member = await chat.get_member(user.id)
+    if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+        try:
+            await message.delete()
+        except:
+            pass
+        return
+    target_user = None
+    target_id = None
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
+    else:
+        if context.args:
+            first_arg = context.args[0]
+            if first_arg.isdigit():
+                target_id = int(first_arg)
+            elif first_arg.startswith('@'):
+                username = first_arg[1:]
+                try:
+                    target_user = await context.bot.get_chat(f'@{username}')
+                    target_id = target_user.id
+                except:
+                    await message.reply_text("User not found.")
+                    return
+            else:
+                try:
+                    target_user = await context.bot.get_chat(f'@{first_arg}')
+                    target_id = target_user.id
+                except:
+                    await message.reply_text("User not found.")
+                    return
+            if target_id:
+                try:
+                    target_member = await chat.get_member(target_id)
+                    target_user = target_member.user
+                except:
+                    await message.reply_text("User not found in group.")
+                    return
+        else:
+            await message.reply_text("Please reply to a message or provide user ID/username.")
+            return
+    if not target_user:
+        return
+    if target_user.id == context.bot.id:
+        await message.reply_text("Can't unban myself.")
+        return
+    try:
+        await chat.unban_member(target_user.id)
+        await update_user_status(chat.id, target_user.id, 'normal', '', user.id)
+        username = target_user.username or target_user.first_name
+        text = f"✅ {username} has been unbanned."
+        await message.reply_text(text)
+    except Exception as e:
+        await message.reply_text(f"Error: {str(e)}")
+async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        return
+    user = update.effective_user
+    message = update.message
+    target_user = None
+    reason = ""
+    target_id = None
+    target_username = None
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
+        reason = ' '.join(context.args)
+    else:
+        if context.args:
+            first_arg = context.args[0]
+            reason = ' '.join(context.args[1:])
+            if first_arg.isdigit():
+                target_id = int(first_arg)
+            elif first_arg.startswith('@'):
+                target_username = first_arg[1:]
+            else:
+                target_username = first_arg
+    if target_username:
+        try:
+            target_user = await context.bot.get_chat(f'@{target_username}')
+        except:
+            await message.reply_text("User not found.")
+            return
+    elif target_id:
+        try:
+            target_member = await chat.get_member(target_id)
+            target_user = target_member.user
+        except:
+            await message.reply_text("User not found.")
+            return
+    if not target_user:
+        await message.reply_text("Please reply to a message or provide user ID/username.")
+        return
+    try:
+        await message.delete()
+    except:
+        pass
+    try:
+        await context.bot.send_message(user.id, "Your report has been sent to admins privately.")
+    except Forbidden:
+        pass
+    except Exception as e:
+        logger.error(f"Error sending private message to reporter: {e}")
+    try:
+        admins = await chat.get_administrators()
+        for admin in admins:
+            if not admin.user.is_bot:
+                text = f"Report in {chat.title}:\nFrom {user.mention_html()}:\nReported {target_user.mention_html()} for: {reason}"
+                try:
+                    await context.bot.send_message(admin.user.id, text, parse_mode='HTML')
+                except:
+                    pass
+    except Exception as e:
+        logger.error(f"Error sending reports to admins: {e}")
 async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -829,6 +1293,56 @@ async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TY
         await toggle_promo_handler(update, context)
     elif data.startswith("toggle_links_"):
         await toggle_links_handler(update, context)
+    elif data.startswith("toggle_joins_"):
+        await toggle_joins_handler(update, context)
+    elif data.startswith("unban_"):
+        await query.answer()
+        parts = data.split("_")
+        if len(parts) != 3:
+            return
+        target_id = int(parts[1])
+        chat_id = int(parts[2])
+        presser = query.from_user
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            member = await chat.get_member(presser.id)
+            if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                await query.answer("Only admins can unban.", show_alert=True)
+                return
+            await chat.unban_member(target_id)
+            await update_user_status(chat_id, target_id, 'normal', '', presser.id)
+            await query.edit_message_text(query.message.text + "\n✅ Unbanned.")
+        except Exception as e:
+            await query.answer(f"Error: {str(e)}", show_alert=True)
+    elif data.startswith("unmute_"):
+        await query.answer()
+        parts = data.split("_")
+        if len(parts) != 3:
+            return
+        target_id = int(parts[1])
+        chat_id = int(parts[2])
+        presser = query.from_user
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            member = await chat.get_member(presser.id)
+            if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                await query.answer("Only admins can unmute.", show_alert=True)
+                return
+            permissions = ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_change_info=False,
+                can_invite_users=True,
+                can_pin_messages=False,
+            )
+            await chat.restrict_member(target_id, permissions)
+            await update_user_status(chat_id, target_id, 'normal', '', presser.id)
+            await query.edit_message_text(query.message.text + "\n✅ Unmuted.")
+        except Exception as e:
+            await query.answer(f"Error: {str(e)}", show_alert=True)
 # --- FASTAPI / WEBHOOK SETUP ---
 @app.on_event("startup")
 async def startup_event():
@@ -858,6 +1372,16 @@ async def startup_event():
             filters.TEXT & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
             check_message
         ))
+        ptb_application.add_handler(MessageHandler(
+            filters.StatusUpdate.NEW_CHAT_MEMBERS,
+            delete_join_handler
+        ))
+        ptb_application.add_handler(CommandHandler("warn", warn_handler))
+        ptb_application.add_handler(CommandHandler("mute", mute_handler))
+        ptb_application.add_handler(CommandHandler("unmute", unmute_handler))
+        ptb_application.add_handler(CommandHandler("ban", ban_handler))
+        ptb_application.add_handler(CommandHandler("unban", unban_handler))
+        ptb_application.add_handler(CommandHandler("report", report_handler))
         await ptb_application.initialize()
         await ptb_application.start()
         # Set webhook safely with retry for flood control
