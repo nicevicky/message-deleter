@@ -3,7 +3,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Response
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, ChatPermissions
 from telegram.constants import ChatType, ChatMemberStatus
 from telegram.error import BadRequest, RetryAfter, Forbidden
 from telegram.ext import (
@@ -74,10 +74,29 @@ async def get_group_settings(chat_id: int):
         return None
 
 async def is_user_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if user is admin in the group"""
+    """Check if user is admin in the group (supports anonymous admins)"""
     try:
         member = await context.bot.get_chat_member(chat_id, user_id)
         return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+    except Exception:
+        return False
+
+async def is_sender_admin(chat_id: int, message, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if the message sender is an admin (supports anonymous admins)"""
+    try:
+        # For anonymous admins, message.from_user might be None or the group itself
+        # We need to check if the sender is actually an admin
+        if message.sender_chat and message.sender_chat.id == chat_id:
+            # Message sent by anonymous admin (as the group)
+            # We need to check if the user who triggered the command is an admin
+            # For anonymous admins, we'll allow the command if it's from an admin
+            # We can check by getting all admins and seeing if any match
+            return True
+        
+        if message.from_user:
+            return await is_user_admin(chat_id, message.from_user.id, context)
+        
+        return False
     except Exception:
         return False
 
@@ -408,11 +427,12 @@ async def is_channel_linked_to_group(context: ContextTypes.DEFAULT_TYPE, channel
 
 # --- MODERATION COMMAND HANDLERS ---
 async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /warn command - Admin only"""
+    """Handle /warn command - Admin only (supports anonymous admins)"""
     message = update.message
     chat = message.chat
     
-    if not await is_user_admin(chat.id, message.from_user.id, context):
+    # Support anonymous admins - check if sender is admin
+    if not await is_sender_admin(chat.id, message, context):
         await message.reply_text("⚠️ This command is only for admins!")
         return
     
@@ -456,8 +476,11 @@ async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ User not found. Please reply to the user's message or mention them with @username")
         return
     
+    # For anonymous admin, use bot ID or 0 as warned_by
+    warned_by = message.from_user.id if message.from_user else 0
+    
     # Add warning to database
-    await add_warning(chat.id, target_user.id, message.from_user.id, reason, target_username)
+    await add_warning(chat.id, target_user.id, warned_by, reason, target_username)
     
     # Get warning count
     warnings = await get_user_warnings(chat.id, target_user.id)
@@ -465,7 +488,7 @@ async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Send warning message
     user_mention = target_user.mention_html()
-    admin_mention = message.from_user.mention_html()
+    admin_mention = "Anonymous Admin" if not message.from_user else message.from_user.mention_html()
     
     warn_msg = f"""
 ⚠️ <b>WARNING #{warning_count}</b>
@@ -492,11 +515,12 @@ This user has been warned by admin.
         await schedule_message_deletion(chat.id, sent_message.message_id, settings.get('warning_timer'))
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /ban command - Admin only"""
+    """Handle /ban command - Admin only (supports anonymous admins)"""
     message = update.message
     chat = message.chat
     
-    if not await is_user_admin(chat.id, message.from_user.id, context):
+    # Support anonymous admins - check if sender is admin
+    if not await is_sender_admin(chat.id, message, context):
         await message.reply_text("⚠️ This command is only for admins!")
         return
     
@@ -552,12 +576,15 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(f"❌ Error banning user: {e}")
         return
     
+    # For anonymous admin, use bot ID or 0 as banned_by
+    banned_by = message.from_user.id if message.from_user else 0
+    
     # Add ban to database
-    await add_ban(chat.id, target_user.id, message.from_user.id, reason, target_username)
+    await add_ban(chat.id, target_user.id, banned_by, reason, target_username)
     
     # Send ban message
     user_mention = target_user.mention_html()
-    admin_mention = message.from_user.mention_html()
+    admin_mention = "Anonymous Admin" if not message.from_user else message.from_user.mention_html()
     
     ban_msg = f"""
 🚫 <b>USER BANNED</b>
@@ -578,11 +605,12 @@ This user has been banned from the group.
     await message.reply_html(ban_msg, reply_markup=reply_markup)
 
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /unban command - Admin only"""
+    """Handle /unban command - Admin only (supports anonymous admins)"""
     message = update.message
     chat = message.chat
     
-    if not await is_user_admin(chat.id, message.from_user.id, context):
+    # Support anonymous admins - check if sender is admin
+    if not await is_sender_admin(chat.id, message, context):
         await message.reply_text("⚠️ This command is only for admins!")
         return
     
@@ -632,11 +660,12 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text("✅ User has been unbanned successfully!")
 
 async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /mute command - Admin only"""
+    """Handle /mute command - Admin only (supports anonymous admins)"""
     message = update.message
     chat = message.chat
     
-    if not await is_user_admin(chat.id, message.from_user.id, context):
+    # Support anonymous admins - check if sender is admin
+    if not await is_sender_admin(chat.id, message, context):
         await message.reply_text("⚠️ This command is only for admins!")
         return
     
@@ -705,21 +734,24 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ This user is already muted!")
         return
     
-    # Mute user in Telegram (restrict permissions)
+    # Mute user in Telegram using NEW ChatPermissions API
     try:
-        await chat.restrict_member(
-            target_user.id,
+        permissions = ChatPermissions(
             can_send_messages=False,
             can_send_media_messages=False,
             can_send_other_messages=False,
             can_add_web_page_previews=False
         )
+        await chat.restrict_member(target_user.id, permissions)
     except Exception as e:
         await message.reply_text(f"❌ Error muting user: {e}")
         return
     
+    # For anonymous admin, use bot ID or 0 as muted_by
+    muted_by = message.from_user.id if message.from_user else 0
+    
     # Add mute to database
-    await add_mute(chat.id, target_user.id, message.from_user.id, reason, duration_minutes, target_username)
+    await add_mute(chat.id, target_user.id, muted_by, reason, duration_minutes, target_username)
     
     # Format duration display
     if duration_minutes >= 60:
@@ -731,7 +763,7 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Send mute message
     user_mention = target_user.mention_html()
-    admin_mention = message.from_user.mention_html()
+    admin_mention = "Anonymous Admin" if not message.from_user else message.from_user.mention_html()
     
     mute_msg = f"""
 🔇 <b>USER MUTED</b>
@@ -753,11 +785,12 @@ This user has been muted and cannot send messages.
     await message.reply_html(mute_msg, reply_markup=reply_markup)
 
 async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /unmute command - Admin only"""
+    """Handle /unmute command - Admin only (supports anonymous admins)"""
     message = update.message
     chat = message.chat
     
-    if not await is_user_admin(chat.id, message.from_user.id, context):
+    # Support anonymous admins - check if sender is admin
+    if not await is_sender_admin(chat.id, message, context):
         await message.reply_text("⚠️ This command is only for admins!")
         return
     
@@ -794,15 +827,15 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ This user is not currently muted!")
         return
     
-    # Unmute user in Telegram
+    # Unmute user in Telegram using NEW ChatPermissions API
     try:
-        await chat.restrict_member(
-            target_user_id,
+        permissions = ChatPermissions(
             can_send_messages=True,
             can_send_media_messages=True,
             can_send_other_messages=True,
             can_add_web_page_previews=True
         )
+        await chat.restrict_member(target_user_id, permissions)
     except Exception as e:
         await message.reply_text(f"❌ Error unmuting user: {e}")
         return
@@ -943,15 +976,15 @@ async def unmute_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await query.answer("⚠️ Only admins can unmute users!", show_alert=True)
         return
     
-    # Unmute user
+    # Unmute user using NEW ChatPermissions API
     try:
-        await context.bot.restrict_member(
-            chat_id, user_id,
+        permissions = ChatPermissions(
             can_send_messages=True,
             can_send_media_messages=True,
             can_send_other_messages=True,
             can_add_web_page_previews=True
         )
+        await context.bot.restrict_member(chat_id, user_id, permissions)
         await unmute_user_in_db(chat_id, user_id)
         
         # Update message
@@ -1022,15 +1055,15 @@ async def mute_from_warn_callback_handler(update: Update, context: ContextTypes.
         await query.answer("⚠️ Only admins can mute users!", show_alert=True)
         return
     
-    # Mute user for 1 hour
+    # Mute user for 1 hour using NEW ChatPermissions API
     try:
-        await context.bot.restrict_member(
-            chat_id, user_id,
+        permissions = ChatPermissions(
             can_send_messages=False,
             can_send_media_messages=False,
             can_send_other_messages=False,
             can_add_web_page_previews=False
         )
+        await context.bot.restrict_member(chat_id, user_id, permissions)
         await add_mute(chat_id, user_id, query.from_user.id, "Muted from warning", 60)
         
         # Update message
@@ -1055,8 +1088,8 @@ async def show_admin_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.message
     chat = message.chat
     
-    # Check if user is admin
-    if not await is_user_admin(chat.id, message.from_user.id, context):
+    # Support anonymous admins - check if sender is admin
+    if not await is_sender_admin(chat.id, message, context):
         await message.reply_text("⚠️ This keyboard is only visible to admins!")
         return
     
@@ -1595,11 +1628,11 @@ async def send_welcome_message(chat: any, new_member: any, context: ContextTypes
                 prompt = f"Translate the following texts to {user_lang}, preserving all HTML tags, emojis, and formatting intact. Each section separated by --- should be translated separately and output in the same order separated by ---:\n{text_to_translate}"
                 
                 payload = {
-                    "contents": [{
+                    "contents": [({
                         "parts": [{
                             "text": prompt
                         }]
-                    }]
+                    })]
                 }
                 headers = {"Content-Type": "application/json"}
                 
