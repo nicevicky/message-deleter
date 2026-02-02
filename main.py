@@ -425,6 +425,49 @@ async def is_channel_linked_to_group(context: ContextTypes.DEFAULT_TYPE, channel
     except Exception:
         return False
 
+# --- HELPER FUNCTION: PARSE DURATION ---
+def parse_duration(duration_str: str) -> int:
+    """
+    Parse duration string and return seconds
+    Supported formats: 10m, 1h, 2d, 1w
+    Returns: duration in seconds
+    """
+    duration_str_lower = duration_str.lower().strip()
+    
+    # Check for 'm' (minutes)
+    if duration_str_lower.endswith('m'):
+        try:
+            return int(duration_str_lower[:-1]) * 60
+        except ValueError:
+            return 0
+    
+    # Check for 'h' (hours)
+    elif duration_str_lower.endswith('h'):
+        try:
+            return int(duration_str_lower[:-1]) * 60 * 60
+        except ValueError:
+            return 0
+    
+    # Check for 'd' (days)
+    elif duration_str_lower.endswith('d'):
+        try:
+            return int(duration_str_lower[:-1]) * 60 * 60 * 24
+        except ValueError:
+            return 0
+    
+    # Check for 'w' (weeks)
+    elif duration_str_lower.endswith('w'):
+        try:
+            return int(duration_str_lower[:-1]) * 60 * 60 * 24 * 7
+        except ValueError:
+            return 0
+    
+    # Try plain number (assume minutes)
+    try:
+        return int(duration_str_lower) * 60
+    except ValueError:
+        return 0
+
 # --- MODERATION COMMAND HANDLERS ---
 async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /warn command - Admin only (supports anonymous admins)"""
@@ -660,7 +703,7 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text("✅ User has been unbanned successfully!")
 
 async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /mute command - Admin only (supports anonymous admins)"""
+    """Handle /mute command - Admin only (supports anonymous admins) with custom duration support"""
     message = update.message
     chat = message.chat
     
@@ -670,11 +713,11 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Parse arguments: /mute @username duration reason
-    # Duration format: 10m, 1h, etc.
+    # Duration format: 10m, 1h, 1d, 1w, etc.
     if not context.args or len(context.args) < 2:
         await message.reply_text(
             "❌ Usage: /mute <username/ID> <duration> <reason>\n\n"
-            "Duration examples: 10m, 1h, 2h\n"
+            "Duration examples: 10m, 1h, 1d, 1w\n"
             "Example: /mute @user123 1h Spamming"
         )
         return
@@ -684,22 +727,31 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     duration_str = context.args[1]
     reason = " ".join(context.args[2:]) if len(context.args) > 2 else "No reason provided"
     
-    # Parse duration
-    duration_minutes = 0
-    duration_str_lower = duration_str.lower()
+    # Parse duration using helper function
+    duration_seconds = parse_duration(duration_str)
     
-    if duration_str_lower.endswith('m'):
-        duration_minutes = int(duration_str_lower[:-1])
-    elif duration_str_lower.endswith('h'):
-        duration_minutes = int(duration_str_lower[:-1]) * 60
-    elif duration_str_lower.endswith('d'):
-        duration_minutes = int(duration_str_lower[:-1]) * 60 * 24
-    else:
-        try:
-            duration_minutes = int(duration_str)
-        except ValueError:
-            await message.reply_text("❌ Invalid duration format. Use: 10m, 1h, 2d")
-            return
+    if duration_seconds == 0:
+        await message.reply_text(
+            "❌ Invalid duration format!\n\n"
+            "Supported formats:\n"
+            "• 10m (10 minutes)\n"
+            "• 1h (1 hour)\n"
+            "• 1d (1 day)\n"
+            "• 1w (1 week)\n"
+            "• 30 (30 minutes, default)\n\n"
+            "Maximum duration: 366 days"
+        )
+        return
+    
+    # Validate maximum duration (366 days in seconds)
+    max_duration_seconds = 366 * 24 * 60 * 60
+    if duration_seconds > max_duration_seconds:
+        await message.reply_text(
+            "❌ Duration exceeds maximum limit!\n\n"
+            f"Maximum allowed: 366 days\n"
+            f"Your duration: {duration_str}"
+        )
+        return
     
     # Get target user
     target_user = None
@@ -734,7 +786,11 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ This user is already muted!")
         return
     
-    # Mute user in Telegram using NEW ChatPermissions API
+    # Calculate until_date (Unix timestamp)
+    from datetime import datetime, timezone
+    until_date = int((datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)).timestamp())
+    
+    # Mute user in Telegram using restrictChatMember with until_date
     try:
         permissions = ChatPermissions(
             can_send_messages=False,
@@ -746,10 +802,13 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_send_video_notes=False,
             can_send_polls=False
         )
-        await chat.restrict_member(target_user.id, permissions)
+        await chat.restrict_member(target_user.id, permissions, until_date=until_date)
     except Exception as e:
         await message.reply_text(f"❌ Error muting user: {e}")
         return
+    
+    # Convert duration to minutes for database
+    duration_minutes = duration_seconds // 60
     
     # For anonymous admin, use bot ID or 0 as muted_by
     muted_by = message.from_user.id if message.from_user else 0
@@ -758,9 +817,15 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await add_mute(chat.id, target_user.id, muted_by, reason, duration_minutes, target_username)
     
     # Format duration display
-    if duration_minutes >= 60:
-        hours = duration_minutes // 60
-        mins = duration_minutes % 60
+    if duration_seconds >= 604800:  # 1 week
+        weeks = duration_seconds // 604800
+        duration_display = f"{weeks} week{'s' if weeks > 1 else ''}"
+    elif duration_seconds >= 86400:  # 1 day
+        days = duration_seconds // 86400
+        duration_display = f"{days} day{'s' if days > 1 else ''}"
+    elif duration_seconds >= 3600:  # 1 hour
+        hours = duration_seconds // 3600
+        mins = (duration_seconds % 3600) // 60
         duration_display = f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
     else:
         duration_display = f"{duration_minutes}m"
@@ -831,7 +896,7 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ This user is not currently muted!")
         return
     
-    # Unmute user in Telegram using NEW ChatPermissions API
+    # Unmute user in Telegram using restrictChatMember with until_date=0 (unlimited)
     try:
         permissions = ChatPermissions(
             can_send_messages=True,
@@ -843,7 +908,7 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_send_video_notes=True,
             can_send_polls=True
         )
-        await chat.restrict_member(target_user_id, permissions)
+        await chat.restrict_member(target_user_id, permissions, until_date=0)
     except Exception as e:
         await message.reply_text(f"❌ Error unmuting user: {e}")
         return
@@ -851,7 +916,24 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Mark mute as inactive in database
     await unmute_user_in_db(chat.id, target_user_id)
     
-    await message.reply_text("✅ User has been unmuted successfully!")
+    # Get user info for professional message
+    try:
+        target_user = await context.bot.get_chat_member(chat.id, target_user_id)
+        if target_user.user:
+            username = target_user.user.username or target_user.user.first_name or f"User {target_user_id}"
+            if target_user.user.username:
+                user_mention = f"@{target_user.user.username}"
+            else:
+                user_mention = target_user.user.mention_html()
+        else:
+            user_mention = f"User {target_user_id}"
+    except Exception:
+        user_mention = f"User {target_user_id}"
+    
+    await message.reply_html(
+        f"✅ <b>User Unmuted</b>\n\n"
+        f"{user_mention} has been unmuted and can now send messages in the group."
+    )
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /report command - Available to all members"""
@@ -891,7 +973,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_user = target_user.user
                 target_username = target_user.username
         except Exception:
-            await message.reply_text("❌ Could not find user. Please reply to their message or mention them with @username")
+            await message.reply_text("❌ Could not find user. Please reply to the user's message or mention them with @username")
             return
     
     if not target_user:
@@ -955,11 +1037,26 @@ async def unban_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await context.bot.unban_member(chat_id, user_id)
         await unban_user_in_db(chat_id, user_id)
         
+        # Get user info for professional message
+        try:
+            target_user = await context.bot.get_chat_member(chat_id, user_id)
+            if target_user.user:
+                username = target_user.user.username or target_user.user.first_name or f"User {user_id}"
+                if target_user.user.username:
+                    user_mention = f"@{target_user.user.username}"
+                else:
+                    user_mention = target_user.user.mention_html()
+            else:
+                user_mention = f"User {user_id}"
+        except Exception:
+            user_mention = f"User {user_id}"
+        
         # Update message
         try:
             await query.message.edit_text(
-                f"✅ User has been unbanned successfully!\n\nUser ID: {user_id}",
-                reply_markup=None
+                f"✅ <b>User Unbanned</b>\n\n{user_mention} has been unbanned and can join the group again.",
+                reply_markup=None,
+                parse_mode='HTML'
             )
         except BadRequest:
             pass
@@ -984,7 +1081,7 @@ async def unmute_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await query.answer("⚠️ Only admins can unmute users!", show_alert=True)
         return
     
-    # Unmute user using NEW ChatPermissions API
+    # Unmute user using restrictChatMember with until_date=0 (unlimited)
     try:
         permissions = ChatPermissions(
             can_send_messages=True,
@@ -996,14 +1093,29 @@ async def unmute_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             can_send_video_notes=True,
             can_send_polls=True
         )
-        await context.bot.restrict_member(chat_id, user_id, permissions)
+        await context.bot.restrict_member(chat_id, user_id, permissions, until_date=0)
         await unmute_user_in_db(chat_id, user_id)
+        
+        # Get user info for professional message
+        try:
+            target_user = await context.bot.get_chat_member(chat_id, user_id)
+            if target_user.user:
+                username = target_user.user.username or target_user.user.first_name or f"User {user_id}"
+                if target_user.user.username:
+                    user_mention = f"@{target_user.user.username}"
+                else:
+                    user_mention = target_user.user.mention_html()
+            else:
+                user_mention = f"User {user_id}"
+        except Exception:
+            user_mention = f"User {user_id}"
         
         # Update message
         try:
             await query.message.edit_text(
-                f"✅ User has been unmuted successfully!\n\nUser ID: {user_id}",
-                reply_markup=None
+                f"✅ <b>User Unmuted</b>\n\n{user_mention} has been unmuted and can now send messages in the group.",
+                reply_markup=None,
+                parse_mode='HTML'
             )
         except BadRequest:
             pass
@@ -1067,8 +1179,11 @@ async def mute_from_warn_callback_handler(update: Update, context: ContextTypes.
         await query.answer("⚠️ Only admins can mute users!", show_alert=True)
         return
     
-    # Mute user for 1 hour using NEW ChatPermissions API
+    # Mute user for 1 hour using restrictChatMember with until_date
     try:
+        from datetime import datetime, timezone
+        until_date = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())
+        
         permissions = ChatPermissions(
             can_send_messages=False,
             can_send_photos=False,
@@ -1079,7 +1194,7 @@ async def mute_from_warn_callback_handler(update: Update, context: ContextTypes.
             can_send_video_notes=False,
             can_send_polls=False
         )
-        await context.bot.restrict_member(chat_id, user_id, permissions)
+        await context.bot.restrict_member(chat_id, user_id, permissions, until_date=until_date)
         await add_mute(chat_id, user_id, query.from_user.id, "Muted from warning", 60)
         
         # Update message
@@ -1164,7 +1279,7 @@ async def admin_keyboard_callback_handler(update: Update, context: ContextTypes.
     # Show usage instructions
     instructions = {
         "warn": "⚠️ <b>Warn Usage</b>\n\nReply to a message and use: /warn @username reason\nExample: /warn @user123 Spamming",
-        "mute": "🔇 <b>Mute Usage</b>\n\nReply to a message and use: /mute @username duration reason\nExample: /mute @user123 1h Spamming\nDuration: 10m, 1h, 2d",
+        "mute": "🔇 <b>Mute Usage</b>\n\nReply to a message and use: /mute @username duration reason\nExample: /mute @user123 1h Spamming\nDuration: 10m, 1h, 1d, 1w",
         "ban": "🚫 <b>Ban Usage</b>\n\nReply to a message and use: /ban @username reason\nExample: /ban @user123 Repeated spam",
         "unmute": "🔊 <b>Unmute Usage</b>\n\nUse: /unmute @username\nExample: /unmute @user123",
         "unban": "✅ <b>Unban Usage</b>\n\nUse: /unban @username\nExample: /unban @user123",
@@ -1209,7 +1324,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📚 <b>Bot Commands & Features</b>
 <b>Admin Commands (Group only):</b>
 /warn <username> <reason> - Warn a user
-/mute <username> <duration> <reason> - Mute a user
+/mute <username> <duration> <reason> - Mute a user (supports 10m, 1h, 1d, 1w)
 /ban <username> <reason> - Ban a user
 /unmute <username> - Unmute a user
 /unban <username> - Unban a user
@@ -1645,9 +1760,9 @@ async def send_welcome_message(chat: any, new_member: any, context: ContextTypes
                 
                 payload = {
                     "contents": [({
-                        "parts": [{
+                        "parts": [({
                             "text": prompt
-                        }]
+                        })]
                     })]
                 }
                 headers = {"Content-Type": "application/json"}
@@ -1920,6 +2035,11 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
+    
+    # FIXED: Handle join/leave delete toggles separately to avoid callback parsing error
+    if data == "toggle_join_delete":
+        await query.answer("⚠️ Invalid callback data!", show_alert=True)
+        return
     
     if data == "my_groups":
         await my_groups_handler(update, context)
