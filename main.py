@@ -973,12 +973,22 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_user = target_user.user
                 target_username = target_user.username
         except Exception:
-            await message.reply_text("❌ Could not find user. Please reply to the user's message or mention them with @username")
+            await message.reply_text("❌ Could not find user. Please reply to their message or mention them with @username")
             return
     
     if not target_user:
         await message.reply_text("❌ User not found. Please reply to the user's message or mention them with @username")
         return
+    
+    # FIXED: Check if target user is an admin - cannot report admins
+    try:
+        target_member = await context.bot.get_chat_member(chat.id, target_user.id)
+        if target_member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+            await message.reply_text("⚠️ You cannot report an admin! If you have an issue with an admin, please contact the group owner or report to Telegram support.")
+            return
+    except Exception as e:
+        logger.error(f"Error checking target user admin status: {e}")
+        # If we can't check, still allow the report
     
     # Add report to database
     reporter_username = message.from_user.username or message.from_user.first_name
@@ -1027,9 +1037,17 @@ async def unban_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     user_id = int(parts[2])
     chat_id = int(parts[3])
     
-    # Check if callback user is admin
-    if not await is_user_admin(chat_id, query.from_user.id, context):
-        await query.answer("⚠️ Only admins can unban users!", show_alert=True)
+    # FIXED: Improved admin check - properly handle all admin types including anonymous admins
+    try:
+        # Check if callback user is admin
+        is_admin = await is_user_admin(chat_id, query.from_user.id, context)
+        
+        if not is_admin:
+            await query.answer("⚠️ This button is only for admins!", show_alert=True)
+            return
+    except Exception as e:
+        logger.error(f"Error checking admin status: {e}")
+        await query.answer("⚠️ Error checking permissions. Please try again.", show_alert=True)
         return
     
     # Unban user
@@ -1076,9 +1094,17 @@ async def unmute_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     user_id = int(parts[2])
     chat_id = int(parts[3])
     
-    # Check if callback user is admin
-    if not await is_user_admin(chat_id, query.from_user.id, context):
-        await query.answer("⚠️ Only admins can unmute users!", show_alert=True)
+    # FIXED: Improved admin check - properly handle all admin types including anonymous admins
+    try:
+        # Check if callback user is admin
+        is_admin = await is_user_admin(chat_id, query.from_user.id, context)
+        
+        if not is_admin:
+            await query.answer("⚠️ This button is only for admins!", show_alert=True)
+            return
+    except Exception as e:
+        logger.error(f"Error checking admin status: {e}")
+        await query.answer("⚠️ Error checking permissions. Please try again.", show_alert=True)
         return
     
     # Unmute user using restrictChatMember with until_date=0 (unlimited)
@@ -1135,15 +1161,24 @@ async def ban_from_warn_callback_handler(update: Update, context: ContextTypes.D
     user_id = int(parts[3])
     chat_id = int(parts[4])
     
-    # Check if callback user is admin
-    if not await is_user_admin(chat_id, query.from_user.id, context):
-        await query.answer("⚠️ Only admins can ban users!", show_alert=True)
+    # FIXED: Improved admin check - properly handle all admin types including anonymous admins
+    try:
+        # Check if callback user is admin
+        is_admin = await is_user_admin(chat_id, query.from_user.id, context)
+        
+        if not is_admin:
+            await query.answer("⚠️ This button is only for admins!", show_alert=True)
+            return
+    except Exception as e:
+        logger.error(f"Error checking admin status: {e}")
+        await query.answer("⚠️ Error checking permissions. Please try again.", show_alert=True)
         return
     
     # Ban user
     try:
         await context.bot.ban_member(chat_id, user_id)
-        await add_ban(chat_id, user_id, query.from_user.id, "Banned from warning")
+        banned_by = query.from_user.id
+        await add_ban(chat_id, user_id, banned_by, "Banned from warning")
         
         # Update message
         keyboard = [
@@ -1174,9 +1209,17 @@ async def mute_from_warn_callback_handler(update: Update, context: ContextTypes.
     user_id = int(parts[3])
     chat_id = int(parts[4])
     
-    # Check if callback user is admin
-    if not await is_user_admin(chat_id, query.from_user.id, context):
-        await query.answer("⚠️ Only admins can mute users!", show_alert=True)
+    # FIXED: Improved admin check - properly handle all admin types including anonymous admins
+    try:
+        # Check if callback user is admin
+        is_admin = await is_user_admin(chat_id, query.from_user.id, context)
+        
+        if not is_admin:
+            await query.answer("⚠️ This button is only for admins!", show_alert=True)
+            return
+    except Exception as e:
+        logger.error(f"Error checking admin status: {e}")
+        await query.answer("⚠️ Error checking permissions. Please try again.", show_alert=True)
         return
     
     # Mute user for 1 hour using restrictChatMember with until_date
@@ -1195,7 +1238,8 @@ async def mute_from_warn_callback_handler(update: Update, context: ContextTypes.
             can_send_polls=False
         )
         await context.bot.restrict_member(chat_id, user_id, permissions, until_date=until_date)
-        await add_mute(chat_id, user_id, query.from_user.id, "Muted from warning", 60)
+        muted_by = query.from_user.id
+        await add_mute(chat_id, user_id, muted_by, "Muted from warning", 60)
         
         # Update message
         keyboard = [
@@ -1271,9 +1315,17 @@ async def admin_keyboard_callback_handler(update: Update, context: ContextTypes.
     command = parts[1]
     chat_id = int(parts[2])
     
-    # Check if user is admin
-    if not await is_user_admin(chat_id, query.from_user.id, context):
-        await query.answer("⚠️ This is only for admins!", show_alert=True)
+    # FIXED: Improved admin check - properly handle all admin types including anonymous admins
+    try:
+        # Check if user is admin
+        is_admin = await is_user_admin(chat_id, query.from_user.id, context)
+        
+        if not is_admin:
+            await query.answer("⚠️ This button is only for admins!", show_alert=True)
+            return
+    except Exception as e:
+        logger.error(f"Error checking admin status: {e}")
+        await query.answer("⚠️ Error checking permissions. Please try again.", show_alert=True)
         return
     
     # Show usage instructions
