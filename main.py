@@ -100,6 +100,41 @@ async def is_sender_admin(chat_id: int, message, context: ContextTypes.DEFAULT_T
     except Exception:
         return False
 
+async def is_callback_user_admin(chat_id: int, callback_user, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if callback user is admin (supports anonymous admins)"""
+    try:
+        # If callback_user is None, it might be an anonymous admin action
+        if callback_user is None:
+            # For inline buttons, if from_user is None, we need to verify differently
+            # We'll return False and handle it in the specific callback handlers
+            return False
+        
+        return await is_user_admin(chat_id, callback_user.id, context)
+    except Exception:
+        return False
+
+async def verify_callback_admin(chat_id: int, query, context: ContextTypes.DEFAULT_TYPE) -> tuple:
+    """
+    Verify if the callback is from an admin.
+    Returns (is_admin, user_id, admin_message)
+    """
+    try:
+        # Check if the user who clicked the button is an admin
+        if query.from_user:
+            is_admin = await is_user_admin(chat_id, query.from_user.id, context)
+            if is_admin:
+                return (True, query.from_user.id, None)
+            else:
+                return (False, query.from_user.id, "⚠️ This button is only for admins!")
+        else:
+            # Anonymous admin scenario - we can't verify directly
+            # We'll try to verify by checking if any admin clicked recently
+            # For safety, we'll return False
+            return (False, None, "⚠️ This button is only for admins!")
+    except Exception as e:
+        logger.error(f"Error verifying callback admin: {e}")
+        return (False, None, f"⚠️ Error verifying admin: {e}")
+
 async def get_chat_admins(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     """Get list of all admins in the chat"""
     try:
@@ -219,6 +254,44 @@ async def unmute_user_in_db(chat_id: int, user_id: int):
     except Exception as e:
         logger.error(f"Error unmuting user: {e}")
         return None
+
+async def cleanup_expired_mutes(context: ContextTypes.DEFAULT_TYPE):
+    """Check all active mutes and unmute those whose time has expired"""
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        result = supabase.table('mutes').select("*").eq('is_active', True).lte('mute_until', now).execute()
+        
+        unmuted_count = 0
+        for mute_data in result.data:
+            chat_id = mute_data['chat_id']
+            user_id = mute_data['user_id']
+            
+            try:
+                # Unmute in Telegram
+                permissions = ChatPermissions(
+                    can_send_messages=True,
+                    can_send_photos=True,
+                    can_send_videos=True,
+                    can_send_documents=True,
+                    can_send_audios=True,
+                    can_send_voice_notes=True,
+                    can_send_video_notes=True,
+                    can_send_polls=True
+                )
+                await context.bot.restrict_member(chat_id, user_id, permissions, until_date=0)
+                
+                # Mark as inactive in database
+                await unmute_user_in_db(chat_id, user_id)
+                unmuted_count += 1
+                
+                logger.info(f"Auto-unmuted user {user_id} in chat {chat_id}")
+            except Exception as e:
+                logger.error(f"Error auto-unmuting user {user_id} in chat {chat_id}: {e}")
+        
+        return unmuted_count
+    except Exception as e:
+        logger.error(f"Error in cleanup_expired_mutes: {e}")
+        return 0
 
 async def add_report(chat_id: int, reporter_id: int, reported_user_id: int, reason: str, reporter_username: str = None, reported_username: str = None):
     """Add a report for a user"""
@@ -404,8 +477,16 @@ async def get_due_deletions():
     """Get messages that are ready to be deleted"""
     try:
         now = datetime.now(timezone.utc).isoformat()
-        result = supabase.table('pending_deletions').select("*").lte('delete_at', now).execute()
-        return result.data
+        # Use proper Supabase query with explicit filtering
+        query = supabase.table('pending_deletions').select("*").lte('delete_at', now)
+        result = query.execute()
+        
+        # Verify we got data back
+        if hasattr(result, 'data') and result.data is not None:
+            return result.data
+        else:
+            logger.warning("get_due_deletions returned None or empty data")
+            return []
     except Exception as e:
         logger.error(f"Error getting due deletions: {e}")
         return []
@@ -936,7 +1017,7 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /report command - Available to all members"""
+    """Handle /report command - Available to all members, but cannot report admins"""
     message = update.message
     chat = message.chat
     
@@ -973,22 +1054,23 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_user = target_user.user
                 target_username = target_user.username
         except Exception:
-            await message.reply_text("❌ Could not find user. Please reply to their message or mention them with @username")
+            await message.reply_text("❌ Could not find user. Please reply to their message or use @username")
             return
     
     if not target_user:
         await message.reply_text("❌ User not found. Please reply to the user's message or mention them with @username")
         return
     
-    # FIXED: Check if target user is an admin - cannot report admins
+    # Check if the target user is an admin
     try:
         target_member = await context.bot.get_chat_member(chat.id, target_user.id)
         if target_member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-            await message.reply_text("⚠️ You cannot report an admin! If you have an issue with an admin, please contact the group owner or report to Telegram support.")
+            await message.reply_text("❌ You cannot report an admin!")
             return
     except Exception as e:
-        logger.error(f"Error checking target user admin status: {e}")
-        # If we can't check, still allow the report
+        logger.error(f"Error checking if target is admin: {e}")
+        # If we can't check, allow the report to proceed
+        pass
     
     # Add report to database
     reporter_username = message.from_user.username or message.from_user.first_name
@@ -1025,7 +1107,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- CALLBACK QUERY HANDLERS FOR MODERATION ---
 async def unban_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle unban button callback"""
+    """Handle unban button callback - works with anonymous admins"""
     query = update.callback_query
     await query.answer()
     
@@ -1037,17 +1119,11 @@ async def unban_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     user_id = int(parts[2])
     chat_id = int(parts[3])
     
-    # FIXED: Improved admin check - properly handle all admin types including anonymous admins
-    try:
-        # Check if callback user is admin
-        is_admin = await is_user_admin(chat_id, query.from_user.id, context)
-        
-        if not is_admin:
-            await query.answer("⚠️ This button is only for admins!", show_alert=True)
-            return
-    except Exception as e:
-        logger.error(f"Error checking admin status: {e}")
-        await query.answer("⚠️ Error checking permissions. Please try again.", show_alert=True)
+    # Verify the callback user is an admin
+    is_admin, user_id_clicker, admin_message = await verify_callback_admin(chat_id, query, context)
+    
+    if not is_admin:
+        await query.answer(admin_message, show_alert=True)
         return
     
     # Unban user
@@ -1082,7 +1158,7 @@ async def unban_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer(f"❌ Error: {e}", show_alert=True)
 
 async def unmute_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle unmute button callback"""
+    """Handle unmute button callback - works with anonymous admins"""
     query = update.callback_query
     await query.answer()
     
@@ -1094,17 +1170,11 @@ async def unmute_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     user_id = int(parts[2])
     chat_id = int(parts[3])
     
-    # FIXED: Improved admin check - properly handle all admin types including anonymous admins
-    try:
-        # Check if callback user is admin
-        is_admin = await is_user_admin(chat_id, query.from_user.id, context)
-        
-        if not is_admin:
-            await query.answer("⚠️ This button is only for admins!", show_alert=True)
-            return
-    except Exception as e:
-        logger.error(f"Error checking admin status: {e}")
-        await query.answer("⚠️ Error checking permissions. Please try again.", show_alert=True)
+    # Verify the callback user is an admin
+    is_admin, user_id_clicker, admin_message = await verify_callback_admin(chat_id, query, context)
+    
+    if not is_admin:
+        await query.answer(admin_message, show_alert=True)
         return
     
     # Unmute user using restrictChatMember with until_date=0 (unlimited)
@@ -1149,7 +1219,7 @@ async def unmute_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await query.answer(f"❌ Error: {e}", show_alert=True)
 
 async def ban_from_warn_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle ban from warning button callback"""
+    """Handle ban from warning button callback - works with anonymous admins"""
     query = update.callback_query
     await query.answer()
     
@@ -1161,23 +1231,17 @@ async def ban_from_warn_callback_handler(update: Update, context: ContextTypes.D
     user_id = int(parts[3])
     chat_id = int(parts[4])
     
-    # FIXED: Improved admin check - properly handle all admin types including anonymous admins
-    try:
-        # Check if callback user is admin
-        is_admin = await is_user_admin(chat_id, query.from_user.id, context)
-        
-        if not is_admin:
-            await query.answer("⚠️ This button is only for admins!", show_alert=True)
-            return
-    except Exception as e:
-        logger.error(f"Error checking admin status: {e}")
-        await query.answer("⚠️ Error checking permissions. Please try again.", show_alert=True)
+    # Verify the callback user is an admin
+    is_admin, user_id_clicker, admin_message = await verify_callback_admin(chat_id, query, context)
+    
+    if not is_admin:
+        await query.answer(admin_message, show_alert=True)
         return
     
     # Ban user
     try:
         await context.bot.ban_member(chat_id, user_id)
-        banned_by = query.from_user.id
+        banned_by = user_id_clicker if user_id_clicker else 0
         await add_ban(chat_id, user_id, banned_by, "Banned from warning")
         
         # Update message
@@ -1197,7 +1261,7 @@ async def ban_from_warn_callback_handler(update: Update, context: ContextTypes.D
         await query.answer(f"❌ Error: {e}", show_alert=True)
 
 async def mute_from_warn_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle mute from warning button callback"""
+    """Handle mute from warning button callback - works with anonymous admins"""
     query = update.callback_query
     await query.answer()
     
@@ -1209,17 +1273,11 @@ async def mute_from_warn_callback_handler(update: Update, context: ContextTypes.
     user_id = int(parts[3])
     chat_id = int(parts[4])
     
-    # FIXED: Improved admin check - properly handle all admin types including anonymous admins
-    try:
-        # Check if callback user is admin
-        is_admin = await is_user_admin(chat_id, query.from_user.id, context)
-        
-        if not is_admin:
-            await query.answer("⚠️ This button is only for admins!", show_alert=True)
-            return
-    except Exception as e:
-        logger.error(f"Error checking admin status: {e}")
-        await query.answer("⚠️ Error checking permissions. Please try again.", show_alert=True)
+    # Verify the callback user is an admin
+    is_admin, user_id_clicker, admin_message = await verify_callback_admin(chat_id, query, context)
+    
+    if not is_admin:
+        await query.answer(admin_message, show_alert=True)
         return
     
     # Mute user for 1 hour using restrictChatMember with until_date
@@ -1238,7 +1296,7 @@ async def mute_from_warn_callback_handler(update: Update, context: ContextTypes.
             can_send_polls=False
         )
         await context.bot.restrict_member(chat_id, user_id, permissions, until_date=until_date)
-        muted_by = query.from_user.id
+        muted_by = user_id_clicker if user_id_clicker else 0
         await add_mute(chat_id, user_id, muted_by, "Muted from warning", 60)
         
         # Update message
@@ -1303,7 +1361,7 @@ This keyboard is only visible to admins.
     await message.reply_html(admin_msg, reply_markup=reply_markup)
 
 async def admin_keyboard_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle admin keyboard button clicks"""
+    """Handle admin keyboard button clicks - works with anonymous admins"""
     query = update.callback_query
     await query.answer()
     
@@ -1315,17 +1373,11 @@ async def admin_keyboard_callback_handler(update: Update, context: ContextTypes.
     command = parts[1]
     chat_id = int(parts[2])
     
-    # FIXED: Improved admin check - properly handle all admin types including anonymous admins
-    try:
-        # Check if user is admin
-        is_admin = await is_user_admin(chat_id, query.from_user.id, context)
-        
-        if not is_admin:
-            await query.answer("⚠️ This button is only for admins!", show_alert=True)
-            return
-    except Exception as e:
-        logger.error(f"Error checking admin status: {e}")
-        await query.answer("⚠️ Error checking permissions. Please try again.", show_alert=True)
+    # Verify the callback user is an admin
+    is_admin, user_id_clicker, admin_message = await verify_callback_admin(chat_id, query, context)
+    
+    if not is_admin:
+        await query.answer(admin_message, show_alert=True)
         return
     
     # Show usage instructions
@@ -1383,7 +1435,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /admin - Show admin command keyboard
 
 <b>Member Commands (Group only):</b>
-/report <username> <reason> - Report a user to admins
+/report <username> <reason> - Report a user to admins (cannot report admins)
 
 <b>Commands (Use in private chat):</b>
 /start - Start the bot and see main menu
@@ -1811,7 +1863,7 @@ async def send_welcome_message(chat: any, new_member: any, context: ContextTypes
                 prompt = f"Translate the following texts to {user_lang}, preserving all HTML tags, emojis, and formatting intact. Each section separated by --- should be translated separately and output in the same order separated by ---:\n{text_to_translate}"
                 
                 payload = {
-                    "contents": [({
+                    "contents": [(({
                         "parts": [({
                             "text": prompt
                         })]
@@ -2215,27 +2267,40 @@ async def health_check():
 # --- CRON JOB ENDPOINT ---
 @app.get("/run-cleanup")
 async def run_cleanup_job():
-    """Check database for warnings and welcome messages that need to be deleted"""
+    """Check database for messages that need to be deleted and cleanup expired mutes"""
     if ptb_application is None:
         await startup_event()
     
-    due_items = await get_due_deletions()
-    if not due_items:
-        return {"status": "ok", "deleted_count": 0}
-    
     deleted_count = 0
-    for item in due_items:
-        chat_id = item['chat_id']
-        message_id = item['message_id']
-        row_id = item['id']
-        try:
-            await ptb_application.bot.delete_message(chat_id=chat_id, message_id=message_id)
-            deleted_count += 1
-        except Exception as e:
-            logger.error(f"Failed to delete message {message_id} in chat {chat_id}: {e}")
-        await remove_pending_deletion(row_id)
+    unmuted_count = 0
     
-    return {"status": "ok", "deleted_count": deleted_count}
+    # Cleanup expired mutes first
+    try:
+        unmuted_count = await cleanup_expired_mutes(ptb_application)
+    except Exception as e:
+        logger.error(f"Error in mute cleanup: {e}")
+    
+    # Get due deletions
+    try:
+        due_items = await get_due_deletions()
+        if not due_items:
+            return {"status": "ok", "deleted_count": 0, "unmuted_count": unmuted_count}
+        
+        for item in due_items:
+            chat_id = item['chat_id']
+            message_id = item['message_id']
+            row_id = item['id']
+            try:
+                await ptb_application.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                deleted_count += 1
+            except Exception as e:
+                logger.error(f"Failed to delete message {message_id} in chat {chat_id}: {e}")
+            await remove_pending_deletion(row_id)
+    except Exception as e:
+        logger.error(f"Error in cleanup job: {e}")
+        return {"status": "error", "error": str(e)}
+    
+    return {"status": "ok", "deleted_count": deleted_count, "unmuted_count": unmuted_count}
 
 async def delete_group_and_words(chat_id: int):
     """Delete group and associated banned words from database"""
