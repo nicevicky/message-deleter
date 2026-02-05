@@ -125,15 +125,15 @@ async def verify_callback_admin(chat_id: int, query, context: ContextTypes.DEFAU
             if is_admin:
                 return (True, query.from_user.id, None)
             else:
-                return (False, query.from_user.id, "⚠️ This button is only for admins!")
+                return (False, query.from_user.id, "❌ This button is for admins only. You must become an admin before using this button.")
         else:
             # Anonymous admin scenario - we can't verify directly
             # We'll try to verify by checking if any admin clicked recently
             # For safety, we'll return False
-            return (False, None, "⚠️ This button is only for admins!")
+            return (False, None, "❌ This button is for admins only. You must become an admin before using this button.")
     except Exception as e:
         logger.error(f"Error verifying callback admin: {e}")
-        return (False, None, f"⚠️ Error verifying admin: {e}")
+        return (False, None, f"❌ This button is for admins only. You must become an admin before using this button.")
 
 async def get_chat_admins(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     """Get list of all admins in the chat"""
@@ -267,7 +267,7 @@ async def cleanup_expired_mutes(context: ContextTypes.DEFAULT_TYPE):
             user_id = mute_data['user_id']
             
             try:
-                # Unmute in Telegram
+                # Unmute in Telegram using restrict_chat_member
                 permissions = ChatPermissions(
                     can_send_messages=True,
                     can_send_photos=True,
@@ -278,7 +278,7 @@ async def cleanup_expired_mutes(context: ContextTypes.DEFAULT_TYPE):
                     can_send_video_notes=True,
                     can_send_polls=True
                 )
-                await context.bot.restrict_member(chat_id, user_id, permissions, until_date=0)
+                await context.bot.restrict_chat_member(chat_id, user_id, permissions, until_date=0)
                 
                 # Mark as inactive in database
                 await unmute_user_in_db(chat_id, user_id)
@@ -871,7 +871,7 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime, timezone
     until_date = int((datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)).timestamp())
     
-    # Mute user in Telegram using restrictChatMember with until_date
+    # Mute user in Telegram using restrict_chat_member with until_date
     try:
         permissions = ChatPermissions(
             can_send_messages=False,
@@ -883,7 +883,7 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_send_video_notes=False,
             can_send_polls=False
         )
-        await chat.restrict_member(target_user.id, permissions, until_date=until_date)
+        await chat.restrict_chat_member(target_user.id, permissions, until_date=until_date)
     except Exception as e:
         await message.reply_text(f"❌ Error muting user: {e}")
         return
@@ -977,7 +977,7 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ This user is not currently muted!")
         return
     
-    # Unmute user in Telegram using restrictChatMember with until_date=0 (unlimited)
+    # Unmute user in Telegram using restrict_chat_member with until_date=0 (unlimited)
     try:
         permissions = ChatPermissions(
             can_send_messages=True,
@@ -989,7 +989,7 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_send_video_notes=True,
             can_send_polls=True
         )
-        await chat.restrict_member(target_user_id, permissions, until_date=0)
+        await chat.restrict_chat_member(target_user_id, permissions, until_date=0)
     except Exception as e:
         await message.reply_text(f"❌ Error unmuting user: {e}")
         return
@@ -1177,7 +1177,7 @@ async def unmute_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await query.answer(admin_message, show_alert=True)
         return
     
-    # Unmute user using restrictChatMember with until_date=0 (unlimited)
+    # Unmute user using restrict_chat_member with until_date=0 (unlimited)
     try:
         permissions = ChatPermissions(
             can_send_messages=True,
@@ -1189,7 +1189,7 @@ async def unmute_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             can_send_video_notes=True,
             can_send_polls=True
         )
-        await context.bot.restrict_member(chat_id, user_id, permissions, until_date=0)
+        await context.bot.restrict_chat_member(chat_id, user_id, permissions, until_date=0)
         await unmute_user_in_db(chat_id, user_id)
         
         # Get user info for professional message
@@ -1280,7 +1280,7 @@ async def mute_from_warn_callback_handler(update: Update, context: ContextTypes.
         await query.answer(admin_message, show_alert=True)
         return
     
-    # Mute user for 1 hour using restrictChatMember with until_date
+    # Mute user for 1 hour using restrict_chat_member with until_date
     try:
         from datetime import datetime, timezone
         until_date = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())
@@ -1295,7 +1295,7 @@ async def mute_from_warn_callback_handler(update: Update, context: ContextTypes.
             can_send_video_notes=False,
             can_send_polls=False
         )
-        await context.bot.restrict_member(chat_id, user_id, permissions, until_date=until_date)
+        await context.bot.restrict_chat_member(chat_id, user_id, permissions, until_date=until_date)
         muted_by = user_id_clicker if user_id_clicker else 0
         await add_mute(chat_id, user_id, muted_by, "Muted from warning", 60)
         
@@ -1863,11 +1863,11 @@ async def send_welcome_message(chat: any, new_member: any, context: ContextTypes
                 prompt = f"Translate the following texts to {user_lang}, preserving all HTML tags, emojis, and formatting intact. Each section separated by --- should be translated separately and output in the same order separated by ---:\n{text_to_translate}"
                 
                 payload = {
-                    "contents": [{
-                        "parts": [{
+                    "contents": [({
+                        "parts": [({
                             "text": prompt
-                        }]
-                    }]
+                        })]
+                    })]
                 }
                 headers = {"Content-Type": "application/json"}
                 
