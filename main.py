@@ -332,6 +332,7 @@ async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username
         welcome_message = None
         welcome_timer = 0
         delete_join_messages = False
+        max_warnings = 3  # NEW: Default max warnings
         
         if existing_group:
             delete_promotions = existing_group.get('delete_promotions', False)
@@ -341,6 +342,7 @@ async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username
             welcome_message = existing_group.get('welcome_message', None)
             welcome_timer = existing_group.get('welcome_timer', 0)
             delete_join_messages = existing_group.get('delete_join_messages', False)
+            max_warnings = existing_group.get('max_warnings', 3)  # NEW: Preserve max_warnings
         
         data = {
             "chat_id": chat_id,
@@ -354,7 +356,8 @@ async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username
             "max_word_count": max_word_count,
             "welcome_message": welcome_message,
             "welcome_timer": welcome_timer,
-            "delete_join_messages": delete_join_messages
+            "delete_join_messages": delete_join_messages,
+            "max_warnings": max_warnings  # NEW: Add max_warnings
         }
         result = supabase.table('groups').upsert(data, on_conflict='chat_id').execute()
         return result
@@ -458,6 +461,19 @@ async def update_delete_join_messages(chat_id: int, delete_join: bool):
         return result
     except Exception as e:
         logger.error(f"Error updating delete join messages setting: {e}")
+        return None
+
+# NEW: Update max warnings setting
+async def update_max_warnings(chat_id: int, max_warnings: int):
+    """Update the maximum warnings before auto-mute (3-31)"""
+    try:
+        # Validate max_warnings range
+        if max_warnings < 3 or max_warnings > 31:
+            raise ValueError("Max warnings must be between 3 and 31")
+        result = supabase.table('groups').update({"max_warnings": max_warnings}).eq('chat_id', chat_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error updating max warnings: {e}")
         return None
 
 async def schedule_message_deletion(chat_id: int, message_id: int, delay_seconds: int):
@@ -610,18 +626,51 @@ async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     warnings = await get_user_warnings(chat.id, target_user.id)
     warning_count = len(warnings)
     
+    # NEW: Check if max warnings reached
+    settings = await get_group_settings(chat.id)
+    max_warnings = settings.get('max_warnings', 3) if settings else 3
+    
     # Send warning message
     user_mention = target_user.mention_html()
     admin_mention = "Anonymous Admin" if not message.from_user else message.from_user.mention_html()
     
     warn_msg = f"""
-⚠️ <b>WARNING #{warning_count}</b>
+⚠️ <b>WARNING #{warning_count}/{max_warnings}</b>
 👤 User: {user_mention}
 🛡️ Admin: {admin_mention}
 📝 Reason: {reason}
 
 This user has been warned by admin.
     """
+    
+    # Check if max warnings reached - auto-mute
+    if warning_count >= max_warnings:
+        # Auto-mute user for 1 hour
+        duration_seconds = 3600  # 1 hour
+        until_date = int((datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)).timestamp())
+        
+        try:
+            permissions = ChatPermissions(
+                can_send_messages=False,
+                can_send_photos=False,
+                can_send_videos=False,
+                can_send_documents=False,
+                can_send_audios=False,
+                can_send_voice_notes=False,
+                can_send_video_notes=False,
+                can_send_polls=False
+            )
+            await context.bot.restrict_chat_member(chat.id, target_user.id, permissions, until_date=until_date)
+            muted_by = warned_by
+            await add_mute(chat.id, target_user.id, muted_by, f"Auto-muted after {max_warnings} warnings", 60, target_username)
+            
+            warn_msg += f"""
+            
+🚫 <b>AUTO-MUTE ACTIVATED</b>
+User has reached {max_warnings} warnings and has been automatically muted for 1 hour.
+            """
+        except Exception as e:
+            logger.error(f"Error auto-muting user: {e}")
     
     # Create admin keyboard (only visible to admins)
     keyboard = [
@@ -634,7 +683,6 @@ This user has been warned by admin.
     sent_message = await message.reply_html(warn_msg, reply_markup=reply_markup)
     
     # Schedule deletion
-    settings = await get_group_settings(chat.id)
     if settings and settings.get('warning_timer'):
         await schedule_message_deletion(chat.id, sent_message.message_id, settings.get('warning_timer'))
 
@@ -695,7 +743,7 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Ban user in Telegram
     try:
-        await chat.ban_member(target_user.id)
+        await context.bot.ban_member(chat.id, target_user.id)
     except Exception as e:
         await message.reply_text(f"❌ Error banning user: {e}")
         return
@@ -773,7 +821,7 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Unban user in Telegram
     try:
-        await chat.unban_member(target_user_id)
+        await context.bot.unban_member(chat.id, target_user_id)
     except Exception as e:
         await message.reply_text(f"❌ Error unbanning user: {e}")
         return
@@ -883,7 +931,7 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_send_video_notes=False,
             can_send_polls=False
         )
-        await chat.restrict_chat_member(target_user.id, permissions, until_date=until_date)
+        await context.bot.restrict_chat_member(chat.id, target_user.id, permissions, until_date=until_date)
     except Exception as e:
         await message.reply_text(f"❌ Error muting user: {e}")
         return
@@ -989,7 +1037,7 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_send_video_notes=True,
             can_send_polls=True
         )
-        await chat.restrict_chat_member(target_user_id, permissions, until_date=0)
+        await context.bot.restrict_chat_member(chat.id, target_user_id, permissions, until_date=0)
     except Exception as e:
         await message.reply_text(f"❌ Error unmuting user: {e}")
         return
@@ -1418,6 +1466,7 @@ I'm a powerful group moderation bot that helps you:
 ✅ Custom welcome messages with HTML support
 ✅ Admin commands: /warn, /mute, /ban, /unmute, /unban
 ✅ User reports: /report
+✅ Auto-mute users who reach max warnings (3-31)
 🚀 Get started by adding me to your group!
     """
     await update.message.reply_html(welcome_text, reply_markup=reply_markup)
@@ -1427,7 +1476,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 📚 <b>Bot Commands & Features</b>
 <b>Admin Commands (Group only):</b>
-/warn <username> <reason> - Warn a user
+/warn <username> <reason> - Warn a user (auto-mutes at max warnings)
 /mute <username> <duration> <reason> - Mute a user (supports 10m, 1h, 1d, 1w)
 /ban <username> <reason> - Ban a user
 /unmute <username> - Unmute a user
@@ -1448,6 +1497,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • <b>Word Limit:</b> Delete messages that are too long (e.g., >100 words).
 • <b>Anti-Promo:</b> Delete forwarded messages, spam bots, and promotional text.
 • <b>Timer:</b> Set how long warning messages stay visible.
+• <b>Auto-Mute:</b> Users reaching max warnings (3-31) are automatically muted for 1 hour.
 • <b>Welcome Messages:</b> Custom HTML welcome messages for new members.
 <b>Note:</b> Admins and Anonymous Admins are exempt from deletion.
     """
@@ -1529,6 +1579,9 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
     delete_join = settings.get('delete_join_messages', False)
     delete_join_status = "✅ Enabled" if delete_join else "❌ Disabled"
     
+    max_warnings = settings.get('max_warnings', 3)
+    max_warnings_status = f"{max_warnings}"
+    
     text = f"""
 ⚙️ <b>Group Settings</b>
 📱 Group: {settings['chat_title']}
@@ -1540,6 +1593,7 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
 📨 <b>Delete Promotions (Forwards/Bots/Spam):</b> {promo_status}
 🌐 <b>Delete Links (URLs):</b> {link_status}
 ⏱ <b>Warning Delete Timer:</b> {timer_display}
+⚠️ <b>Max Warnings:</b> {max_warnings_status} (Auto-mute at limit)
 👋 <b>Delete Join Messages:</b> {delete_join_status}
     """
     
@@ -1551,7 +1605,8 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
          InlineKeyboardButton("⏱ Warning Timer", callback_data=f"set_timer_{chat_id}")],
         [InlineKeyboardButton("📨 Toggle Promotions", callback_data=f"toggle_promo_{chat_id}"),
          InlineKeyboardButton("🌐 Toggle Links", callback_data=f"toggle_links_{chat_id}")],
-        [InlineKeyboardButton("👋 Toggle Join Delete", callback_data=f"toggle_join_delete_{chat_id}")],
+        [InlineKeyboardButton("⚠️ Max Warnings", callback_data=f"set_max_warnings_{chat_id}"),
+         InlineKeyboardButton("👋 Toggle Join Delete", callback_data=f"toggle_join_delete_{chat_id}")],
         [InlineKeyboardButton("🔙 Back to Groups", callback_data="my_groups")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1683,6 +1738,29 @@ Examples:
     """
     await query.message.edit_text(text, parse_mode='HTML')
 
+# NEW: Set max warnings handler
+async def set_max_warnings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle max warnings setup"""
+    query = update.callback_query
+    await query.answer()
+    chat_id = int(query.data.split("_")[3])
+    
+    context.user_data['awaiting_input'] = chat_id
+    context.user_data['action'] = 'set_max_warnings'
+    
+    text = """
+⚠️ <b>Set Maximum Warnings Before Auto-Mute</b>
+When a user reaches this many warnings, they will be automatically muted for 1 hour.
+Allowed range: 3 to 31
+Examples:
+• <code>3</code> (Auto-mute after 3 warnings)
+• <code>5</code> (Auto-mute after 5 warnings)
+• <code>10</code> (Auto-mute after 10 warnings)
+
+✏️ Send the maximum number of warnings (3-31) now.
+    """
+    await query.message.edit_text(text, parse_mode='HTML')
+
 async def toggle_promo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1805,6 +1883,21 @@ Examples:
                 text = f"✅ Max word count set to <b>{limit} words</b>!"
         else:
             text = "❌ Invalid number! Please send a number like 100, 35, or 2."
+    
+    elif action == 'set_max_warnings':
+        if user_text.isdigit():
+            max_warnings = int(user_text)
+            if 3 <= max_warnings <= 31:
+                await update_max_warnings(chat_id, max_warnings)
+                text = f"✅ Max warnings set to <b>{max_warnings}</b>! Users will be auto-muted after reaching this limit."
+            else:
+                text = "❌ Invalid number! Max warnings must be between 3 and 31."
+                await update.message.reply_html(text)
+                return
+        else:
+            text = "❌ Invalid number! Please send a number between 3 and 31."
+            await update.message.reply_html(text)
+            return
     
     # Clear state
     if 'awaiting_input' in context.user_data:
@@ -1969,7 +2062,7 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📝 You can also set a custom welcome message for new members!
 
 <b>Admin Commands:</b>
-/warn <username> <reason> - Warn a user
+/warn <username> <reason> - Warn a user (auto-mutes at max warnings)
 /mute <username> <duration> <reason> - Mute a user
 /ban <username> <reason> - Ban a user
 /admin - Show admin command keyboard
@@ -2053,6 +2146,7 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_promotion = False
         reason = "promotional content"
         
+        # NEW: Check for forwarded messages
         if is_forwarded_or_channel_message(message):
             is_promotion = True
             reason = "forwarded or channel message"
@@ -2169,6 +2263,8 @@ async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TY
         await toggle_links_handler(update, context)
     elif data.startswith("toggle_join_delete_"):
         await toggle_join_delete_handler(update, context)
+    elif data.startswith("set_max_warnings_"):
+        await set_max_warnings_handler(update, context)
     # Moderation callbacks
     elif data.startswith("unban_user_"):
         await unban_callback_handler(update, context)
