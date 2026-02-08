@@ -522,6 +522,51 @@ async def is_channel_linked_to_group(context: ContextTypes.DEFAULT_TYPE, channel
     except Exception:
         return False
 
+# --- GEMINI HELPER FOR MUTE REASON GENERATION ---
+async def generate_mute_reason_with_gemini(warning_count: int, recent_warnings: list, offense_type: str) -> str:
+    """
+    Use Gemini API to generate a human-readable mute reason based on user's warning history.
+    """
+    try:
+        # Build context for Gemini
+        warnings_summary = ""
+        if recent_warnings:
+            warnings_summary = "\n".join([f"- {w['reason']} ({w['warned_at']})" for w in recent_warnings[-5:]])
+        
+        prompt = f"""Generate a concise, professional mute reason (2-3 sentences) for a Telegram group moderation.
+        
+Context:
+- Warning count: {warning_count}
+- Offense type: {offense_type}
+- Recent warnings: {warnings_summary if warnings_summary else "None"}
+
+The reason should explain WHY the user is being muted so other group members understand.
+Focus on the pattern of behavior (spamming, repeated violations, etc.).
+Keep it under 150 characters if possible.
+Format as plain text, no markdown."""
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [({
+                "parts": [({
+                    "text": prompt
+                })]
+            })]
+        }
+        headers = {"Content-Type": "application/json"}
+        
+        response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=5)
+        if response.status_code == 200:
+            result = response.json()
+            generated_reason = result['candidates'][0]['content']['parts'][0]['text'].strip()
+            return generated_reason
+        else:
+            logger.error(f"Gemini API error: {response.status_code} - {response.text}")
+            return f"Multiple violations ({offense_type})"
+    except Exception as e:
+        logger.error(f"Error generating mute reason with Gemini: {e}")
+        return f"Repeated violations ({offense_type})"
+
 # --- HELPER FUNCTION: PARSE DURATION ---
 def parse_duration(duration_str: str) -> int:
     """
@@ -630,7 +675,7 @@ async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = await get_group_settings(chat.id)
     max_warnings = settings.get('max_warnings', 3) if settings else 3
     
-    # Send warning message
+    # Send warning message with count (NOT scheduled for deletion)
     user_mention = target_user.mention_html()
     admin_mention = "Anonymous Admin" if not message.from_user else message.from_user.mention_html()
     
@@ -645,6 +690,9 @@ This user has been warned by admin.
     
     # Check if max warnings reached - auto-mute
     if warning_count >= max_warnings:
+        # Generate mute reason with Gemini
+        mute_reason = await generate_mute_reason_with_gemini(warning_count, warnings, "Maximum warnings reached")
+        
         # Auto-mute user for 1 hour
         duration_seconds = 3600  # 1 hour
         until_date = int((datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)).timestamp())
@@ -662,13 +710,26 @@ This user has been warned by admin.
             )
             await context.bot.restrict_chat_member(chat.id, target_user.id, permissions, until_date=until_date)
             muted_by = warned_by
-            await add_mute(chat.id, target_user.id, muted_by, f"Auto-muted after {max_warnings} warnings", 60, target_username)
+            await add_mute(chat.id, target_user.id, muted_by, mute_reason, 60, target_username)
             
-            warn_msg += f"""
-            
-🚫 <b>AUTO-MUTE ACTIVATED</b>
-User has reached {max_warnings} warnings and has been automatically muted for 1 hour.
+            # Create mute message with unmute button
+            mute_msg = f"""
+🔇 <b>USER MUTED (AUTO)</b>
+👤 User: {user_mention}
+🛡️ Muted by: Admin
+⏱ Duration: 1 hour
+📝 Reason: {mute_reason}
+
+User has reached {max_warnings} warnings and has been automatically muted.
             """
+            
+            # Create admin keyboard with unmute button
+            keyboard = [
+                [InlineKeyboardButton("🔊 Unmute User", callback_data=f"unmute_user_{target_user.id}_{chat.id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await message.reply_html(mute_msg, reply_markup=reply_markup)
         except Exception as e:
             logger.error(f"Error auto-muting user: {e}")
     
@@ -682,9 +743,7 @@ User has reached {max_warnings} warnings and has been automatically muted for 1 
     
     sent_message = await message.reply_html(warn_msg, reply_markup=reply_markup)
     
-    # Schedule deletion
-    if settings and settings.get('warning_timer'):
-        await schedule_message_deletion(chat.id, sent_message.message_id, settings.get('warning_timer'))
+    # FIXED: Do NOT schedule deletion for warning messages - they should stay
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /ban command - Admin only (supports anonymous admins)"""
@@ -741,9 +800,9 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ This user is already banned!")
         return
     
-    # Ban user in Telegram
+    # FIXED: Ban user in Telegram using ban_chat_member (v20+)
     try:
-        await context.bot.ban_member(chat.id, target_user.id)
+        await context.bot.ban_chat_member(chat.id, target_user.id)
     except Exception as e:
         await message.reply_text(f"❌ Error banning user: {e}")
         return
@@ -821,7 +880,7 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Unban user in Telegram
     try:
-        await context.bot.unban_member(chat.id, target_user_id)
+        await context.bot.unban_chat_member(chat.id, target_user_id)
     except Exception as e:
         await message.reply_text(f"❌ Error unbanning user: {e}")
         return
@@ -942,8 +1001,15 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # For anonymous admin, use bot ID or 0 as muted_by
     muted_by = message.from_user.id if message.from_user else 0
     
+    # Get user's warning history for better mute reason
+    user_warnings = await get_user_warnings(chat.id, target_user.id)
+    warning_count = len(user_warnings)
+    
+    # Generate mute reason with Gemini
+    mute_reason = await generate_mute_reason_with_gemini(warning_count, user_warnings, f"Manual mute: {reason}")
+    
     # Add mute to database
-    await add_mute(chat.id, target_user.id, muted_by, reason, duration_minutes, target_username)
+    await add_mute(chat.id, target_user.id, muted_by, mute_reason, duration_minutes, target_username)
     
     # Format duration display
     if duration_seconds >= 604800:  # 1 week
@@ -959,7 +1025,7 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         duration_display = f"{duration_minutes}m"
     
-    # Send mute message
+    # Send mute message with unmute button
     user_mention = target_user.mention_html()
     admin_mention = "Anonymous Admin" if not message.from_user else message.from_user.mention_html()
     
@@ -968,7 +1034,7 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 👤 User: {user_mention}
 🛡️ Muted by: {admin_mention}
 ⏱ Duration: {duration_display}
-📝 Reason: {reason}
+📝 Reason: {mute_reason}
 
 This user has been muted and cannot send messages.
     """
@@ -1176,7 +1242,7 @@ async def unban_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     # Unban user
     try:
-        await context.bot.unban_member(chat_id, user_id)
+        await context.bot.unban_chat_member(chat_id, user_id)
         await unban_user_in_db(chat_id, user_id)
         
         # Get user info for professional message
@@ -1286,9 +1352,9 @@ async def ban_from_warn_callback_handler(update: Update, context: ContextTypes.D
         await query.answer(admin_message, show_alert=True)
         return
     
-    # Ban user
+    # Ban user using ban_chat_member (v20+)
     try:
-        await context.bot.ban_member(chat_id, user_id)
+        await context.bot.ban_chat_member(chat_id, user_id)
         banned_by = user_id_clicker if user_id_clicker else 0
         await add_ban(chat_id, user_id, banned_by, "Banned from warning")
         
@@ -1344,10 +1410,18 @@ async def mute_from_warn_callback_handler(update: Update, context: ContextTypes.
             can_send_polls=False
         )
         await context.bot.restrict_chat_member(chat_id, user_id, permissions, until_date=until_date)
-        muted_by = user_id_clicker if user_id_clicker else 0
-        await add_mute(chat_id, user_id, muted_by, "Muted from warning", 60)
         
-        # Update message
+        # Get user's warning history for mute reason
+        user_warnings = await get_user_warnings(chat_id, user_id)
+        warning_count = len(user_warnings)
+        
+        # Generate mute reason with Gemini
+        mute_reason = await generate_mute_reason_with_gemini(warning_count, user_warnings, "Muted from warning")
+        
+        muted_by = user_id_clicker if user_id_clicker else 0
+        await add_mute(chat_id, user_id, muted_by, mute_reason, 60)
+        
+        # Update message with unmute button
         keyboard = [
             [InlineKeyboardButton("🔊 Unmute User", callback_data=f"unmute_user_{user_id}_{chat_id}")]
         ]
@@ -1355,7 +1429,7 @@ async def mute_from_warn_callback_handler(update: Update, context: ContextTypes.
         
         try:
             await query.message.edit_text(
-                f"🔇 User has been muted for 1 hour!\n\nUser ID: {user_id}",
+                f"🔇 User has been muted for 1 hour!\n\nUser ID: {user_id}\nReason: {mute_reason}",
                 reply_markup=reply_markup
             )
         except BadRequest:
@@ -2096,6 +2170,87 @@ async def user_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await send_welcome_message(chat, new_member.user, context, settings)
 
+async def send_warning_with_count(chat: any, user_id: int, username: str, reason: str, context: ContextTypes.DEFAULT_TYPE, offense_type: str = "general"):
+    """
+    Send a warning message with count (except for banned words)
+    and add warning to database if not a banned word offense
+    """
+    warnings = await get_user_warnings(chat.id, user_id)
+    warning_count = len(warnings)
+    
+    settings = await get_group_settings(chat.id)
+    max_warnings = settings.get('max_warnings', 3) if settings else 3
+    
+    user_mention = f"@{username}" if username else f"User {user_id}"
+    
+    # For banned words, don't add to warning count and don't show count
+    if offense_type == "banned_word":
+        warning_msg = f"⚠️ {user_mention}, your message was hidden because it contained a banned word."
+        await chat.send_message(warning_msg)
+        return
+    
+    # For all other offenses, add warning and show count
+    await add_warning(chat.id, user_id, 0, reason, username)
+    warning_count += 1
+    
+    warning_msg = f"""
+⚠️ <b>WARNING #{warning_count}/{max_warnings}</b>
+👤 User: {user_mention}
+📝 Reason: {reason}
+
+This user has been warned by the bot.
+    """
+    
+    # Check if max warnings reached - auto-mute
+    if warning_count >= max_warnings:
+        # Get updated warnings for mute reason
+        updated_warnings = await get_user_warnings(chat.id, user_id)
+        
+        # Generate mute reason with Gemini
+        mute_reason = await generate_mute_reason_with_gemini(warning_count, updated_warnings, f"Maximum warnings reached: {offense_type}")
+        
+        # Auto-mute user for 1 hour
+        duration_seconds = 3600  # 1 hour
+        until_date = int((datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)).timestamp())
+        
+        try:
+            permissions = ChatPermissions(
+                can_send_messages=False,
+                can_send_photos=False,
+                can_send_videos=False,
+                can_send_documents=False,
+                can_send_audios=False,
+                can_send_voice_notes=False,
+                can_send_video_notes=False,
+                can_send_polls=False
+            )
+            await context.bot.restrict_chat_member(chat.id, user_id, permissions, until_date=until_date)
+            await add_mute(chat.id, user_id, 0, mute_reason, 60, username)
+            
+            # Create mute message with unmute button
+            mute_msg = f"""
+🔇 <b>USER MUTED (AUTO)</b>
+👤 User: {user_mention}
+🛡️ Muted by: Bot
+⏱ Duration: 1 hour
+📝 Reason: {mute_reason}
+
+User has reached {max_warnings} warnings and has been automatically muted.
+            """
+            
+            # Create admin keyboard with unmute button
+            keyboard = [
+                [InlineKeyboardButton("🔊 Unmute User", callback_data=f"unmute_user_{user_id}_{chat.id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await chat.send_message(mute_msg, reply_markup=reply_markup, parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Error auto-muting user: {e}")
+    
+    # Send warning message (NOT scheduled for deletion - it stays)
+    await chat.send_message(warning_msg, parse_mode='HTML')
+
 async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
@@ -2128,20 +2283,22 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin_or_exempt:
         return
     
+    username = message.from_user.username or message.from_user.first_name if message.from_user else "Anonymous"
+    
+    # Check word count
     max_word_count = settings.get('max_word_count', 0)
     if max_word_count > 0:
         word_count = len(message.text.split())
         if word_count > max_word_count:
             try:
                 await message.delete()
-                username = message.from_user.username or message.from_user.first_name
-                warning = f"⚠️ @{username}, your message was too long ({word_count} words). Max allowed is {max_word_count} words."
-                warning_msg = await chat.send_message(warning)
-                await schedule_message_deletion(chat.id, warning_msg.message_id, warning_timer)
+                # Send warning WITH count (adds to warning system)
+                await send_warning_with_count(chat, message.from_user.id, username, f"Message too long ({word_count} words. Max: {max_word_count})", context, "word_limit")
                 return
             except Exception as e:
                 logger.error(f"Error deleting long message: {e}")
     
+    # Check for promotional/forwarded content
     if settings.get('delete_promotions', False):
         is_promotion = False
         reason = "promotional content"
@@ -2180,14 +2337,13 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_promotion:
             try:
                 await message.delete()
-                username = message.from_user.username or message.from_user.first_name if message.from_user else "Anonymous"
-                warning = f"⚠️ @{username}, {reason} is not allowed."
-                warning_msg = await chat.send_message(warning)
-                await schedule_message_deletion(chat.id, warning_msg.message_id, warning_timer)
+                # Send warning WITH count (adds to warning system)
+                await send_warning_with_count(chat, message.from_user.id, username, f"{reason} is not allowed", context, reason.replace(" ", "_"))
                 return
             except Exception as e:
                 logger.error(f"Error deleting promotional message: {e}")
     
+    # Check for links
     if settings.get('delete_links', False):
         link_pattern = r'(https?://\S+|www\.\S+|t\.me/\S+)'
         has_link = False
@@ -2203,14 +2359,13 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if has_link:
             try:
                 await message.delete()
-                username = message.from_user.username or message.from_user.first_name
-                warning = f"⚠️ @{username}, links are not allowed in this group."
-                warning_msg = await chat.send_message(warning)
-                await schedule_message_deletion(chat.id, warning_msg.message_id, warning_timer)
+                # Send warning WITH count (adds to warning system)
+                await send_warning_with_count(chat, message.from_user.id, username, "Links are not allowed in this group", context, "link")
                 return
             except Exception as e:
                 logger.error(f"Error deleting link message: {e}")
     
+    # Check for banned words (NO count added)
     banned_words = await get_banned_words(chat.id)
     if not banned_words:
         return
@@ -2221,10 +2376,8 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if re.search(pattern, message_text):
             try:
                 await message.delete()
-                username = message.from_user.username or message.from_user.first_name
-                warning = f"⚠️ @{username}, your message was hidden because it contained a banned word."
-                warning_msg = await chat.send_message(warning)
-                await schedule_message_deletion(chat.id, warning_msg.message_id, warning_timer)
+                # Send warning WITHOUT count (banned words don't add to warning count)
+                await send_warning_with_count(chat, message.from_user.id, username, "banned word", context, "banned_word")
                 return
             except Exception as e:
                 logger.error(f"Error deleting message with banned word: {e}")
