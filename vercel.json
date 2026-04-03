@@ -22,6 +22,6 @@
     { "src": "/moderation", "dest": "/moderation.html" },
     { "src": "/reports", "dest": "/reports.html" },
 
-    { "src": "/api/(.*)", "dest": "main.py" }
+    { "src": "/(.*)", "dest": "main.py" }
   ]
 }
