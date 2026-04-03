@@ -1,22 +1,18 @@
 {
   "version": 2,
   "builds": [
-    { "src": "main.py", "use": "@vercel/python" },
-    { "src": "public/**", "use": "@vercel/static" }
+    {
+      "src": "main.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "50mb"
+      }
+    }
   ],
   "routes": [
-    { "src": "/api/(.*)", "dest": "/main.py" },
-    
-    { "src": "/", "dest": "/public/index.html" },
-    { "src": "/admin", "dest": "/public/admin.html" },
-    { "src": "/home", "dest": "/public/home.html" },
-    { "src": "/profile", "dest": "/public/profile.html" },
-    { "src": "/groups", "dest": "/public/groups.html" },
-    { "src": "/group-settings", "dest": "/public/group-settings.html" },
-    { "src": "/join-requests", "dest": "/public/join-requests.html" },
-    { "src": "/moderation", "dest": "/public/moderation.html" },
-    { "src": "/reports", "dest": "/public/reports.html" },
-    
-    { "handle": "filesystem" }
+    {
+      "src": "/(.*)",
+      "dest": "main.py"
+    }
   ]
 }
