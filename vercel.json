@@ -1,46 +1,23 @@
 {
   "version": 2,
   "builds": [
-    { "src": "main.py",                         "use": "@vercel/python" },
-
-    { "src": "public/index.html",               "use": "@vercel/static" },
-    { "src": "public/home.html",                "use": "@vercel/static" },
-    { "src": "public/profile.html",             "use": "@vercel/static" },
-    { "src": "public/groups.html",              "use": "@vercel/static" },
-    { "src": "public/group-settings.html",      "use": "@vercel/static" },
-    { "src": "public/join-requests.html",       "use": "@vercel/static" },
-    { "src": "public/moderation.html",          "use": "@vercel/static" },
-    { "src": "public/reports.html",             "use": "@vercel/static" },
-    { "src": "public/admin.html",               "use": "@vercel/static" }
+    { "src": "main.py", "use": "@vercel/python" },
+    { "src": "public/*.html", "use": "@vercel/static" }
   ],
-
   "routes": [
-    { "src": "/",                       "dest": "/public/index.html" },
+    { "handle": "filesystem" },
 
-    { "src": "/home",                   "dest": "/public/home.html" },
-    { "src": "/home.html",              "dest": "/public/home.html" },
+    { "src": "/", "dest": "/public/index.html" },
 
-    { "src": "/profile",                "dest": "/public/profile.html" },
-    { "src": "/profile.html",           "dest": "/public/profile.html" },
+    { "src": "/admin", "dest": "/public/admin.html" },
+    { "src": "/home", "dest": "/public/home.html" },
+    { "src": "/profile", "dest": "/public/profile.html" },
+    { "src": "/groups", "dest": "/public/groups.html" },
+    { "src": "/group-settings", "dest": "/public/group-settings.html" },
+    { "src": "/join-requests", "dest": "/public/join-requests.html" },
+    { "src": "/moderation", "dest": "/public/moderation.html" },
+    { "src": "/reports", "dest": "/public/reports.html" },
 
-    { "src": "/groups",                 "dest": "/public/groups.html" },
-    { "src": "/groups.html",            "dest": "/public/groups.html" },
-
-    { "src": "/group-settings",         "dest": "/public/group-settings.html" },
-    { "src": "/group-settings.html",    "dest": "/public/group-settings.html" },
-
-    { "src": "/join-requests",          "dest": "/public/join-requests.html" },
-    { "src": "/join-requests.html",     "dest": "/public/join-requests.html" },
-
-    { "src": "/moderation",             "dest": "/public/moderation.html" },
-    { "src": "/moderation.html",        "dest": "/public/moderation.html" },
-
-    { "src": "/reports",                "dest": "/public/reports.html" },
-    { "src": "/reports.html",           "dest": "/public/reports.html" },
-
-    { "src": "/admin",                  "dest": "/public/admin.html" },
-    { "src": "/admin.html",             "dest": "/public/admin.html" },
-
-    { "src": "/(.*)",                   "dest": "/main.py" }
+    { "src": "/api/(.*)", "dest": "/main.py" }
   ]
 }
