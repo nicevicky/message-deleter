@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
+<title>GroupPilot — Admin</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
+<style>
+:root{--primary:#00d4ff;--accent:#7c3aed;--gold:#ffd700;--bg:#030810;--surface:#0a1220;--card:#0f1c2e;--border:rgba(0,212,255,0.1);--text:#e8f4fd;--muted:#4a6a88;--danger:#ff4757;--success:#00e676;--warn:#ffb300}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding-bottom:76px}
+body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(0,212,255,0.018) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,0.018) 1px,transparent 1px);background-size:48px 48px;pointer-events:none;z-index:0}
+.topbar{position:relative;z-index:10;display:flex;align-items:center;gap:12px;padding:14px 20px;background:rgba(10,18,32,0.98);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
+.logo{display:flex;align-items:center;gap:10px;flex:1}
+.logo-ic{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--gold),#ff8c00);display:flex;align-items:center;justify-content:center;font-size:15px;color:#1a0800;box-shadow:0 0 10px rgba(255,215,0,0.28)}
+.logo-text{font-family:'Rajdhani',sans-serif;font-size:18px;font-weight:700}.logo-text span{color:var(--gold)}
+.admin-badge{padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;background:rgba(255,215,0,0.1);color:var(--gold);border:1px solid rgba(255,215,0,0.22)}
+/* Stats */
+.stats-wrap{position:relative;z-index:1;padding:18px 20px 14px}
+.stats-3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:15px;padding:16px 10px;text-align:center;position:relative;overflow:hidden;transition:transform .15s}
+.stat-card:active{transform:scale(0.97)}
+.sc-glow{position:absolute;width:70px;height:70px;border-radius:50%;top:-20px;right:-10px;filter:blur(18px);opacity:.35}
+.sc-icon{font-size:20px;margin-bottom:8px}
+.sc-val{font-family:'Rajdhani',sans-serif;font-size:28px;font-weight:700;line-height:1}
+.sc-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-top:4px}
+.bot-bar{background:var(--card);border:1px solid rgba(0,212,255,0.18);border-radius:14px;padding:15px 16px;display:flex;align-items:center;gap:14px}
+.bb-ic{width:46px;height:46px;border-radius:13px;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;font-size:20px;color:#fff;box-shadow:0 4px 12px rgba(0,212,255,0.25);flex-shrink:0}
+.bb-info{flex:1}
+.bb-title{font-family:'Rajdhani',sans-serif;font-size:16px;font-weight:700}
+.bb-sub{font-size:11px;color:var(--muted);margin-top:2px}
+.bb-count{font-family:'Rajdhani',sans-serif;font-size:30px;font-weight:700;color:var(--primary)}
+/* Tabs */
+.tabs-wrap{position:relative;z-index:1;padding:0 20px}
+.tab-row{display:flex;gap:0;background:var(--card);border-radius:12px;padding:4px;border:1px solid var(--border);margin-bottom:14px}
+.tab{flex:1;padding:8px 4px;text-align:center;font-size:11px;font-weight:600;border-radius:8px;cursor:pointer;color:var(--muted);transition:all .2s;white-space:nowrap}
+.tab.active{background:linear-gradient(135deg,var(--accent),var(--primary));color:#fff;box-shadow:0 2px 8px rgba(0,212,255,0.22)}
+.panel{display:none}.panel.active{display:block}
+/* Search */
+.search-wrap{margin-bottom:12px}
+.search-box{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:9px 12px}
+.search-box i{color:var(--muted);font-size:12px}
+.search-box input{flex:1;background:none;border:none;outline:none;color:var(--text);font-size:13px;font-family:'DM Sans',sans-serif}
+.search-box input::placeholder{color:var(--muted)}
+/* User card */
+.u-card{background:var(--card);border:1px solid var(--border);border-radius:13px;padding:12px 14px;margin-bottom:7px;display:flex;align-items:center;gap:11px}
+.u-av{width:40px;height:40px;border-radius:50%;flex-shrink:0;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;color:#fff}
+.u-av.adm{background:linear-gradient(135deg,#9a6f00,var(--gold))}
+.u-body{flex:1;min-width:0}
+.u-name{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.u-meta{font-size:10px;color:var(--muted);margin-top:3px}
+.u-btns{display:flex;gap:5px}
+.ub-btn{width:30px;height:30px;border-radius:8px;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:11px;transition:transform .12s}
+.ub-btn:active{transform:scale(0.9)}
+.ub-promote{background:rgba(255,215,0,0.1);color:var(--gold);border:1px solid rgba(255,215,0,0.2)}
+.ub-demote{background:rgba(80,80,80,0.2);color:var(--muted);border:1px solid var(--border)}
+/* Group card */
+.g-card{background:var(--card);border:1px solid var(--border);border-radius:13px;padding:12px 14px;margin-bottom:7px;display:flex;align-items:center;gap:11px}
+.g-ic{width:40px;height:40px;border-radius:11px;flex-shrink:0;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;font-size:17px;color:#fff}
+.g-body{flex:1;min-width:0}
+.g-name{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.g-meta{font-size:10px;color:var(--muted);margin-top:3px}
+.g-del{padding:5px 10px;border-radius:7px;border:none;font-size:11px;font-weight:600;cursor:pointer;background:rgba(255,71,87,0.1);color:var(--danger);border:1px solid rgba(255,71,87,0.2);flex-shrink:0}
+/* System */
+.sys-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:10px}
+.sys-row{display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--border)}
+.sys-row:last-child{border-bottom:none}
+.sys-label{font-size:13px;display:flex;align-items:center;gap:8px}.sys-label i{color:var(--primary);width:14px}
+.sys-val{font-size:12px;color:var(--muted);font-family:monospace}
+.sys-val.ok{color:var(--success)}.sys-val.warn{color:var(--warn)}
+.action-btn{width:100%;padding:12px;border-radius:12px;border:none;font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:8px;transition:transform .12s}
+.action-btn:active{transform:scale(0.98)}
+.btn-maint{background:rgba(255,179,0,0.08);color:var(--warn);border:1px solid rgba(255,179,0,0.18)}
+.btn-primary{background:linear-gradient(135deg,var(--accent),var(--primary));color:#fff;box-shadow:0 3px 10px rgba(0,212,255,0.22)}
+.sec-hdr{font-family:'Rajdhani',sans-serif;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);padding:12px 0 8px;display:flex;align-items:center;gap:6px}
+.badge-sm{padding:2px 7px;border-radius:6px;font-size:10px;font-weight:600}
+.bs-admin{background:rgba(255,215,0,0.1);color:var(--gold)}
+.bs-user{background:rgba(0,212,255,0.07);color:var(--primary)}
+.skeleton{background:linear-gradient(90deg,var(--card) 25%,var(--surface) 50%,var(--card) 75%);background-size:200% 100%;animation:shimmer 1.2s infinite;border-radius:13px}
+.skel-card{height:58px;margin-bottom:7px}
+@keyframes shimmer{to{background-position:-200% 0}}
+.empty{text-align:center;padding:28px 10px}
+.empty i{font-size:32px;color:var(--muted);opacity:.25;margin-bottom:9px;display:block}
+.empty p{font-size:12px;color:var(--muted)}
+.toast{position:fixed;bottom:86px;left:50%;transform:translateX(-50%) translateY(100px);background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 18px;font-size:13px;display:flex;align-items:center;gap:8px;z-index:999;transition:transform .3s cubic-bezier(.34,1.56,.64,1);white-space:nowrap}
+.toast.show{transform:translateX(-50%) translateY(0)}
+.bottom-nav{position:fixed;bottom:0;left:0;right:0;background:rgba(10,18,32,0.98);backdrop-filter:blur(16px);border-top:1px solid var(--border);display:flex;padding:10px 0 max(10px,env(safe-area-inset-bottom));z-index:200}
+.nav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:4px;color:var(--muted);font-size:10px;text-decoration:none;transition:color .2s}
+.nav-item i{font-size:18px}
+.nav-item.active{color:var(--gold)}
+.nav-item.active i{filter:drop-shadow(0 0 5px var(--gold))}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="logo">
+    <div class="logo-ic"><i class="fa-solid fa-crown"></i></div>
+    <div class="logo-text">Group<span>Pilot</span></div>
+  </div>
+  <div class="admin-badge"><i class="fa-solid fa-shield-halved" style="margin-right:3px"></i>ADMIN</div>
+</div>
+
+<div class="stats-wrap">
+  <div class="stats-3">
+    <div class="stat-card"><div class="sc-glow" style="background:var(--primary)"></div>
+      <div class="sc-icon" style="color:var(--primary)"><i class="fa-solid fa-users"></i></div>
+      <div class="sc-val" id="sUsers">—</div><div class="sc-label">Users</div>
+    </div>
+    <div class="stat-card"><div class="sc-glow" style="background:var(--accent)"></div>
+      <div class="sc-icon" style="color:#c084fc"><i class="fa-solid fa-layer-group"></i></div>
+      <div class="sc-val" id="sGroups">—</div><div class="sc-label">Groups</div>
+    </div>
+    <div class="stat-card"><div class="sc-glow" style="background:var(--gold)"></div>
+      <div class="sc-icon" style="color:var(--gold)"><i class="fa-solid fa-crown"></i></div>
+      <div class="sc-val" id="sAdmins">—</div><div class="sc-label">Admins</div>
+    </div>
+  </div>
+  <div class="bot-bar">
+    <div class="bb-ic"><i class="fa-solid fa-tower-control"></i></div>
+    <div class="bb-info">
+      <div class="bb-title">Bot Active On</div>
+      <div class="bb-sub">Groups where bot has admin rights</div>
+    </div>
+    <div class="bb-count" id="sBotActive">—</div>
+  </div>
+</div>
+
+<div class="tabs-wrap">
+  <div class="tab-row">
+    <div class="tab active" onclick="switchTab('users',this)"><i class="fa-solid fa-users" style="margin-right:3px"></i>Users</div>
+    <div class="tab"        onclick="switchTab('groups',this)"><i class="fa-solid fa-layer-group" style="margin-right:3px"></i>Groups</div>
+    <div class="tab"        onclick="switchTab('system',this)"><i class="fa-solid fa-gear" style="margin-right:3px"></i>System</div>
+  </div>
+
+  <!-- Users -->
+  <div class="panel active" id="panel-users">
+    <div class="search-wrap">
+      <div class="search-box"><i class="fa-solid fa-magnifying-glass"></i>
+        <input type="text" id="userSearch" placeholder="Search name, username, ID..." oninput="filterUsers()"/>
+      </div>
+    </div>
+    <div class="sec-hdr"><i class="fa-solid fa-users" style="color:var(--primary)"></i>All Users</div>
+    <div id="usersList"><div class="skeleton skel-card"></div><div class="skeleton skel-card"></div><div class="skeleton skel-card"></div></div>
+  </div>
+
+  <!-- Groups -->
+  <div class="panel" id="panel-groups">
+    <div class="search-wrap">
+      <div class="search-box"><i class="fa-solid fa-magnifying-glass"></i>
+        <input type="text" id="groupSearch" placeholder="Search groups..." oninput="filterGroups()"/>
+      </div>
+    </div>
+    <div class="sec-hdr"><i class="fa-solid fa-layer-group" style="color:#c084fc"></i>All Groups</div>
+    <div id="groupsList"><div class="skeleton skel-card"></div><div class="skeleton skel-card"></div></div>
+  </div>
+
+  <!-- System -->
+  <div class="panel" id="panel-system">
+    <div class="sys-card">
+      <div class="sys-row"><div class="sys-label"><i class="fa-solid fa-circle-check"></i>Bot Status</div><div class="sys-val ok">Online</div></div>
+      <div class="sys-row"><div class="sys-label"><i class="fa-solid fa-database"></i>Supabase</div><div class="sys-val ok">Connected</div></div>
+      <div class="sys-row"><div class="sys-label"><i class="fa-solid fa-globe"></i>Webhook</div><div class="sys-val ok">Active</div></div>
+      <div class="sys-row"><div class="sys-label"><i class="fa-solid fa-clock"></i>Server Time</div><div class="sys-val" id="serverTime">—</div></div>
+      <div class="sys-row"><div class="sys-label"><i class="fa-solid fa-ban"></i>Active Bans</div><div class="sys-val warn" id="sBans">—</div></div>
+      <div class="sys-row"><div class="sys-label"><i class="fa-solid fa-microphone-slash"></i>Active Mutes</div><div class="sys-val warn" id="sMutes">—</div></div>
+    </div>
+    <div class="sec-hdr"><i class="fa-solid fa-wrench" style="color:var(--warn)"></i>Maintenance</div>
+    <button class="action-btn btn-maint" onclick="runCleanup()"><i class="fa-solid fa-broom"></i> Run Message Cleanup</button>
+    <button class="action-btn btn-maint" onclick="runGroupCleanup()"><i class="fa-solid fa-trash-can"></i> Cleanup Dead Groups</button>
+    <button class="action-btn btn-primary" onclick="window.location.href='home.html'"><i class="fa-solid fa-house"></i> Switch to User View</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"><i class="fa-solid fa-check-circle" style="color:var(--success)"></i><span id="toastMsg"></span></div>
+
+<nav class="bottom-nav">
+  <a class="nav-item active" href="admin.html"><i class="fa-solid fa-gauge-high"></i><span>Dashboard</span></a>
+  <a class="nav-item" href="reports.html"><i class="fa-solid fa-flag"></i><span>Reports</span></a>
+  <a class="nav-item" href="moderation.html"><i class="fa-solid fa-shield-halved"></i><span>Mods</span></a>
+  <a class="nav-item" href="profile.html"><i class="fa-solid fa-circle-user"></i><span>Profile</span></a>
+</nav>
+
+<script>
+const SUPABASE_URL      = 'https://mwxrklxxgwbaemqnbvda.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im13eHJrbHh4Z3diYWVtcW5idmRhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NDI4MTYyOCwiZXhwIjoyMDc5ODU3NjI4fQ.mTfLl-MWCNfENzTX8E39fmlnMmVHNsif5uBFPcLpd28';
+const BACKEND_URL       = 'https://message-deleter.vercel.app';
+
+// ── ADMIN CONFIG ──────────────────────────────────────────────────────────
+// Add your Telegram user ID(s) here for hardcoded admin access.
+// These IDs bypass the Supabase is_admin check (useful for first-time setup).
+// Example: const ADMIN_IDS = [123456789, 987654321];
+const ADMIN_IDS = [5727413041];
+// ─────────────────────────────────────────────────────────────────────────
+
+const sb  = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const tg  = window.Telegram?.WebApp;
+if(tg){tg.ready();tg.expand();tg.setBackgroundColor('#030810');}
+
+const userData = JSON.parse(sessionStorage.getItem('gp_user')||'null');
+if(!userData){window.location.href='index.html';}
+
+// Dual-layer admin check: DB flag OR hardcoded ID
+const isAdminUser = !!userData?.is_admin || ADMIN_IDS.includes(Number(userData?.telegram_id));
+if(!isAdminUser){window.location.href='home.html';}
+
+let allUsers=[], allGroups=[];
+
+function showToast(msg,type='success'){
+  const t=document.getElementById('toast');
+  document.getElementById('toastMsg').textContent=msg;
+  t.querySelector('i').style.color=type==='success'?'var(--success)':'var(--danger)';
+  t.querySelector('i').className=type==='success'?'fa-solid fa-check-circle':'fa-solid fa-circle-exclamation';
+  t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'),2500);
+}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function relTime(ts){if(!ts)return'—';const d=Date.now()-new Date(ts).getTime(),dy=Math.floor(d/86400000),h=Math.floor(d/3600000);return dy>0?dy+'d ago':h>0?h+'h ago':'recent';}
+function switchTab(n,el){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById('panel-'+n).classList.add('active');
+  if(n==='system')document.getElementById('serverTime').textContent=new Date().toLocaleString();
+}
+
+// Users
+async function promoteUser(uid){
+  const {error}=await sb.from('users').update({is_admin:true}).eq('telegram_id',uid);
+  if(!error){const u=allUsers.find(u=>u.telegram_id===uid);if(u)u.is_admin=true;renderUsers();showToast('User promoted to admin');}
+  else showToast('Error','error');
+}
+async function demoteUser(uid){
+  if(uid===Number(userData.telegram_id)||ADMIN_IDS.includes(uid)){showToast('Cannot demote this admin','error');return;}
+  const {error}=await sb.from('users').update({is_admin:false}).eq('telegram_id',uid);
+  if(!error){const u=allUsers.find(u=>u.telegram_id===uid);if(u)u.is_admin=false;renderUsers();showToast('User demoted');}
+  else showToast('Error','error');
+}
+function filterUsers(){renderUsers(document.getElementById('userSearch').value.toLowerCase());}
+function renderUsers(q=''){
+  const fl=allUsers.filter(u=>(u.username||'').toLowerCase().includes(q)||(u.first_name||'').toLowerCase().includes(q)||String(u.telegram_id).includes(q));
+  const c=document.getElementById('usersList');
+  if(!fl.length){c.innerHTML=`<div class="empty"><i class="fa-solid fa-users"></i><p>No users found</p></div>`;return;}
+  c.innerHTML=fl.map(u=>`
+    <div class="u-card">
+      <div class="u-av ${u.is_admin?'adm':''}">${(u.first_name||'U').charAt(0)}</div>
+      <div class="u-body">
+        <div class="u-name">${esc(u.first_name||'')} ${esc(u.last_name||'')} <span class="badge-sm ${u.is_admin?'bs-admin':'bs-user'}">${u.is_admin?'Admin':'User'}</span></div>
+        <div class="u-meta">${u.username?'@'+esc(u.username)+' · ':''}ID: ${u.telegram_id} · ${relTime(u.last_seen)}</div>
+      </div>
+      <div class="u-btns">
+        ${u.is_admin
+          ?`<button class="ub-btn ub-demote" onclick="demoteUser(${u.telegram_id})" title="Demote"><i class="fa-solid fa-arrow-down"></i></button>`
+          :`<button class="ub-btn ub-promote" onclick="promoteUser(${u.telegram_id})" title="Make Admin"><i class="fa-solid fa-crown"></i></button>`}
+      </div>
+    </div>`).join('');
+}
+
+// Groups
+async function deleteGroup(cid){
+  if(!confirm('Remove this group from database?'))return;
+  const {error}=await sb.from('groups').delete().eq('chat_id',cid);
+  if(!error){allGroups=allGroups.filter(g=>g.chat_id!==cid);renderGroups();showToast('Group removed');}
+  else showToast('Error','error');
+}
+function filterGroups(){renderGroups(document.getElementById('groupSearch').value.toLowerCase());}
+function renderGroups(q=''){
+  const fl=allGroups.filter(g=>(g.chat_title||'').toLowerCase().includes(q));
+  const c=document.getElementById('groupsList');
+  if(!fl.length){c.innerHTML=`<div class="empty"><i class="fa-solid fa-layer-group"></i><p>No groups found</p></div>`;return;}
+  c.innerHTML=fl.map(g=>`
+    <div class="g-card">
+      <div class="g-ic"><i class="fa-solid fa-users"></i></div>
+      <div class="g-body">
+        <div class="g-name">${esc(g.chat_title)}</div>
+        <div class="g-meta">ID: ${g.chat_id} · @${esc(g.added_by_username||g.added_by)} · ${g.bot_is_admin?'<span style="color:var(--success)">Active</span>':'<span style="color:var(--danger)">Inactive</span>'}</div>
+      </div>
+      <button class="g-del" onclick="deleteGroup(${g.chat_id})"><i class="fa-solid fa-trash"></i></button>
+    </div>`).join('');
+}
+
+// Cleanup
+async function runCleanup(){
+  showToast('Running cleanup...');
+  try{const r=await fetch(BACKEND_URL+'/run-cleanup');const d=await r.json();showToast(`Done: ${d.deleted_count} deleted, ${d.unmuted_count} unmuted`);}
+  catch(e){showToast('Cleanup failed','error');}
+}
+async function runGroupCleanup(){
+  showToast('Running group cleanup...');
+  try{const r=await fetch(BACKEND_URL+'/run-group-cleanup');const d=await r.json();showToast(`Removed ${d.removed?.length||0} dead groups`);}
+  catch(e){showToast('Failed','error');}
+}
+
+async function init(){
+  const[{count:uc},{count:gc},{count:ac},{count:bc_a},{count:bans},{count:mutes}]=await Promise.all([
+    sb.from('users').select('*',{count:'exact',head:true}),
+    sb.from('groups').select('*',{count:'exact',head:true}),
+    sb.from('users').select('*',{count:'exact',head:true}).eq('is_admin',true),
+    sb.from('groups').select('*',{count:'exact',head:true}).eq('bot_is_admin',true),
+    sb.from('bans').select('*',{count:'exact',head:true}).eq('is_active',true),
+    sb.from('mutes').select('*',{count:'exact',head:true}).eq('is_active',true),
+  ]);
+  document.getElementById('sUsers').textContent    = uc??0;
+  document.getElementById('sGroups').textContent   = gc??0;
+  document.getElementById('sAdmins').textContent   = ac??0;
+  document.getElementById('sBotActive').textContent= bc_a??0;
+  document.getElementById('sBans').textContent     = bans??0;
+  document.getElementById('sMutes').textContent    = mutes??0;
+
+  const[{data:uData},{data:gData}]=await Promise.all([
+    sb.from('users').select('*').order('joined_at',{ascending:false}),
+    sb.from('groups').select('*').order('created_at',{ascending:false}),
+  ]);
+  allUsers=uData||[];
+  allGroups=gData||[];
+  renderUsers();
+  renderGroups();
+}
+init();
+</script>
+</body>
+</html>

@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
+<title>GroupPilot — Home</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
+<style>
+:root{--primary:#00d4ff;--accent:#7c3aed;--bg:#050a14;--surface:#0d1626;--card:#111d30;--border:rgba(0,212,255,0.12);--text:#e8f4fd;--muted:#5a7a99;--danger:#ff4757;--success:#00e676;--warn:#ffb300}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding-bottom:76px}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:14px 20px 12px;background:rgba(13,22,38,0.97);backdrop-filter:blur(14px);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
+.brand{display:flex;align-items:center;gap:8px;font-family:'Rajdhani',sans-serif;font-size:20px;font-weight:700;background:linear-gradient(135deg,#fff,var(--primary));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.brand i{font-size:16px;color:var(--primary);-webkit-text-fill-color:var(--primary)}
+.avatar-btn{width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;font-family:'Rajdhani',sans-serif;font-size:16px;font-weight:700;color:#fff;border:2px solid var(--border);cursor:pointer;flex-shrink:0}
+.hero{padding:22px 20px 16px;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;width:280px;height:280px;background:radial-gradient(circle,rgba(124,58,237,0.14),transparent 70%);top:-80px;right:-50px;pointer-events:none}
+.greeting{font-size:13px;color:var(--muted);margin-bottom:4px}
+.greeting strong{color:var(--primary)}
+.hero-title{font-family:'Rajdhani',sans-serif;font-size:26px;font-weight:700;line-height:1.2}
+.hero-sub{font-size:12px;color:var(--muted);margin-top:5px}
+.stats-row{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:0 20px 20px}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px 10px;text-align:center;position:relative;overflow:hidden;transition:transform .15s}
+.stat-card:active{transform:scale(0.97)}
+.stat-card::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(0,212,255,0.04),transparent);border-radius:14px}
+.stat-icon{font-size:18px;margin-bottom:6px}
+.stat-value{font-family:'Rajdhani',sans-serif;font-size:24px;font-weight:700;line-height:1}
+.stat-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-top:3px}
+.section{padding:0 20px 16px}
+.section-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.section-title{font-family:'Rajdhani',sans-serif;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.section-link{font-size:12px;color:var(--primary);text-decoration:none}
+.group-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;gap:12px;cursor:pointer;transition:all .2s;text-decoration:none;color:inherit}
+.group-card:active{transform:scale(0.98);border-color:var(--primary)}
+.gc-icon{width:46px;height:46px;border-radius:13px;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;font-size:20px;color:#fff;box-shadow:0 4px 12px rgba(124,58,237,0.3);flex-shrink:0}
+.gc-body{flex:1;min-width:0}
+.gc-name{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gc-meta{font-size:11px;color:var(--muted);margin-top:3px;display:flex;align-items:center;gap:6px}
+.gc-arrow{color:var(--muted);font-size:11px}
+.badge{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:600}
+.badge-active{background:rgba(0,230,118,0.1);color:var(--success)}
+.badge-warn{background:rgba(255,179,0,0.1);color:var(--warn)}
+.empty{text-align:center;padding:36px 10px}
+.empty i{font-size:42px;color:var(--muted);opacity:.3;margin-bottom:12px;display:block}
+.empty p{color:var(--muted);font-size:13px}
+.add-btn{display:inline-flex;align-items:center;gap:6px;margin-top:14px;padding:11px 22px;background:linear-gradient(135deg,var(--accent),var(--primary));border-radius:12px;color:#fff;font-size:13px;font-weight:500;text-decoration:none;box-shadow:0 4px 14px rgba(0,212,255,0.25)}
+.skeleton{background:linear-gradient(90deg,var(--card) 25%,var(--surface) 50%,var(--card) 75%);background-size:200% 100%;animation:shimmer 1.2s infinite;border-radius:16px}
+.skel-card{height:72px;margin-bottom:10px}
+@keyframes shimmer{to{background-position:-200% 0}}
+.bottom-nav{position:fixed;bottom:0;left:0;right:0;background:rgba(13,22,38,0.97);backdrop-filter:blur(16px);border-top:1px solid var(--border);display:flex;padding:10px 0 max(10px,env(safe-area-inset-bottom));z-index:200}
+.nav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:4px;color:var(--muted);font-size:10px;text-decoration:none;transition:color .2s}
+.nav-item i{font-size:20px}
+.nav-item.active{color:var(--primary)}
+.nav-item.active i{filter:drop-shadow(0 0 6px var(--primary))}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><i class="fa-solid fa-tower-control"></i>GroupPilot</div>
+  <div class="avatar-btn" id="avatarBtn" onclick="window.location.href='profile.html'">?</div>
+</div>
+
+<div class="hero">
+  <div class="greeting">Welcome back, <strong id="firstName">User</strong></div>
+  <div class="hero-title">Your Groups<br>Dashboard</div>
+  <div class="hero-sub">Manage moderation, reports &amp; settings</div>
+</div>
+
+<div class="stats-row">
+  <div class="stat-card">
+    <div class="stat-icon" style="color:var(--primary)"><i class="fa-solid fa-layer-group"></i></div>
+    <div class="stat-value" id="statGroups">—</div>
+    <div class="stat-label">Groups</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon" style="color:var(--warn)"><i class="fa-solid fa-triangle-exclamation"></i></div>
+    <div class="stat-value" id="statWarnings">—</div>
+    <div class="stat-label">Warnings</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon" style="color:var(--danger)"><i class="fa-solid fa-ban"></i></div>
+    <div class="stat-value" id="statBans">—</div>
+    <div class="stat-label">Bans</div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-hdr">
+    <span class="section-title"><i class="fa-solid fa-layer-group" style="color:var(--primary)"></i>My Groups</span>
+    <a href="groups.html" class="section-link">View all <i class="fa-solid fa-chevron-right" style="font-size:9px"></i></a>
+  </div>
+  <div id="groupsList">
+    <div class="skeleton skel-card"></div>
+    <div class="skeleton skel-card"></div>
+  </div>
+</div>
+
+<nav class="bottom-nav">
+  <a class="nav-item active" href="home.html"><i class="fa-solid fa-house"></i><span>Home</span></a>
+  <a class="nav-item" href="groups.html"><i class="fa-solid fa-layer-group"></i><span>Groups</span></a>
+  <a class="nav-item" href="reports.html"><i class="fa-solid fa-flag"></i><span>Reports</span></a>
+  <a class="nav-item" href="moderation.html"><i class="fa-solid fa-shield-halved"></i><span>Mods</span></a>
+  <a class="nav-item" href="profile.html"><i class="fa-solid fa-circle-user"></i><span>Profile</span></a>
+</nav>
+
+<script>
+const SUPABASE_URL      = 'https://mwxrklxxgwbaemqnbvda.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im13eHJrbHh4Z3diYWVtcW5idmRhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NDI4MTYyOCwiZXhwIjoyMDc5ODU3NjI4fQ.mTfLl-MWCNfENzTX8E39fmlnMmVHNsif5uBFPcLpd28';
+const sb  = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const tg  = window.Telegram?.WebApp;
+if(tg){tg.ready();tg.expand();tg.setBackgroundColor('#050a14');}
+
+const userData = JSON.parse(sessionStorage.getItem('gp_user')||'null');
+if(!userData){window.location.href='index.html';}
+
+const name = userData?.first_name || 'User';
+document.getElementById('firstName').textContent = name;
+document.getElementById('avatarBtn').textContent  = name.charAt(0).toUpperCase();
+
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+async function loadDashboard(){
+  const uid = userData.telegram_id;
+  const {count:gc} = await sb.from('groups').select('*',{count:'exact',head:true}).eq('added_by',uid);
+  document.getElementById('statGroups').textContent = gc ?? 0;
+
+  const {data:myG} = await sb.from('groups').select('chat_id').eq('added_by',uid);
+  const cids = (myG||[]).map(g=>g.chat_id);
+
+  if(cids.length){
+    const [{count:wc},{count:bc}] = await Promise.all([
+      sb.from('warnings').select('*',{count:'exact',head:true}).in('chat_id',cids),
+      sb.from('bans').select('*',{count:'exact',head:true}).in('chat_id',cids).eq('is_active',true),
+    ]);
+    document.getElementById('statWarnings').textContent = wc ?? 0;
+    document.getElementById('statBans').textContent     = bc ?? 0;
+  } else {
+    document.getElementById('statWarnings').textContent = 0;
+    document.getElementById('statBans').textContent     = 0;
+  }
+
+  const {data:groups,error} = await sb.from('groups').select('*').eq('added_by',uid)
+    .order('created_at',{ascending:false}).limit(5);
+  const cont = document.getElementById('groupsList');
+
+  if(error||!groups?.length){
+    cont.innerHTML = `<div class="empty"><i class="fa-solid fa-layer-group"></i><p>No groups yet. Add GroupPilot to a Telegram group to get started.</p>
+      <a class="add-btn" href="https://t.me/GroupPilotBot?startgroup=true" target="_blank"><i class="fa-solid fa-plus"></i> Add to Group</a></div>`;
+    return;
+  }
+  cont.innerHTML = groups.map(g=>`
+    <a class="group-card" href="group-settings.html?id=${g.chat_id}">
+      <div class="gc-icon"><i class="fa-solid fa-users"></i></div>
+      <div class="gc-body">
+        <div class="gc-name">${esc(g.chat_title)}</div>
+        <div class="gc-meta">
+          <span class="badge ${g.bot_is_admin?'badge-active':'badge-warn'}">
+            <i class="fa-solid fa-circle" style="font-size:5px"></i>
+            ${g.bot_is_admin?'Active':'Needs Admin'}
+          </span>
+        </div>
+      </div>
+      <i class="fa-solid fa-chevron-right gc-arrow"></i>
+    </a>`).join('');
+}
+
+loadDashboard();
+</script>
+</body>
+</html>

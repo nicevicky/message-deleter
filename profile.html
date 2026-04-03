@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
+<title>GroupPilot — Profile</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
+<style>
+:root{--primary:#00d4ff;--accent:#7c3aed;--gold:#ffd700;--bg:#050a14;--surface:#0d1626;--card:#111d30;--border:rgba(0,212,255,0.12);--text:#e8f4fd;--muted:#5a7a99;--danger:#ff4757;--success:#00e676}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding-bottom:76px}
+.topbar{display:flex;align-items:center;gap:12px;padding:14px 20px;background:rgba(13,22,38,0.97);backdrop-filter:blur(14px);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
+.back-btn{width:36px;height:36px;border-radius:10px;background:var(--card);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text);font-size:14px}
+.topbar-title{font-family:'Rajdhani',sans-serif;font-size:20px;font-weight:700}
+.hero{padding:32px 20px 24px;text-align:center;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;width:260px;height:260px;background:radial-gradient(circle,rgba(124,58,237,0.13),transparent 70%);top:-80px;left:50%;transform:translateX(-50%);pointer-events:none}
+.av-wrap{position:relative;display:inline-block;margin-bottom:14px}
+.avatar{width:86px;height:86px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;font-family:'Rajdhani',sans-serif;font-size:34px;font-weight:700;color:#fff;border:3px solid rgba(0,212,255,0.25);box-shadow:0 0 0 5px rgba(0,212,255,0.06),0 8px 20px rgba(0,0,0,0.35)}
+.admin-ring{position:absolute;inset:-4px;border-radius:50%;border:2px solid transparent;background:linear-gradient(var(--bg),var(--bg)) padding-box,linear-gradient(135deg,var(--gold),var(--primary)) border-box;display:none}
+.profile-name{font-family:'Rajdhani',sans-serif;font-size:22px;font-weight:700}
+.profile-handle{font-size:13px;color:var(--muted);margin-top:3px}
+.profile-badge{display:inline-flex;align-items:center;gap:5px;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:600;margin-top:8px}
+.badge-user{background:rgba(0,212,255,0.1);color:var(--primary);border:1px solid rgba(0,212,255,0.2)}
+.badge-admin{background:rgba(255,215,0,0.1);color:var(--gold);border:1px solid rgba(255,215,0,0.2)}
+.section{padding:0 20px 8px}
+.sec-label{font-family:'Rajdhani',sans-serif;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);padding:14px 0 8px}
+.info-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
+.info-row{display:flex;align-items:center;justify-content:space-between;padding:13px 16px;border-bottom:1px solid var(--border)}
+.info-row:last-child{border-bottom:none}
+.ir-left{display:flex;align-items:center;gap:10px}
+.ir-ic{width:32px;height:32px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:13px}
+.ic-blue{background:rgba(0,212,255,0.1);color:var(--primary)}
+.ic-purple{background:rgba(124,58,237,0.1);color:#c084fc}
+.ic-green{background:rgba(0,230,118,0.1);color:var(--success)}
+.ir-label{font-size:13px;font-weight:500}
+.ir-val{font-size:12px;color:var(--muted);font-family:monospace}
+.action-list{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
+.action-row{display:flex;align-items:center;gap:12px;padding:13px 16px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .15s;text-decoration:none;color:inherit}
+.action-row:last-child{border-bottom:none}
+.action-row:active{background:rgba(255,255,255,0.02)}
+.ar-ic{width:32px;height:32px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0}
+.ar-label{flex:1;font-size:14px;font-weight:500}
+.ar-arrow{font-size:11px;color:var(--muted)}
+.row-danger .ar-label{color:var(--danger)}
+.row-danger .ar-ic{background:rgba(255,71,87,0.1);color:var(--danger)}
+.bottom-nav{position:fixed;bottom:0;left:0;right:0;background:rgba(13,22,38,0.97);backdrop-filter:blur(16px);border-top:1px solid var(--border);display:flex;padding:10px 0 max(10px,env(safe-area-inset-bottom));z-index:200}
+.nav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:4px;color:var(--muted);font-size:10px;text-decoration:none;transition:color .2s}
+.nav-item i{font-size:20px}
+.nav-item.active{color:var(--primary)}
+.nav-item.active i{filter:drop-shadow(0 0 6px var(--primary))}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="back-btn" onclick="history.back()"><i class="fa-solid fa-arrow-left"></i></div>
+  <div class="topbar-title">Profile</div>
+</div>
+
+<div class="hero">
+  <div class="av-wrap">
+    <div class="admin-ring" id="adminRing"></div>
+    <div class="avatar" id="avatar">U</div>
+  </div>
+  <div class="profile-name"  id="profileName">User</div>
+  <div class="profile-handle" id="profileHandle">@username</div>
+  <div class="profile-badge badge-user" id="profileBadge">
+    <i class="fa-solid fa-user"></i> Member
+  </div>
+</div>
+
+<div class="section">
+  <div class="sec-label">Account Info</div>
+  <div class="info-card">
+    <div class="info-row">
+      <div class="ir-left"><div class="ir-ic ic-blue"><i class="fa-brands fa-telegram"></i></div><div class="ir-label">Telegram ID</div></div>
+      <div class="ir-val" id="tgId">—</div>
+    </div>
+    <div class="info-row">
+      <div class="ir-left"><div class="ir-ic ic-purple"><i class="fa-solid fa-calendar-check"></i></div><div class="ir-label">Joined</div></div>
+      <div class="ir-val" id="joinDate">—</div>
+    </div>
+    <div class="info-row">
+      <div class="ir-left"><div class="ir-ic ic-green"><i class="fa-solid fa-clock-rotate-left"></i></div><div class="ir-label">Last Seen</div></div>
+      <div class="ir-val" id="lastSeen">—</div>
+    </div>
+  </div>
+
+  <div class="sec-label">Navigation</div>
+  <div class="action-list">
+    <a class="action-row" href="home.html">
+      <div class="ar-ic" style="background:rgba(0,212,255,0.1);color:var(--primary)"><i class="fa-solid fa-house"></i></div>
+      <div class="ar-label">Home Dashboard</div>
+      <i class="fa-solid fa-chevron-right ar-arrow"></i>
+    </a>
+    <a class="action-row" href="groups.html">
+      <div class="ar-ic" style="background:rgba(124,58,237,0.1);color:#c084fc"><i class="fa-solid fa-layer-group"></i></div>
+      <div class="ar-label">My Groups</div>
+      <i class="fa-solid fa-chevron-right ar-arrow"></i>
+    </a>
+    <a class="action-row" href="join-requests.html">
+      <div class="ar-ic" style="background:rgba(0,230,118,0.1);color:var(--success)"><i class="fa-solid fa-user-check"></i></div>
+      <div class="ar-label">Join Approvals</div>
+      <i class="fa-solid fa-chevron-right ar-arrow"></i>
+    </a>
+    <a class="action-row" href="moderation.html">
+      <div class="ar-ic" style="background:rgba(255,179,0,0.1);color:var(--warn)"><i class="fa-solid fa-shield-halved"></i></div>
+      <div class="ar-label">Moderation Log</div>
+      <i class="fa-solid fa-chevron-right ar-arrow"></i>
+    </a>
+    <div class="action-row row-danger" onclick="logout()">
+      <div class="ar-ic"><i class="fa-solid fa-right-from-bracket"></i></div>
+      <div class="ar-label">Logout</div>
+    </div>
+  </div>
+</div>
+
+<nav class="bottom-nav">
+  <a class="nav-item" href="home.html"><i class="fa-solid fa-house"></i><span>Home</span></a>
+  <a class="nav-item" href="groups.html"><i class="fa-solid fa-layer-group"></i><span>Groups</span></a>
+  <a class="nav-item" href="reports.html"><i class="fa-solid fa-flag"></i><span>Reports</span></a>
+  <a class="nav-item" href="moderation.html"><i class="fa-solid fa-shield-halved"></i><span>Mods</span></a>
+  <a class="nav-item active" href="profile.html"><i class="fa-solid fa-circle-user"></i><span>Profile</span></a>
+</nav>
+
+<script>
+const tg = window.Telegram?.WebApp;
+if(tg){tg.ready();tg.expand();tg.setBackgroundColor('#050a14');}
+const userData = JSON.parse(sessionStorage.getItem('gp_user')||'null');
+if(!userData){window.location.href='index.html';}
+
+const fullName = [userData.first_name, userData.last_name].filter(Boolean).join(' ') || 'User';
+document.getElementById('avatar').textContent        = fullName.charAt(0).toUpperCase();
+document.getElementById('profileName').textContent   = fullName;
+document.getElementById('profileHandle').textContent = userData.username ? '@'+userData.username : 'No username';
+document.getElementById('tgId').textContent          = userData.telegram_id;
+document.getElementById('joinDate').textContent      = userData.joined_at  ? new Date(userData.joined_at).toLocaleDateString()  : '—';
+document.getElementById('lastSeen').textContent      = userData.last_seen  ? new Date(userData.last_seen).toLocaleString()       : '—';
+
+if(userData.is_admin){
+  document.getElementById('adminRing').style.display = 'block';
+  const b = document.getElementById('profileBadge');
+  b.className = 'profile-badge badge-admin';
+  b.innerHTML = '<i class="fa-solid fa-crown"></i> Admin';
+}
+
+function logout(){
+  sessionStorage.removeItem('gp_user');
+  sessionStorage.removeItem('gp_tg_init');
+  window.location.href = 'index.html';
+}
+</script>
+</body>
+</html>

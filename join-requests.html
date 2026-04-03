@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
+<title>GroupPilot — Join Requests</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
+<style>
+:root{--primary:#00d4ff;--accent:#7c3aed;--bg:#050a14;--surface:#0d1626;--card:#111d30;--border:rgba(0,212,255,0.12);--text:#e8f4fd;--muted:#5a7a99;--danger:#ff4757;--success:#00e676;--warn:#ffb300}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding-bottom:76px}
+.topbar{display:flex;align-items:center;gap:12px;padding:14px 20px;background:rgba(13,22,38,0.97);backdrop-filter:blur(14px);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
+.back-btn{width:36px;height:36px;border-radius:10px;background:var(--card);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text);font-size:14px}
+.topbar-title{font-family:'Rajdhani',sans-serif;font-size:20px;font-weight:700;flex:1}
+.info-banner{margin:14px 20px;padding:12px 14px;border-radius:12px;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.14);font-size:12px;color:var(--muted);line-height:1.55;display:flex;gap:10px;align-items:flex-start}
+.info-banner i{color:var(--primary);margin-top:1px;flex-shrink:0}
+.sec-label{padding:4px 20px 10px;font-family:'Rajdhani',sans-serif;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--muted)}
+.req-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:14px 16px;margin:0 20px 10px;transition:opacity .35s}
+.req-top{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.req-av{width:44px;height:44px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;font-family:'Rajdhani',sans-serif;font-size:18px;font-weight:700;color:#fff;flex-shrink:0}
+.req-info{flex:1}
+.req-name{font-size:14px;font-weight:500}
+.req-meta{font-size:11px;color:var(--muted);margin-top:3px}
+.req-time{font-size:10px;color:var(--muted);margin-top:2px}
+.req-actions{display:flex;gap:8px}
+.req-btn{flex:1;padding:10px;border-radius:10px;border:none;font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;transition:transform .12s}
+.req-btn:active{transform:scale(0.97)}
+.btn-approve{background:rgba(0,230,118,0.1);color:var(--success);border:1px solid rgba(0,230,118,0.22)}
+.btn-reject{background:rgba(255,71,87,0.1);color:var(--danger);border:1px solid rgba(255,71,87,0.2)}
+.empty{text-align:center;padding:40px 20px}
+.empty i{font-size:44px;color:var(--muted);opacity:.3;margin-bottom:12px;display:block}
+.empty p{color:var(--muted);font-size:13px;line-height:1.5}
+.skeleton{background:linear-gradient(90deg,var(--card) 25%,var(--surface) 50%,var(--card) 75%);background-size:200% 100%;animation:shimmer 1.2s infinite;border-radius:16px;height:100px;margin:0 20px 10px}
+@keyframes shimmer{to{background-position:-200% 0}}
+.toast{position:fixed;bottom:86px;left:50%;transform:translateX(-50%) translateY(100px);background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 18px;font-size:13px;display:flex;align-items:center;gap:8px;z-index:999;transition:transform .3s cubic-bezier(.34,1.56,.64,1);white-space:nowrap}
+.toast.show{transform:translateX(-50%) translateY(0)}
+.bottom-nav{position:fixed;bottom:0;left:0;right:0;background:rgba(13,22,38,0.97);backdrop-filter:blur(16px);border-top:1px solid var(--border);display:flex;padding:10px 0 max(10px,env(safe-area-inset-bottom));z-index:200}
+.nav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:4px;color:var(--muted);font-size:10px;text-decoration:none;transition:color .2s}
+.nav-item i{font-size:20px}
+.nav-item.active{color:var(--primary)}
+.nav-item.active i{filter:drop-shadow(0 0 6px var(--primary))}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="back-btn" onclick="history.back()"><i class="fa-solid fa-arrow-left"></i></div>
+  <div class="topbar-title"><i class="fa-solid fa-user-check" style="color:var(--success);font-size:15px;margin-right:8px"></i>Join Requests</div>
+</div>
+
+<div class="info-banner">
+  <i class="fa-solid fa-circle-info"></i>
+  <span>Enable <strong style="color:var(--primary)">Require Join Approval</strong> in Group Settings for join requests to appear here. Turn on <strong style="color:var(--primary)">Auto-Approve</strong> to let the bot handle them automatically.</span>
+</div>
+
+<div class="sec-label">Pending Approvals</div>
+<div id="listWrap">
+  <div class="skeleton"></div>
+  <div class="skeleton"></div>
+</div>
+
+<div class="toast" id="toast"><i class="fa-solid fa-check-circle" style="color:var(--success)"></i><span id="toastMsg"></span></div>
+
+<nav class="bottom-nav">
+  <a class="nav-item active" href="home.html"><i class="fa-solid fa-house"></i><span>Home</span></a>
+  <a class="nav-item" href="groups.html"><i class="fa-solid fa-layer-group"></i><span>Groups</span></a>
+  <a class="nav-item" href="reports.html"><i class="fa-solid fa-flag"></i><span>Reports</span></a>
+  <a class="nav-item" href="moderation.html"><i class="fa-solid fa-shield-halved"></i><span>Mods</span></a>
+  <a class="nav-item" href="profile.html"><i class="fa-solid fa-circle-user"></i><span>Profile</span></a>
+</nav>
+
+<script>
+const SUPABASE_URL      = 'https://mwxrklxxgwbaemqnbvda.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im13eHJrbHh4Z3diYWVtcW5idmRhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NDI4MTYyOCwiZXhwIjoyMDc5ODU3NjI4fQ.mTfLl-MWCNfENzTX8E39fmlnMmVHNsif5uBFPcLpd28';
+const BACKEND_URL       = 'https://message-deleter.vercel.app';
+const sb  = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const tg  = window.Telegram?.WebApp;
+if(tg){tg.ready();tg.expand();tg.setBackgroundColor('#050a14');}
+const userData = JSON.parse(sessionStorage.getItem('gp_user')||'null');
+if(!userData){window.location.href='index.html';}
+
+let requests=[];
+
+function showToast(msg){const t=document.getElementById('toast');document.getElementById('toastMsg').textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2400);}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function relTime(ts){if(!ts)return'—';const d=Date.now()-new Date(ts).getTime(),m=Math.floor(d/60000),h=Math.floor(m/60);return h>0?h+'h ago':m>0?m+'m ago':'just now';}
+
+async function decide(reqId,userId,chatId,action,cardEl){
+  const {error}=await sb.from('join_requests').update({
+    status:action,reviewed_by:userData.telegram_id,reviewed_at:new Date().toISOString()
+  }).eq('id',reqId);
+  if(error){showToast('Error updating request');return;}
+  try{
+    await fetch(BACKEND_URL+(action==='approved'?'/approve-join':'/reject-join'),{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({chat_id:chatId,user_id:userId})
+    });
+  }catch(e){console.warn('Backend call failed:',e);}
+  cardEl.style.opacity='0.4';
+  showToast(action==='approved'?'User approved':'Request rejected');
+  setTimeout(()=>{cardEl.style.display='none';},500);
+}
+
+function render(){
+  const pending=requests.filter(r=>r.status==='pending');
+  const c=document.getElementById('listWrap');
+  if(!pending.length){
+    c.innerHTML=`<div class="empty"><i class="fa-solid fa-user-check"></i><p>No pending join requests.<br>Enable "Require Join Approval" in Group Settings.</p></div>`;
+    return;
+  }
+  c.innerHTML=pending.map((r,i)=>`
+    <div class="req-card" id="req-${i}">
+      <div class="req-top">
+        <div class="req-av">${(r.first_name||'U').charAt(0).toUpperCase()}</div>
+        <div class="req-info">
+          <div class="req-name">${esc(r.first_name||'Unknown')}${r.username?' (@'+esc(r.username)+')':''}</div>
+          <div class="req-meta"><i class="fa-solid fa-users" style="font-size:9px;color:var(--muted);margin-right:3px"></i>Chat: ${r.chat_id}</div>
+          <div class="req-time"><i class="fa-regular fa-clock" style="font-size:9px;margin-right:2px"></i>${relTime(r.requested_at)}</div>
+        </div>
+      </div>
+      <div class="req-actions">
+        <button class="req-btn btn-approve" onclick="decide(${r.id},${r.user_id},${r.chat_id},'approved',document.getElementById('req-${i}'))">
+          <i class="fa-solid fa-check"></i> Approve
+        </button>
+        <button class="req-btn btn-reject" onclick="decide(${r.id},${r.user_id},${r.chat_id},'rejected',document.getElementById('req-${i}'))">
+          <i class="fa-solid fa-xmark"></i> Reject
+        </button>
+      </div>
+    </div>`).join('');
+}
+
+async function init(){
+  const {data:groups}=await sb.from('groups').select('chat_id').eq('added_by',userData.telegram_id);
+  const cids=(groups||[]).map(g=>g.chat_id);
+  if(!cids.length){document.getElementById('listWrap').innerHTML=`<div class="empty"><i class="fa-solid fa-user-check"></i><p>No groups found.</p></div>`;return;}
+  const {data}=await sb.from('join_requests').select('*').in('chat_id',cids).eq('status','pending').order('requested_at',{ascending:false});
+  requests=data||[];
+  render();
+}
+init();
+</script>
+</body>
+</html>

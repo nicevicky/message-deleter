@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
+<title>GroupPilot</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
+<style>
+:root{--primary:#00d4ff;--accent:#7c3aed;--bg:#050a14;--card:#111d30;--border:rgba(0,212,255,0.15);--text:#e8f4fd;--muted:#5a7a99;--danger:#ff4757;--success:#00e676}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;overflow:hidden;position:relative}
+body::before{content:'';position:fixed;inset:0;background:linear-gradient(rgba(0,212,255,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,0.03) 1px,transparent 1px);background-size:40px 40px;transform:perspective(500px) rotateX(30deg) scaleY(1.5) translateY(-20%);transform-origin:center bottom;pointer-events:none;z-index:0}
+body::after{content:'';position:fixed;width:500px;height:500px;border-radius:50%;background:radial-gradient(circle,rgba(124,58,237,0.18),transparent 70%);top:-150px;left:50%;transform:translateX(-50%);pointer-events:none;z-index:0}
+.splash{position:relative;z-index:10;text-align:center;padding:40px 32px;max-width:340px;width:100%}
+.logo-wrap{position:relative;display:inline-block;margin-bottom:28px}
+.orbit{position:absolute;width:130px;height:130px;border:1px dashed rgba(0,212,255,0.2);border-radius:50%;top:50%;left:50%;transform:translate(-50%,-50%);animation:spin 8s linear infinite}
+.orbit-dot{position:absolute;width:7px;height:7px;background:var(--primary);border-radius:50%;top:-3px;left:50%;transform:translateX(-50%);box-shadow:0 0 10px var(--primary)}
+@keyframes spin{to{transform:translate(-50%,-50%) rotate(360deg)}}
+.logo-icon{width:90px;height:90px;border-radius:24px;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;font-size:40px;color:#fff;box-shadow:0 0 0 1px rgba(0,212,255,0.25),0 0 40px rgba(0,212,255,0.2),0 20px 40px rgba(0,0,0,0.5);animation:float 3s ease-in-out infinite;position:relative}
+.logo-icon::after{content:'';position:absolute;bottom:-14px;left:50%;transform:translateX(-50%);width:65%;height:14px;background:radial-gradient(ellipse,rgba(0,212,255,0.25),transparent 70%);border-radius:50%;filter:blur(4px)}
+@keyframes float{0%,100%{transform:translateY(0) rotateY(-6deg)}50%{transform:translateY(-8px) rotateY(6deg)}}
+.app-name{font-family:'Rajdhani',sans-serif;font-size:34px;font-weight:700;letter-spacing:2px;background:linear-gradient(135deg,#fff,var(--primary));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:6px}
+.tagline{font-size:13px;color:var(--muted);margin-bottom:36px}
+.spinner{width:48px;height:48px;border:2px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:rotate .75s linear infinite;margin:0 auto 16px}
+@keyframes rotate{to{transform:rotate(360deg)}}
+.status-text{font-size:13px;color:var(--muted);animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.4}50%{opacity:1}}
+.error-card{background:rgba(255,71,87,0.08);border:1px solid rgba(255,71,87,0.25);border-radius:16px;padding:24px;display:none;text-align:center}
+.error-card i{font-size:32px;color:var(--danger);margin-bottom:10px;display:block}
+.error-card p{font-size:13px;color:#ff8a95;line-height:1.6}
+</style>
+</head>
+<body>
+<div class="splash">
+  <div class="logo-wrap">
+    <div class="orbit"><div class="orbit-dot"></div></div>
+    <div class="logo-icon"><i class="fa-solid fa-tower-control"></i></div>
+  </div>
+  <div class="app-name">GroupPilot</div>
+  <div class="tagline">Intelligent Group Moderation</div>
+  <div id="loadingState">
+    <div class="spinner"></div>
+    <div class="status-text">Authenticating...</div>
+  </div>
+  <div class="error-card" id="errorCard">
+    <i class="fa-solid fa-shield-halved"></i>
+    <p id="errorMsg">This app must be opened inside Telegram.</p>
+  </div>
+</div>
+
+<script>
+const SUPABASE_URL     = 'https://mwxrklxxgwbaemqnbvda.supabase.co';
+const SUPABASE_ANON_KEY= 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im13eHJrbHh4Z3diYWVtcW5idmRhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NDI4MTYyOCwiZXhwIjoyMDc5ODU3NjI4fQ.mTfLl-MWCNfENzTX8E39fmlnMmVHNsif5uBFPcLpd28';
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const tg = window.Telegram?.WebApp;
+
+function showError(msg) {
+  document.getElementById('loadingState').style.display = 'none';
+  const c = document.getElementById('errorCard');
+  c.style.display = 'block';
+  document.getElementById('errorMsg').textContent = msg;
+}
+
+async function init() {
+  if (!tg) { showError('Open this app inside Telegram.'); return; }
+  tg.ready(); tg.expand(); tg.setBackgroundColor('#050a14');
+  const user = tg.initDataUnsafe?.user;
+  if (!user?.id) { showError('Could not verify Telegram identity. Please reopen the app.'); return; }
+
+  try {
+    const { data: existing, error: fe } = await sb.from('users').select('*').eq('telegram_id', user.id).single();
+    let userData;
+    if (fe && fe.code !== 'PGRST116') throw fe;
+
+    if (existing) {
+      const { data: updated } = await sb.from('users').update({
+        last_seen:  new Date().toISOString(),
+        username:   user.username   || existing.username,
+        first_name: user.first_name || existing.first_name,
+        last_name:  user.last_name  || existing.last_name,
+      }).eq('telegram_id', user.id).select().single();
+      userData = updated || existing;
+    } else {
+      const { data: created, error: ce } = await sb.from('users').insert({
+        telegram_id: user.id,
+        username:    user.username,
+        first_name:  user.first_name,
+        last_name:   user.last_name,
+        photo_url:   user.photo_url,
+        is_admin:    false,
+      }).select().single();
+      if (ce) throw ce;
+      userData = created;
+    }
+
+    sessionStorage.setItem('gp_user', JSON.stringify(userData));
+    sessionStorage.setItem('gp_tg_init', tg.initData || '');
+    window.location.href = userData.is_admin ? 'admin.html' : 'home.html';
+  } catch(e) {
+    console.error(e);
+    showError('Authentication failed. Please try again.');
+  }
+}
+
+init();
+</script>
+</body>
+</html>
