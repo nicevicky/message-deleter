@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
+<title>GroupPilot — Group Settings</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
+<style>
+:root{--primary:#00d4ff;--accent:#7c3aed;--bg:#050a14;--surface:#0d1626;--card:#111d30;--border:rgba(0,212,255,0.12);--text:#e8f4fd;--muted:#5a7a99;--danger:#ff4757;--success:#00e676;--warn:#ffb300}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding-bottom:76px}
+.topbar{display:flex;align-items:center;gap:12px;padding:14px 20px;background:rgba(13,22,38,0.97);backdrop-filter:blur(14px);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
+.back-btn{width:36px;height:36px;border-radius:10px;background:var(--card);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text);font-size:14px;flex-shrink:0}
+.topbar-title{font-family:'Rajdhani',sans-serif;font-size:18px;font-weight:700;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.save-btn{padding:8px 16px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--primary));border:none;color:#fff;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;box-shadow:0 3px 10px rgba(0,212,255,0.3);flex-shrink:0}
+.hero{padding:18px 20px;display:flex;align-items:center;gap:14px}
+.hero-icon{width:52px;height:52px;border-radius:14px;background:linear-gradient(135deg,var(--accent),var(--primary));display:flex;align-items:center;justify-content:center;font-size:22px;color:#fff;box-shadow:0 4px 14px rgba(124,58,237,0.35);flex-shrink:0}
+.hero-info .hero-name{font-family:'Rajdhani',sans-serif;font-size:18px;font-weight:700}
+.hero-info .hero-id{font-size:11px;color:var(--muted);font-family:monospace;margin-top:2px}
+.status-chip{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:10px;font-weight:600;margin-top:5px}
+.st-active{background:rgba(0,230,118,0.1);color:var(--success);border:1px solid rgba(0,230,118,0.2)}
+.st-inactive{background:rgba(255,71,87,0.1);color:var(--danger);border:1px solid rgba(255,71,87,0.2)}
+.sec{padding:0 20px 6px}
+.sec-label{font-family:'Rajdhani',sans-serif;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);padding:14px 0 8px;display:flex;align-items:center;gap:6px}
+.toggle-row{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:13px 16px;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:12px;transition:border-color .2s}
+.toggle-row:active{border-color:var(--primary)}
+.tl{display:flex;align-items:center;gap:12px}
+.ti{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0}
+.c-blue{background:rgba(0,212,255,0.1);color:var(--primary)}
+.c-purple{background:rgba(124,58,237,0.1);color:#c084fc}
+.c-green{background:rgba(0,230,118,0.1);color:var(--success)}
+.c-orange{background:rgba(255,179,0,0.1);color:var(--warn)}
+.c-red{background:rgba(255,71,87,0.1);color:var(--danger)}
+.c-teal{background:rgba(0,212,255,0.08);color:#00b4cc}
+.tt .tl-main{font-size:13px;font-weight:500}
+.tt .tl-sub{font-size:11px;color:var(--muted);margin-top:2px}
+.ios-sw{position:relative;width:44px;height:26px;flex-shrink:0}
+.ios-sw input{opacity:0;width:0;height:0;position:absolute}
+.sw-track{position:absolute;inset:0;border-radius:13px;background:var(--surface);border:1px solid var(--border);transition:all .25s;cursor:pointer}
+.sw-track::before{content:'';position:absolute;width:20px;height:20px;border-radius:50%;background:#fff;top:2px;left:2px;transition:transform .25s;box-shadow:0 1px 4px rgba(0,0,0,0.3)}
+.ios-sw input:checked+.sw-track{background:var(--primary);border-color:var(--primary)}
+.ios-sw input:checked+.sw-track::before{transform:translateX(18px)}
+.input-row{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:13px 16px;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.num-in{width:76px;padding:7px 10px;border-radius:8px;text-align:center;background:var(--surface);border:1px solid var(--border);color:var(--text);font-size:14px;font-family:'DM Sans',sans-serif;outline:none;transition:border-color .2s}
+.num-in:focus{border-color:var(--primary)}
+.words-box{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px 16px;margin-bottom:8px}
+.words-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.words-label{font-size:13px;font-weight:500;display:flex;align-items:center;gap:7px}
+.add-word-btn{padding:5px 12px;border-radius:8px;background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.2);color:var(--primary);font-size:12px;cursor:pointer}
+.word-chips{display:flex;flex-wrap:wrap;gap:6px}
+.wchip{display:flex;align-items:center;gap:5px;padding:4px 10px;background:rgba(255,71,87,0.07);border:1px solid rgba(255,71,87,0.18);border-radius:8px;font-size:12px;color:#ff8a95}
+.wchip button{background:none;border:none;color:inherit;cursor:pointer;padding:0;font-size:10px;display:flex;align-items:center}
+.no-words{font-size:12px;color:var(--muted);text-align:center;padding:6px}
+.ta-box{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px 16px;margin-bottom:8px}
+.ta-label{font-size:12px;color:var(--muted);margin-bottom:8px;display:flex;align-items:center;gap:5px}
+textarea{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px;color:var(--text);font-size:13px;font-family:'DM Sans',sans-serif;resize:vertical;min-height:88px;outline:none;transition:border-color .2s}
+textarea:focus{border-color:var(--primary)}
+.full-in{width:100%;padding:10px 14px;border-radius:10px;background:var(--surface);border:1px solid var(--border);color:var(--text);font-size:13px;font-family:'DM Sans',sans-serif;outline:none;transition:border-color .2s;margin-top:8px}
+.full-in:focus{border-color:var(--primary)}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);background:var(--card);border:1px solid var(--border);border-radius:12px;padding:11px 18px;font-size:13px;display:flex;align-items:center;gap:8px;box-shadow:0 4px 20px rgba(0,0,0,0.4);z-index:999;transition:transform .3s cubic-bezier(.34,1.56,.64,1);white-space:nowrap}
+.toast.show{transform:translateX(-50%) translateY(0)}
+.modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);backdrop-filter:blur(4px);z-index:500;align-items:flex-end}
+.modal-bg.open{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:20px 20px 0 0;padding:24px 20px 32px;width:100%;animation:slideUp .3s ease}
+@keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
+.modal h3{font-family:'Rajdhani',sans-serif;font-size:18px;font-weight:700;margin-bottom:14px}
+.modal input{width:100%;padding:12px 14px;background:var(--card);border:1px solid var(--border);border-radius:12px;color:var(--text);font-size:14px;font-family:'DM Sans',sans-serif;outline:none}
+.modal input:focus{border-color:var(--primary)}
+.modal-actions{display:flex;gap:10px;margin-top:14px}
+.modal-btn{flex:1;padding:12px;border-radius:12px;border:none;font-size:14px;font-weight:600;cursor:pointer}
+.m-cancel{background:var(--card);border:1px solid var(--border);color:var(--text)}
+.m-confirm{background:linear-gradient(135deg,var(--accent),var(--primary));color:#fff}
+
+.bottom-nav{position:fixed;bottom:0;left:0;right:0;background:rgba(13,22,38,0.97);backdrop-filter:blur(16px);border-top:1px solid var(--border);display:flex;padding:10px 0 max(10px,env(safe-area-inset-bottom));z-index:200}
+.nav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:4px;color:var(--muted);font-size:10px;text-decoration:none;transition:color .2s}
+.nav-item i{font-size:20px}
+.nav-item.active{color:var(--primary)}
+.nav-item.active i{filter:drop-shadow(0 0 6px var(--primary))}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="back-btn" onclick="history.back()"><i class="fa-solid fa-arrow-left"></i></div>
+  <div class="topbar-title" id="pageTitle">Group Settings</div>
+  <button class="save-btn" onclick="saveSettings()"><i class="fa-solid fa-floppy-disk"></i> Save</button>
+</div>
+
+<div class="hero">
+  <div class="hero-icon"><i class="fa-solid fa-users"></i></div>
+  <div class="hero-info">
+    <div class="hero-name" id="groupName">Loading...</div>
+    <div class="hero-id"   id="groupId">—</div>
+    <div id="groupStatus"></div>
+  </div>
+</div>
+
+<div class="sec">
+  <div class="sec-label"><i class="fa-solid fa-sliders" style="color:var(--primary)"></i>Moderation Toggles</div>
+
+  <div class="toggle-row">
+    <div class="tl"><div class="ti c-blue"><i class="fa-solid fa-link-slash"></i></div>
+    <div class="tt"><div class="tl-main">Delete Links</div><div class="tl-sub">Remove URLs, http &amp; t.me links</div></div></div>
+    <label class="ios-sw"><input type="checkbox" id="toggleLinks"><span class="sw-track"></span></label>
+  </div>
+
+  <div class="toggle-row">
+    <div class="tl"><div class="ti c-purple"><i class="fa-solid fa-bullhorn"></i></div>
+    <div class="tt"><div class="tl-main">Delete Promotions</div><div class="tl-sub">Remove forwards, bot posts &amp; spam emojis</div></div></div>
+    <label class="ios-sw"><input type="checkbox" id="togglePromo"><span class="sw-track"></span></label>
+  </div>
+
+  <div class="toggle-row">
+    <div class="tl"><div class="ti c-teal"><i class="fa-solid fa-door-open"></i></div>
+    <div class="tt"><div class="tl-main">Delete Join Messages</div><div class="tl-sub">Remove "X joined the group" notices</div></div></div>
+    <label class="ios-sw"><input type="checkbox" id="toggleJoin"><span class="sw-track"></span></label>
+  </div>
+
+  <div class="toggle-row">
+    <div class="tl"><div class="ti c-red"><i class="fa-solid fa-face-smile"></i></div>
+    <div class="tt"><div class="tl-main">Sticker Protect</div><div class="tl-sub">Delete stickers sent by non-admins</div></div></div>
+    <label class="ios-sw"><input type="checkbox" id="toggleSticker"><span class="sw-track"></span></label>
+  </div>
+
+  <div class="sec-label"><i class="fa-solid fa-user-check" style="color:var(--success)"></i>Join Approval</div>
+
+  <div class="toggle-row">
+    <div class="tl"><div class="ti c-orange"><i class="fa-solid fa-user-clock"></i></div>
+    <div class="tt"><div class="tl-main">Require Join Approval</div><div class="tl-sub">New members need admin approval to join</div></div></div>
+    <label class="ios-sw"><input type="checkbox" id="toggleApproval"><span class="sw-track"></span></label>
+  </div>
+
+  <div class="toggle-row">
+    <div class="tl"><div class="ti c-green"><i class="fa-solid fa-robot"></i></div>
+    <div class="tt"><div class="tl-main">Auto-Approve Requests</div><div class="tl-sub">Bot automatically approves all join requests</div></div></div>
+    <label class="ios-sw"><input type="checkbox" id="toggleAutoApprove"><span class="sw-track"></span></label>
+  </div>
+
+  <div class="sec-label"><i class="fa-solid fa-gauge-high" style="color:var(--warn)"></i>Limits</div>
+
+  <div class="input-row">
+    <div class="tl"><div class="ti c-orange"><i class="fa-solid fa-triangle-exclamation"></i></div>
+    <div class="tt"><div class="tl-main">Max Warnings</div><div class="tl-sub">Auto-mute after this many (3–31)</div></div></div>
+    <input type="number" class="num-in" id="maxWarnings" min="3" max="31" value="3"/>
+  </div>
+
+  <div class="input-row">
+    <div class="tl"><div class="ti c-blue"><i class="fa-solid fa-text-width"></i></div>
+    <div class="tt"><div class="tl-main">Max Word Count</div><div class="tl-sub">0 = unlimited</div></div></div>
+    <input type="number" class="num-in" id="maxWords" min="0" value="0"/>
+  </div>
+
+  <div class="input-row">
+    <div class="tl"><div class="ti c-purple"><i class="fa-solid fa-clock"></i></div>
+    <div class="tt"><div class="tl-main">Warning Timer (sec)</div><div class="tl-sub">Auto-delete warning messages after this</div></div></div>
+    <input type="number" class="num-in" id="warnTimer" min="0" value="30"/>
+  </div>
+
+  <div class="sec-label"><i class="fa-solid fa-ban" style="color:var(--danger)"></i>Banned Words</div>
+
+  <div class="words-box">
+    <div class="words-top">
+      <div class="words-label"><i class="fa-solid fa-shield-halved" style="color:var(--danger)"></i>Banned Words</div>
+      <div class="add-word-btn" onclick="openModal()"><i class="fa-solid fa-plus"></i> Add</div>
+    </div>
+    <div class="word-chips" id="wordChips"><div class="no-words">No banned words set</div></div>
+  </div>
+
+  <div class="sec-label"><i class="fa-solid fa-hand-wave" style="color:var(--success)"></i>Welcome Message</div>
+
+  <div class="ta-box">
+    <div class="ta-label"><i class="fa-solid fa-code"></i>HTML welcome message — variables: {USER_NAME} {CHAT_TITLE} {BOT_NAME} {USER_ID}</div>
+    <textarea id="welcomeMsg" placeholder="Welcome {USER_NAME} to {CHAT_TITLE}!"></textarea>
+    <div class="ta-label" style="margin-top:12px"><i class="fa-solid fa-timer"></i>Auto-delete welcome after (seconds, 0 = never delete)</div>
+    <input type="number" class="full-in" id="welcomeTimer" min="0" value="0"/>
+  </div>
+</div>
+
+<!-- Add Word Modal -->
+<div class="modal-bg" id="wordModal">
+  <div class="modal">
+    <h3><i class="fa-solid fa-ban" style="color:var(--danger);margin-right:8px"></i>Add Banned Word</h3>
+    <input type="text" id="wordInput" placeholder="Enter word to ban..." autocomplete="off" autocapitalize="none"/>
+    <div class="modal-actions">
+      <button class="modal-btn m-cancel" onclick="closeModal()">Cancel</button>
+      <button class="modal-btn m-confirm" onclick="doAddWord()">Add Word</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"><i class="fa-solid fa-check-circle"></i><span id="toastMsg"></span></div>
+
+<script>
+const SUPABASE_URL      = 'https://mwxrklxxgwbaemqnbvda.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im13eHJrbHh4Z3diYWVtcW5idmRhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NDI4MTYyOCwiZXhwIjoyMDc5ODU3NjI4fQ.mTfLl-MWCNfENzTX8E39fmlnMmVHNsif5uBFPcLpd28';
+const sb  = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const tg  = window.Telegram?.WebApp;
+if(tg){tg.ready();tg.expand();tg.setBackgroundColor('#050a14');}
+
+const userData = JSON.parse(sessionStorage.getItem('gp_user')||'null');
+if(!userData){window.location.href='index.html';}
+
+const chatId = new URLSearchParams(location.search).get('id');
+if(!chatId){history.back();}
+
+let bannedWords = [];
+
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function showToast(msg,type='success'){
+  const t=document.getElementById('toast');
+  document.getElementById('toastMsg').textContent=msg;
+  t.style.borderColor=type==='success'?'rgba(0,230,118,0.3)':'rgba(255,71,87,0.3)';
+  t.querySelector('i').className=type==='success'?'fa-solid fa-check-circle':'fa-solid fa-circle-exclamation';
+  t.querySelector('i').style.color=type==='success'?'var(--success)':'var(--danger)';
+  t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'),2600);
+}
+
+function renderWords(){
+  const c=document.getElementById('wordChips');
+  if(!bannedWords.length){c.innerHTML='<div class="no-words">No banned words set</div>';return;}
+  c.innerHTML=bannedWords.map(w=>`
+    <div class="wchip">${esc(w)}<button onclick="removeWord('${esc(w)}')"><i class="fa-solid fa-xmark"></i></button></div>`).join('');
+}
+
+async function removeWord(word){
+  const {error}=await sb.from('banned_words').delete().eq('chat_id',chatId).eq('word',word);
+  if(!error){bannedWords=bannedWords.filter(w=>w!==word);renderWords();showToast(`"${word}" removed`);}
+  else showToast('Error removing word','error');
+}
+
+function openModal(){document.getElementById('wordModal').classList.add('open');document.getElementById('wordInput').focus();}
+function closeModal(){document.getElementById('wordModal').classList.remove('open');document.getElementById('wordInput').value='';}
+
+async function doAddWord(){
+  const word=document.getElementById('wordInput').value.trim().toLowerCase();
+  if(!word)return;
+  if(bannedWords.includes(word)){showToast('Word already banned','error');return;}
+  const {error}=await sb.from('banned_words').insert({chat_id:chatId,word,added_by:userData.telegram_id});
+  if(!error){bannedWords.push(word);renderWords();closeModal();showToast(`"${word}" banned`);}
+  else showToast('Error adding word','error');
+}
+
+async function saveSettings(){
+  const maxW=parseInt(document.getElementById('maxWarnings').value)||3;
+  if(maxW<3||maxW>31){showToast('Max warnings must be 3–31','error');return;}
+  const {error}=await sb.from('groups').update({
+    delete_links:           document.getElementById('toggleLinks').checked,
+    delete_promotions:      document.getElementById('togglePromo').checked,
+    delete_join_messages:   document.getElementById('toggleJoin').checked,
+    sticker_protect:        document.getElementById('toggleSticker').checked,
+    require_approval:       document.getElementById('toggleApproval').checked,
+    auto_approve:           document.getElementById('toggleAutoApprove').checked,
+    max_warnings:           maxW,
+    max_word_count:         parseInt(document.getElementById('maxWords').value)||0,
+    warning_timer:          parseInt(document.getElementById('warnTimer').value)||30,
+    welcome_message:        document.getElementById('welcomeMsg').value.trim()||null,
+    welcome_timer:          parseInt(document.getElementById('welcomeTimer').value)||0,
+    updated_at:             new Date().toISOString(),
+  }).eq('chat_id',chatId);
+  if(!error) showToast('Settings saved!');
+  else       showToast('Save failed','error');
+}
+
+async function load(){
+  const {data:g,error}=await sb.from('groups').select('*').eq('chat_id',chatId).single();
+  if(error||!g){history.back();return;}
+  document.getElementById('pageTitle').textContent  = g.chat_title;
+  document.getElementById('groupName').textContent  = g.chat_title;
+  document.getElementById('groupId').textContent    = `Chat ID: ${g.chat_id}`;
+  document.getElementById('groupStatus').innerHTML  = `<span class="status-chip ${g.bot_is_admin?'st-active':'st-inactive'}"><i class="fa-solid fa-circle" style="font-size:5px"></i>${g.bot_is_admin?'Bot is Admin':'Needs Admin Rights'}</span>`;
+  document.getElementById('toggleLinks').checked         = !!g.delete_links;
+  document.getElementById('togglePromo').checked         = !!g.delete_promotions;
+  document.getElementById('toggleJoin').checked          = !!g.delete_join_messages;
+  document.getElementById('toggleSticker').checked       = !!g.sticker_protect;
+  document.getElementById('toggleApproval').checked      = !!g.require_approval;
+  document.getElementById('toggleAutoApprove').checked   = !!g.auto_approve;
+  document.getElementById('maxWarnings').value  = g.max_warnings||3;
+  document.getElementById('maxWords').value     = g.max_word_count||0;
+  document.getElementById('warnTimer').value    = g.warning_timer||30;
+  document.getElementById('welcomeMsg').value   = g.welcome_message||'';
+  document.getElementById('welcomeTimer').value = g.welcome_timer||0;
+  const {data:words}=await sb.from('banned_words').select('word').eq('chat_id',chatId);
+  bannedWords=(words||[]).map(w=>w.word);
+  renderWords();
+}
+
+document.getElementById('wordInput').addEventListener('keydown',e=>{if(e.key==='Enter')doAddWord();});
+document.getElementById('wordModal').addEventListener('click',e=>{if(e.target===e.currentTarget)closeModal();});
+load();
+</script>
+
+<nav class="bottom-nav">
+  <a class="nav-item" href="home.html"><i class="fa-solid fa-house"></i><span>Home</span></a>
+  <a class="nav-item active" href="groups.html"><i class="fa-solid fa-layer-group"></i><span>Groups</span></a>
+  <a class="nav-item" href="reports.html"><i class="fa-solid fa-flag"></i><span>Reports</span></a>
+  <a class="nav-item" href="moderation.html"><i class="fa-solid fa-shield-halved"></i><span>Mods</span></a>
+  <a class="nav-item" href="profile.html"><i class="fa-solid fa-circle-user"></i><span>Profile</span></a>
+</nav>
+</body>
+</html>
