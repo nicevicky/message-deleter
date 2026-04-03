@@ -14,11 +14,12 @@ from telegram.ext import (
     ContextTypes,
     filters,
     ChatMemberHandler,
+    ChatJoinRequestHandler,
 )
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import asyncio
-import requests
+import requests as http_requests
 import json
 
 # Load environment variables
@@ -60,6 +61,25 @@ def is_forwarded_or_channel_message(message) -> bool:
             if first_entity.type == 'text_link' and 't.me' in (first_entity.url or ''):
                 return True
     return False
+
+
+def is_deleted_account(user) -> bool:
+    """Detect Telegram deleted/ghost accounts."""
+    if user is None:
+        return False
+    return (
+        getattr(user, "first_name", "") == "Deleted"
+        and getattr(user, "username", None) is None
+        and not getattr(user, "is_bot", False)
+    )
+
+
+def get_user_mention_html(user) -> str:
+    """Returns clickable mention: @username if available, else tg://user?id= link."""
+    name = (user.first_name or "User").strip()
+    if getattr(user, "username", None):
+        return f'<a href="https://t.me/{user.username}">@{user.username}</a>'
+    return f'<a href="tg://user?id={user.id}">{name}</a>'
 
 # --- DATABASE HELPER FUNCTIONS ---
 async def get_group_settings(chat_id: int):
@@ -170,6 +190,13 @@ async def get_user_warnings(chat_id: int, user_id: int):
         logger.error(f"Error getting warnings: {e}")
         return []
 
+async def clear_user_warnings(chat_id: int, user_id: int):
+    """Delete all warnings for a user (called on unmute/unban)"""
+    try:
+        supabase.table('warnings').delete().eq('chat_id', chat_id).eq('user_id', user_id).execute()
+    except Exception as e:
+        logger.error(f"Error clearing warnings: {e}")
+
 async def add_ban(chat_id: int, user_id: int, banned_by: int, reason: str, username: str = None):
     """Add a ban record for a user"""
     try:
@@ -255,19 +282,18 @@ async def unmute_user_in_db(chat_id: int, user_id: int):
         logger.error(f"Error unmuting user: {e}")
         return None
 
-async def cleanup_expired_mutes(context: ContextTypes.DEFAULT_TYPE):
-    """Check all active mutes and unmute those whose time has expired"""
+async def cleanup_expired_mutes(bot):
+    """Called from cron — receives bot object directly, not a context."""
     try:
         now = datetime.now(timezone.utc).isoformat()
         result = supabase.table('mutes').select("*").eq('is_active', True).lte('mute_until', now).execute()
         
         unmuted_count = 0
-        for mute_data in result.data:
+        for mute_data in (result.data or []):
             chat_id = mute_data['chat_id']
             user_id = mute_data['user_id']
             
             try:
-                # Unmute in Telegram using restrict_chat_member
                 permissions = ChatPermissions(
                     can_send_messages=True,
                     can_send_photos=True,
@@ -278,12 +304,9 @@ async def cleanup_expired_mutes(context: ContextTypes.DEFAULT_TYPE):
                     can_send_video_notes=True,
                     can_send_polls=True
                 )
-                await context.bot.restrict_chat_member(chat_id, user_id, permissions, until_date=0)
-                
-                # Mark as inactive in database
+                await bot.restrict_chat_member(chat_id, user_id, permissions, until_date=0)
                 await unmute_user_in_db(chat_id, user_id)
                 unmuted_count += 1
-                
                 logger.info(f"Auto-unmuted user {user_id} in chat {chat_id}")
             except Exception as e:
                 logger.error(f"Error auto-unmuting user {user_id} in chat {chat_id}: {e}")
@@ -809,7 +832,7 @@ Format as plain text, no markdown."""
         }
         headers = {"Content-Type": "application/json"}
         
-        response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=5)
+        response = http_requests.post(url, headers=headers, data=json.dumps(payload), timeout=5)
         if response.status_code == 200:
             result = response.json()
             generated_reason = result['candidates'][0]['content']['parts'][0]['text'].strip()
@@ -863,6 +886,50 @@ def parse_duration(duration_str: str) -> int:
         return int(duration_str_lower) * 60
     except ValueError:
         return 0
+
+# --- RESOLVE TARGET HELPER ---
+async def resolve_target(message, context):
+    """Resolve target user from reply or args[0] (ID or @username)."""
+    if message.reply_to_message and message.reply_to_message.from_user:
+        u = message.reply_to_message.from_user
+        return u, u.username
+    if context.args:
+        raw = context.args[0].replace("@", "")
+        try:
+            m = await context.bot.get_chat_member(message.chat.id, int(raw))
+            return m.user, m.user.username
+        except Exception:
+            pass
+    return None, None
+
+
+# --- AUTO-MUTE SHARED HELPER ---
+async def auto_mute_user(chat, user_id, username, count, warnings, max_w, context):
+    """Shared helper: auto-mute a user who hit max warnings."""
+    reason = await generate_mute_reason_with_gemini(count, warnings, "Max warnings")
+    until_date = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())
+    try:
+        await context.bot.restrict_chat_member(
+            chat.id, user_id,
+            ChatPermissions(
+                can_send_messages=False, can_send_photos=False,
+                can_send_videos=False, can_send_documents=False,
+                can_send_audios=False, can_send_voice_notes=False,
+                can_send_video_notes=False, can_send_polls=False,
+            ),
+            until_date=until_date,
+        )
+        await add_mute(chat.id, user_id, 0, reason, 60, username)
+        mention = f"@{username}" if username else f"User {user_id}"
+        kb = [[InlineKeyboardButton("🔊 Unmute User", callback_data=f"unmute_user_{user_id}_{chat.id}")]]
+        await chat.send_message(
+            f"🔇 <b>AUTO-MUTED</b>\nUser: {mention}\nDuration: 1 hour\n"
+            f"Reason: {reason}\nReached {max_w} warnings.",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"auto_mute_user: {e}")
+
 
 # --- MODERATION COMMAND HANDLERS ---
 async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1697,12 +1764,10 @@ async def show_admin_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.message
     chat = message.chat
     
-    # Support anonymous admins - check if sender is admin
     if not await is_sender_admin(chat.id, message, context):
         await message.reply_text("⚠️ This keyboard is only visible to admins!")
         return
     
-    # Create admin keyboard
     keyboard = [
         [
             InlineKeyboardButton("⚠️ Warn", callback_data=f"cmd_warn_{chat.id}"),
@@ -1714,12 +1779,12 @@ async def show_admin_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE
             InlineKeyboardButton("✅ Unban", callback_data=f"cmd_unban_{chat.id}")
         ],
         [
-            InlineKeyboardButton("📋 Reports", callback_data=f"cmd_reports_{chat.id}")
+            InlineKeyboardButton("📋 Reports", callback_data=f"cmd_reports_{chat.id}"),
+            InlineKeyboardButton("📢 Tag All", callback_data=f"cmd_tagall_{chat.id}")
         ]
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
     admin_msg = """
 🛡️ <b>Admin Commands</b>
 Click a button to use moderation commands:
@@ -1727,51 +1792,303 @@ Click a button to use moderation commands:
 ⚠️ <b>Warn</b> - Warn a user
 🔇 <b>Mute</b> - Mute a user temporarily
 🚫 <b>Ban</b> - Ban a user permanently
-🔊 <b>Unmute</b> - Unmute a muted user
+🔊 <b>Unmute</b> - Unmute a muted user (resets warnings)
 ✅ <b>Unban</b> - Unban a banned user
 📋 <b>Reports</b> - View pending reports
+📢 <b>Tag All</b> - Tag all tracked members
 
 This keyboard is only visible to admins.
     """
-    
     await message.reply_html(admin_msg, reply_markup=reply_markup)
 
 async def admin_keyboard_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle admin keyboard button clicks - works with anonymous admins"""
+    """Handle admin keyboard button clicks"""
     query = update.callback_query
     await query.answer()
-    
-    # Parse callback data
     parts = query.data.split("_")
     if len(parts) < 3:
         return
-    
     command = parts[1]
     chat_id = int(parts[2])
-    
-    # Verify the callback user is an admin
     is_admin, user_id_clicker, admin_message = await verify_callback_admin(chat_id, query, context)
-    
     if not is_admin:
         await query.answer(admin_message, show_alert=True)
         return
-    
-    # Show usage instructions
     instructions = {
-        "warn": "⚠️ <b>Warn Usage</b>\n\nReply to a message and use: /warn @username reason\nExample: /warn @user123 Spamming",
-        "mute": "🔇 <b>Mute Usage</b>\n\nReply to a message and use: /mute @username duration reason\nExample: /mute @user123 1h Spamming\nDuration: 10m, 1h, 1d, 1w",
-        "ban": "🚫 <b>Ban Usage</b>\n\nReply to a message and use: /ban @username reason\nExample: /ban @user123 Repeated spam",
-        "unmute": "🔊 <b>Unmute Usage</b>\n\nUse: /unmute @username\nExample: /unmute @user123",
-        "unban": "✅ <b>Unban Usage</b>\n\nUse: /unban @username\nExample: /unban @user123",
-        "reports": "📋 <b>View Reports</b>\n\nReports are sent privately to admins. Check your private messages for new reports."
+        "warn":    "/warn @user reason",
+        "mute":    "/mute @user 1h reason",
+        "ban":     "/ban @user reason",
+        "unmute":  "/unmute @user  (resets warnings to 0)",
+        "unban":   "/unban <user_id>",
+        "reports": "Reports are sent privately to admins. Check your DMs.",
+        "tagall":  "/tagall Your announcement",
     }
-    
     instruction_text = instructions.get(command, "Unknown command")
-    
     try:
-        await query.message.reply_html(instruction_text)
+        await query.message.reply_html(f"<b>{command.title()} usage:</b>\n{instruction_text}")
     except Exception as e:
         logger.error(f"Error sending instructions: {e}")
+
+# --- TAG ALL / NOTES / FORCE SUB / FILTER DELETED COMMANDS ---
+
+async def tag_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tag all tracked members in a group — Admin only"""
+    msg  = update.message
+    chat = msg.chat
+    if not await is_sender_admin(chat.id, msg, context):
+        await msg.reply_text("⚠️ Admins only.")
+        return
+    note_text = " ".join(context.args) if context.args else "Attention everyone!"
+    members   = await get_group_members(chat.id)
+    if not members:
+        await msg.reply_text("No members tracked yet. Members are tracked as they send messages.")
+        return
+    mentions = []
+    for m in members:
+        uid   = m["user_id"]
+        uname = m.get("username")
+        fname = m.get("first_name") or "User"
+        if uname:
+            mentions.append(f'<a href="https://t.me/{uname}">@{uname}</a>')
+        else:
+            mentions.append(f'<a href="tg://user?id={uid}">{fname}</a>')
+    chunks = [mentions[i:i+30] for i in range(0, len(mentions), 30)]
+    for idx, chunk in enumerate(chunks):
+        text = (note_text + "\n\n" if idx == 0 else "") + " ".join(chunk)
+        try:
+            await chat.send_message(text, parse_mode="HTML")
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"tagall chunk {idx}: {e}")
+
+
+async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save a note — Admin only. Usage: /note <name> <content>"""
+    msg  = update.message
+    chat = msg.chat
+    if not await is_sender_admin(chat.id, msg, context):
+        await msg.reply_text("⚠️ Admins only.")
+        return
+    if not context.args or len(context.args) < 2:
+        await msg.reply_text("Usage: /note <name> <content>")
+        return
+    name    = context.args[0].lower()
+    content = " ".join(context.args[1:])
+    added_by = msg.from_user.id if msg.from_user else 0
+    await add_note(chat.id, name, content, added_by)
+    await msg.reply_html(f"📝 Note <b>{name}</b> saved.")
+
+
+async def get_note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Retrieve a note. Usage: /get <name>"""
+    msg  = update.message
+    chat = msg.chat
+    if not context.args:
+        await msg.reply_text("Usage: /get <name>")
+        return
+    note = await get_note(chat.id, context.args[0].lower())
+    if note:
+        await msg.reply_html(f"📝 <b>{context.args[0]}</b>\n\n{note['content']}")
+    else:
+        await msg.reply_text(f"❌ No note named '{context.args[0]}'.")
+
+
+async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all notes in this group."""
+    msg   = update.message
+    chat  = msg.chat
+    notes = await get_all_notes(chat.id)
+    if notes:
+        lines = "\n".join(f"- <code>{n}</code>" for n in notes)
+        await msg.reply_html(f"<b>Notes ({len(notes)}):</b>\n{lines}\n\nUse /get &lt;name&gt; to retrieve.")
+    else:
+        await msg.reply_text("No notes yet. Use /note <name> <content>.")
+
+
+async def delnote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete a note — Admin only. Usage: /delnote <name>"""
+    msg  = update.message
+    chat = msg.chat
+    if not await is_sender_admin(chat.id, msg, context):
+        await msg.reply_text("⚠️ Admins only.")
+        return
+    if not context.args:
+        await msg.reply_text("Usage: /delnote <name>")
+        return
+    await delete_note(chat.id, context.args[0].lower())
+    await msg.reply_html(f"🗑 Note <b>{context.args[0]}</b> deleted.")
+
+
+async def forcesub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add or list force-subscribe channels — Admin only. Usage: /forcesub @channel"""
+    msg  = update.message
+    chat = msg.chat
+    if not await is_sender_admin(chat.id, msg, context):
+        await msg.reply_text("⚠️ Admins only.")
+        return
+    if not context.args:
+        channels = await get_active_force_subs(chat.id)
+        if not channels:
+            await msg.reply_text("No force-subscribe channels.\nUsage: /forcesub @channel")
+        else:
+            lines = "\n".join(
+                f"- {c['channel_title']} (@{c.get('channel_username') or c['channel_id']})"
+                for c in channels
+            )
+            await msg.reply_html(f"<b>Force Subscribe Channels:</b>\n{lines}")
+        return
+    try:
+        co = await context.bot.get_chat(context.args[0])
+        bm = await context.bot.get_chat_member(co.id, context.bot.id)
+        if bm.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER]:
+            await msg.reply_text("I must be a member of that channel first.")
+            return
+        await add_force_sub(
+            chat.id, co.id, co.title or context.args[0],
+            co.username, msg.from_user.id if msg.from_user else 0,
+        )
+        await msg.reply_html(
+            f"✅ Force subscribe enabled for <b>{co.title}</b>.\n"
+            f"Members must join before chatting."
+        )
+    except Exception as e:
+        logger.error(f"forcesub: {e}")
+        await msg.reply_text("Could not access that channel. Make sure I'm a member.")
+
+
+async def removeforcesub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a force-subscribe channel — Admin only. Usage: /removeforcesub @channel"""
+    msg  = update.message
+    chat = msg.chat
+    if not await is_sender_admin(chat.id, msg, context):
+        await msg.reply_text("⚠️ Admins only.")
+        return
+    if not context.args:
+        await msg.reply_text("Usage: /removeforcesub @channel")
+        return
+    try:
+        co = await context.bot.get_chat(context.args[0])
+        await remove_force_sub(chat.id, co.id)
+        await msg.reply_html(f"✅ Force subscribe removed for <b>{co.title}</b>.")
+    except Exception as e:
+        await msg.reply_text(f"❌ Failed: {e}")
+
+
+async def filter_deleted_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kick all deleted/ghost accounts from group — Admin only."""
+    msg  = update.message
+    chat = msg.chat
+    if not await is_sender_admin(chat.id, msg, context):
+        await msg.reply_text("⚠️ Admins only.")
+        return
+    members = await get_group_members(chat.id)
+    removed = 0
+    for m in members:
+        try:
+            cm   = await context.bot.get_chat_member(chat.id, m["user_id"])
+            user = cm.user
+            if is_deleted_account(user):
+                try:
+                    await context.bot.ban_chat_member(chat.id, user.id)
+                    await context.bot.unban_chat_member(chat.id, user.id)
+                except Exception:
+                    pass
+                await remove_group_member(chat.id, user.id)
+                removed += 1
+        except (Forbidden, BadRequest):
+            await remove_group_member(chat.id, m["user_id"])
+            removed += 1
+        except Exception:
+            pass
+    await msg.reply_html(f"✅ Done. Removed <b>{removed}</b> deleted/ghost accounts.")
+
+
+# --- JOIN REQUEST HANDLER ---
+
+async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle chat join requests — auto-approve if enabled, otherwise save to DB."""
+    jr   = update.chat_join_request
+    if not jr:
+        return
+    chat = jr.chat
+    user = jr.from_user
+    s    = await get_group_settings(chat.id)
+    if not s:
+        return
+    await add_join_request(chat.id, user.id, user.username, user.first_name)
+    if s.get("auto_approve", False):
+        try:
+            await context.bot.approve_chat_join_request(chat.id, user.id)
+            await update_join_request_status(chat.id, user.id, "approved", context.bot.id)
+        except Exception as e:
+            logger.error(f"auto-approve join: {e}")
+
+
+# --- FORCE SUB CHECK + MESSAGE ---
+
+async def check_force_sub(chat_id: int, user_id: int, context) -> list:
+    """Return list of force_sub channels the user has NOT joined."""
+    channels   = await get_active_force_subs(chat_id)
+    not_joined = []
+    for fc in channels:
+        try:
+            m = await context.bot.get_chat_member(fc["channel_id"], user_id)
+            if m.status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]:
+                not_joined.append(fc)
+        except Exception:
+            not_joined.append(fc)
+    return not_joined
+
+
+async def send_force_sub_message(chat, user, not_joined: list, context, warning_timer=60):
+    """Send a message telling user to join required channels with inline buttons."""
+    try:
+        user_link = get_user_mention_html(user)
+        ch_names  = ", ".join(f"<b>{fc['channel_title']}</b>" for fc in not_joined)
+        text      = (
+            f"{user_link}, you must join the required channel(s) before chatting here.\n\n"
+            f"Please join: {ch_names}\n\nThen send your message again."
+        )
+        kb = []
+        for fc in not_joined:
+            link = (f"https://t.me/{fc['channel_username']}"
+                    if fc.get("channel_username")
+                    else f"https://t.me/c/{str(fc['channel_id']).replace('-100', '')}")
+            kb.append([InlineKeyboardButton(f"Join {fc['channel_title']}", url=link)])
+        msg = await chat.send_message(
+            text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb) if kb else None,
+        )
+        if warning_timer > 0:
+            await schedule_message_deletion(chat.id, msg.message_id, warning_timer)
+    except Exception as e:
+        logger.error(f"send_force_sub_message: {e}")
+
+
+# --- TOGGLE / PROMPT HELPERS FOR SETTINGS CALLBACKS ---
+
+async def _toggle(update, context, field):
+    """Generic toggle helper for boolean group settings."""
+    q = update.callback_query
+    await q.answer()
+    cid = int(q.data.rsplit("_", 1)[-1])
+    s   = await get_group_settings(cid) or {}
+    nv  = not s.get(field, False)
+    await update_setting(cid, **{field: nv})
+    await q.answer(f"{field.replace('_', ' ').title()}: {'ON' if nv else 'OFF'}", show_alert=True)
+    q.data = f"group_settings_{cid}"
+    await group_settings_handler(update, context)
+
+
+async def _prompt(query, context, cid, action, text):
+    """Generic prompt helper — stores awaiting_input state and edits message."""
+    context.user_data["awaiting_input"] = cid
+    context.user_data["action"]         = action
+    try:
+        await query.message.edit_text(text, parse_mode='HTML')
+    except BadRequest:
+        pass
+
 
 # --- ORIGINAL BOT COMMAND HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2311,7 +2628,7 @@ async def send_welcome_message(chat: any, new_member: any, context: ContextTypes
                 headers = {"Content-Type": "application/json"}
                 
                 try:
-                    response = requests.post(url, headers=headers, data=json.dumps(payload))
+                    response = http_requests.post(url, headers=headers, data=json.dumps(payload))
                     if response.status_code == 200:
                         result = response.json()
                         translated_text = result['candidates'][0]['content']['parts'][0]['text']
