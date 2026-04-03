@@ -3,1830 +3,2993 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Response
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    MessageEntity, ChatPermissions
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, ChatPermissions
 from telegram.constants import ChatType, ChatMemberStatus
 from telegram.error import BadRequest, RetryAfter, Forbidden
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters,
-    ChatMemberHandler, ChatJoinRequestHandler,
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+    ChatMemberHandler,
 )
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import asyncio
-import requests as http_requests
+import requests
 import json
 
+# Load environment variables
 load_dotenv()
 
+# Configure logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-SUPABASE_URL       = os.getenv("SUPABASE_URL")
-SUPABASE_KEY       = os.getenv("SUPABASE_KEY")
+# Initialize Supabase
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL        = os.getenv("WEBHOOK_URL")
-GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") # REQUIRED: Add to .env → https://your-domain.vercel.app/webhook/webhook
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-supabase: Client   = create_client(SUPABASE_URL, SUPABASE_KEY)
-app                = FastAPI()
-ptb_application    = None
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ════════════════════════════════════════════════════════════
-# UTILITY HELPERS
-# ════════════════════════════════════════════════════════════
+# Initialize FastAPI
+app = FastAPI()
+
+# Global variable to store the Telegram Application
+ptb_application = None
 
 def is_forwarded_or_channel_message(message) -> bool:
+    """
+    Detects forwarded messages (including hidden channel forwards) and direct channel posts.
+    """
     if message.forward_origin is not None:
         return True
     if message.sender_chat and message.sender_chat.type == ChatType.CHANNEL:
         return True
     if message.entities:
-        e = message.entities[0]
-        if e.offset == 0 and e.type == "text_link" and "t.me" in (e.url or ""):
-            return True
+        first_entity = message.entities[0]
+        if first_entity.offset == 0 and first_entity.type in ('bold', 'text_link'):
+            if first_entity.type == 'text_link' and 't.me' in (first_entity.url or ''):
+                return True
     return False
 
-
-def is_deleted_account(user) -> bool:
-    if user is None:
-        return False
-    return (
-        getattr(user, "first_name", "") == "Deleted"
-        and getattr(user, "username", None) is None
-        and not getattr(user, "is_bot", False)
-    )
-
-
-def get_user_mention_html(user) -> str:
-    """
-    Has username  -> clickable @username
-    No username   -> clickable first_name via tg://user?id=
-    """
-    name = (user.first_name or "User").strip()
-    if getattr(user, "username", None):
-        return f'<a href="https://t.me/{user.username}">@{user.username}</a>'
-    return f'<a href="tg://user?id={user.id}">{name}</a>'
-
-
-def parse_duration(s: str) -> int:
-    s = s.lower().strip()
+# --- DATABASE HELPER FUNCTIONS ---
+async def get_group_settings(chat_id: int):
+    """Get group settings"""
     try:
-        if s.endswith("m"):   return int(s[:-1]) * 60
-        elif s.endswith("h"): return int(s[:-1]) * 3600
-        elif s.endswith("d"): return int(s[:-1]) * 86400
-        elif s.endswith("w"): return int(s[:-1]) * 604800
-        else:                 return int(s) * 60
+        result = supabase.table('groups').select("*").eq('chat_id', chat_id).execute()
+        if result.data:
+            return result.data[0]
+        return None
+    except Exception as e:
+        logger.error(f"Error getting group settings: {e}")
+        return None
+
+async def is_user_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if user is admin in the group (supports anonymous admins)"""
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+    except Exception:
+        return False
+
+async def is_sender_admin(chat_id: int, message, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if the message sender is an admin (supports anonymous admins)"""
+    try:
+        # For anonymous admins, message.from_user might be None or the group itself
+        # We need to check if the sender is actually an admin
+        if message.sender_chat and message.sender_chat.id == chat_id:
+            # Message sent by anonymous admin (as the group)
+            # We need to check if the user who triggered the command is an admin
+            # For anonymous admins, we'll allow the command if it's from an admin
+            # We can check by getting all admins and seeing if any match
+            return True
+        
+        if message.from_user:
+            return await is_user_admin(chat_id, message.from_user.id, context)
+        
+        return False
+    except Exception:
+        return False
+
+async def is_callback_user_admin(chat_id: int, callback_user, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if callback user is admin (supports anonymous admins)"""
+    try:
+        # If callback_user is None, it might be an anonymous admin action
+        if callback_user is None:
+            # For inline buttons, if from_user is None, we need to verify differently
+            # We'll return False and handle it in the specific callback handlers
+            return False
+        
+        return await is_user_admin(chat_id, callback_user.id, context)
+    except Exception:
+        return False
+
+async def verify_callback_admin(chat_id: int, query, context: ContextTypes.DEFAULT_TYPE) -> tuple:
+    """
+    Verify if the callback is from an admin.
+    Returns (is_admin, user_id, admin_message)
+    """
+    try:
+        # Check if the user who clicked the button is an admin
+        if query.from_user:
+            is_admin = await is_user_admin(chat_id, query.from_user.id, context)
+            if is_admin:
+                return (True, query.from_user.id, None)
+            else:
+                return (False, query.from_user.id, "❌ This button is for admins only. You must become an admin before using this button.")
+        else:
+            # Anonymous admin scenario - we can't verify directly
+            # We'll try to verify by checking if any admin clicked recently
+            # For safety, we'll return False
+            return (False, None, "❌ This button is for admins only. You must become an admin before using this button.")
+    except Exception as e:
+        logger.error(f"Error verifying callback admin: {e}")
+        return (False, None, f"❌ This button is for admins only. You must become an admin before using this button.")
+
+async def get_chat_admins(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Get list of all admins in the chat"""
+    try:
+        admins = await context.bot.get_chat_administrators(chat_id)
+        return [admin.user.id for admin in admins]
+    except Exception as e:
+        logger.error(f"Error getting admins: {e}")
+        return []
+
+async def add_warning(chat_id: int, user_id: int, warned_by: int, reason: str, username: str = None):
+    """Add a warning for a user"""
+    try:
+        data = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "username": username,
+            "warned_by": warned_by,
+            "reason": reason,
+            "warned_at": datetime.now(timezone.utc).isoformat()
+        }
+        result = supabase.table('warnings').insert(data).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error adding warning: {e}")
+        return None
+
+async def get_user_warnings(chat_id: int, user_id: int):
+    """Get all warnings for a user"""
+    try:
+        result = supabase.table('warnings').select("*").eq('chat_id', chat_id).eq('user_id', user_id).execute()
+        return result.data
+    except Exception as e:
+        logger.error(f"Error getting warnings: {e}")
+        return []
+
+async def add_ban(chat_id: int, user_id: int, banned_by: int, reason: str, username: str = None):
+    """Add a ban record for a user"""
+    try:
+        data = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "username": username,
+            "banned_by": banned_by,
+            "reason": reason,
+            "banned_at": datetime.now(timezone.utc).isoformat(),
+            "is_active": True
+        }
+        result = supabase.table('bans').insert(data).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error adding ban: {e}")
+        return None
+
+async def get_active_ban(chat_id: int, user_id: int):
+    """Check if user has an active ban"""
+    try:
+        result = supabase.table('bans').select("*").eq('chat_id', chat_id).eq('user_id', user_id).eq('is_active', True).execute()
+        if result.data:
+            return result.data[0]
+        return None
+    except Exception as e:
+        logger.error(f"Error checking ban: {e}")
+        return None
+
+async def unban_user_in_db(chat_id: int, user_id: int):
+    """Mark ban as inactive in database"""
+    try:
+        result = supabase.table('bans').update({"is_active": False}).eq('chat_id', chat_id).eq('user_id', user_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error unbanning user: {e}")
+        return None
+
+async def add_mute(chat_id: int, user_id: int, muted_by: int, reason: str, duration_minutes: int, username: str = None):
+    """Add a mute record for a user"""
+    try:
+        mute_until = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
+        data = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "username": username,
+            "muted_by": muted_by,
+            "reason": reason,
+            "muted_at": datetime.now(timezone.utc).isoformat(),
+            "mute_until": mute_until.isoformat(),
+            "is_active": True
+        }
+        result = supabase.table('mutes').insert(data).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error adding mute: {e}")
+        return None
+
+async def get_active_mute(chat_id: int, user_id: int):
+    """Check if user has an active mute"""
+    try:
+        result = supabase.table('mutes').select("*").eq('chat_id', chat_id).eq('user_id', user_id).eq('is_active', True).execute()
+        if result.data:
+            # Check if mute has expired
+            mute_data = result.data[0]
+            mute_until = datetime.fromisoformat(mute_data['mute_until'])
+            if datetime.now(timezone.utc) > mute_until:
+                # Mute expired, mark as inactive
+                await unmute_user_in_db(chat_id, user_id)
+                return None
+            return mute_data
+        return None
+    except Exception as e:
+        logger.error(f"Error checking mute: {e}")
+        return None
+
+async def unmute_user_in_db(chat_id: int, user_id: int):
+    """Mark mute as inactive in database"""
+    try:
+        result = supabase.table('mutes').update({"is_active": False}).eq('chat_id', chat_id).eq('user_id', user_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error unmuting user: {e}")
+        return None
+
+async def cleanup_expired_mutes(context: ContextTypes.DEFAULT_TYPE):
+    """Check all active mutes and unmute those whose time has expired"""
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        result = supabase.table('mutes').select("*").eq('is_active', True).lte('mute_until', now).execute()
+        
+        unmuted_count = 0
+        for mute_data in result.data:
+            chat_id = mute_data['chat_id']
+            user_id = mute_data['user_id']
+            
+            try:
+                # Unmute in Telegram using restrict_chat_member
+                permissions = ChatPermissions(
+                    can_send_messages=True,
+                    can_send_photos=True,
+                    can_send_videos=True,
+                    can_send_documents=True,
+                    can_send_audios=True,
+                    can_send_voice_notes=True,
+                    can_send_video_notes=True,
+                    can_send_polls=True
+                )
+                await context.bot.restrict_chat_member(chat_id, user_id, permissions, until_date=0)
+                
+                # Mark as inactive in database
+                await unmute_user_in_db(chat_id, user_id)
+                unmuted_count += 1
+                
+                logger.info(f"Auto-unmuted user {user_id} in chat {chat_id}")
+            except Exception as e:
+                logger.error(f"Error auto-unmuting user {user_id} in chat {chat_id}: {e}")
+        
+        return unmuted_count
+    except Exception as e:
+        logger.error(f"Error in cleanup_expired_mutes: {e}")
+        return 0
+
+async def add_report(chat_id: int, reporter_id: int, reported_user_id: int, reason: str, reporter_username: str = None, reported_username: str = None):
+    """Add a report for a user"""
+    try:
+        data = {
+            "chat_id": chat_id,
+            "reporter_id": reporter_id,
+            "reporter_username": reporter_username,
+            "reported_user_id": reported_user_id,
+            "reported_username": reported_username,
+            "reason": reason,
+            "reported_at": datetime.now(timezone.utc).isoformat(),
+            "status": "pending"
+        }
+        result = supabase.table('reports').insert(data).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error adding report: {e}")
+        return None
+
+async def get_pending_reports(chat_id: int):
+    """Get pending reports for a group"""
+    try:
+        result = supabase.table('reports').select("*").eq('chat_id', chat_id).eq('status', 'pending').execute()
+        return result.data
+    except Exception as e:
+        logger.error(f"Error getting reports: {e}")
+        return []
+
+async def add_group_to_db(chat_id: int, chat_title: str, added_by: int, username: str, bot_is_admin: bool, chat_username: str = None):
+    """Add a group to the database, preserving settings if it already exists"""
+    try:
+        existing_group = await get_group_settings(chat_id)
+        delete_promotions = False
+        delete_links = False
+        warning_timer = 30
+        max_word_count = 0
+        welcome_message = None
+        welcome_timer = 0
+        delete_join_messages = False
+        max_warnings = 3
+        require_approval = False
+        auto_approve = False
+        sticker_protect = False
+        force_sub_channel = None
+        force_sub_message_timer = 60
+        member_count = 0
+
+        if existing_group:
+            delete_promotions = existing_group.get('delete_promotions', False)
+            delete_links = existing_group.get('delete_links', False)
+            warning_timer = existing_group.get('warning_timer', 30)
+            max_word_count = existing_group.get('max_word_count', 0)
+            welcome_message = existing_group.get('welcome_message', None)
+            welcome_timer = existing_group.get('welcome_timer', 0)
+            delete_join_messages = existing_group.get('delete_join_messages', False)
+            max_warnings = existing_group.get('max_warnings', 3)
+            require_approval = existing_group.get('require_approval', False)
+            auto_approve = existing_group.get('auto_approve', False)
+            sticker_protect = existing_group.get('sticker_protect', False)
+            force_sub_channel = existing_group.get('force_sub_channel', None)
+            force_sub_message_timer = existing_group.get('force_sub_message_timer', 60)
+            member_count = existing_group.get('member_count', 0)
+
+        data = {
+            "chat_id": chat_id,
+            "chat_title": chat_title,
+            "chat_username": chat_username,
+            "added_by": added_by,
+            "added_by_username": username,
+            "bot_is_admin": bot_is_admin,
+            "delete_promotions": delete_promotions,
+            "delete_links": delete_links,
+            "warning_timer": warning_timer,
+            "max_word_count": max_word_count,
+            "welcome_message": welcome_message,
+            "welcome_timer": welcome_timer,
+            "delete_join_messages": delete_join_messages,
+            "max_warnings": max_warnings,
+            "require_approval": require_approval,
+            "auto_approve": auto_approve,
+            "sticker_protect": sticker_protect,
+            "force_sub_channel": force_sub_channel,
+            "force_sub_message_timer": force_sub_message_timer,
+            "member_count": member_count,
+        }
+        result = supabase.table('groups').upsert(data, on_conflict='chat_id').execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error adding group to DB: {e}")
+        return None
+
+async def get_user_groups(user_id: int):
+    """Get all groups added by a specific user"""
+    try:
+        result = supabase.table('groups').select("*").eq('added_by', user_id).execute()
+        return result.data
+    except Exception as e:
+        logger.error(f"Error getting user groups: {e}")
+        return []
+
+async def add_banned_word(chat_id: int, word: str, added_by: int):
+    """Add a banned word for a group"""
+    try:
+        data = {
+            "chat_id": chat_id,
+            "word": word.lower(),
+            "added_by": added_by
+        }
+        result = supabase.table('banned_words').insert(data).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error adding banned word: {e}")
+        return None
+
+async def remove_banned_word(chat_id: int, word: str):
+    """Remove a banned word for a group"""
+    try:
+        result = supabase.table('banned_words').delete().eq('chat_id', chat_id).eq('word', word.lower()).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error removing banned word: {e}")
+        return None
+
+# --- USERS TABLE HELPERS ---
+async def upsert_user(telegram_id: int, username: str = None, first_name: str = None, last_name: str = None):
+    """Upsert a user record in the users table"""
+    try:
+        data = {
+            "telegram_id": telegram_id,
+            "username": username,
+            "first_name": first_name,
+            "last_name": last_name,
+            "last_seen": datetime.now(timezone.utc).isoformat(),
+        }
+        supabase.table('users').upsert(data, on_conflict='telegram_id').execute()
+    except Exception as e:
+        logger.error(f"Error upserting user {telegram_id}: {e}")
+
+# --- GROUP MEMBERS TABLE HELPERS ---
+async def upsert_group_member(chat_id: int, user_id: int, username: str = None, first_name: str = None):
+    """Upsert a group member record (tracks activity & message count)"""
+    try:
+        existing = supabase.table('group_members').select("*").eq('chat_id', chat_id).eq('user_id', user_id).execute()
+        if existing.data:
+            supabase.table('group_members').update({
+                "username": username,
+                "first_name": first_name,
+                "last_active": datetime.now(timezone.utc).isoformat(),
+                "message_count": existing.data[0].get('message_count', 0) + 1,
+            }).eq('chat_id', chat_id).eq('user_id', user_id).execute()
+        else:
+            supabase.table('group_members').insert({
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "username": username,
+                "first_name": first_name,
+                "last_active": datetime.now(timezone.utc).isoformat(),
+                "message_count": 1,
+                "joined_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+    except Exception as e:
+        logger.error(f"Error upserting group member {user_id} in {chat_id}: {e}")
+
+async def get_group_members(chat_id: int):
+    """Get all members of a group"""
+    try:
+        result = supabase.table('group_members').select("*").eq('chat_id', chat_id).execute()
+        return result.data
+    except Exception as e:
+        logger.error(f"Error getting group members: {e}")
+        return []
+
+async def remove_group_member(chat_id: int, user_id: int):
+    """Remove a member from group_members table (when they leave/are banned)"""
+    try:
+        supabase.table('group_members').delete().eq('chat_id', chat_id).eq('user_id', user_id).execute()
+    except Exception as e:
+        logger.error(f"Error removing group member {user_id} from {chat_id}: {e}")
+
+# --- NOTES TABLE HELPERS ---
+async def add_note(chat_id: int, name: str, content: str, added_by: int):
+    """Add or update a note for a group"""
+    try:
+        data = {
+            "chat_id": chat_id,
+            "name": name.lower(),
+            "content": content,
+            "added_by": added_by,
+        }
+        supabase.table('notes').upsert(data, on_conflict='chat_id,name').execute()
+    except Exception as e:
+        logger.error(f"Error adding note '{name}' in {chat_id}: {e}")
+
+async def get_note(chat_id: int, name: str):
+    """Get a specific note by name"""
+    try:
+        result = supabase.table('notes').select("*").eq('chat_id', chat_id).eq('name', name.lower()).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.error(f"Error getting note '{name}': {e}")
+        return None
+
+async def get_all_notes(chat_id: int):
+    """Get all notes for a group"""
+    try:
+        result = supabase.table('notes').select("*").eq('chat_id', chat_id).execute()
+        return result.data
+    except Exception as e:
+        logger.error(f"Error getting notes for {chat_id}: {e}")
+        return []
+
+async def delete_note(chat_id: int, name: str):
+    """Delete a note by name"""
+    try:
+        supabase.table('notes').delete().eq('chat_id', chat_id).eq('name', name.lower()).execute()
+    except Exception as e:
+        logger.error(f"Error deleting note '{name}' in {chat_id}: {e}")
+
+# --- JOIN REQUESTS TABLE HELPERS ---
+async def add_join_request(chat_id: int, user_id: int, username: str = None, first_name: str = None):
+    """Add or update a join request"""
+    try:
+        data = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "username": username,
+            "first_name": first_name,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "status": "pending",
+        }
+        supabase.table('join_requests').upsert(data, on_conflict='chat_id,user_id').execute()
+    except Exception as e:
+        logger.error(f"Error adding join request for {user_id} in {chat_id}: {e}")
+
+async def get_pending_join_requests(chat_id: int):
+    """Get all pending join requests for a group"""
+    try:
+        result = supabase.table('join_requests').select("*").eq('chat_id', chat_id).eq('status', 'pending').execute()
+        return result.data
+    except Exception as e:
+        logger.error(f"Error getting join requests: {e}")
+        return []
+
+async def update_join_request_status(chat_id: int, user_id: int, status: str, reviewed_by: int):
+    """Update the status of a join request (approved/rejected)"""
+    try:
+        supabase.table('join_requests').update({
+            "status": status,
+            "reviewed_by": reviewed_by,
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq('chat_id', chat_id).eq('user_id', user_id).execute()
+    except Exception as e:
+        logger.error(f"Error updating join request status: {e}")
+
+# --- FORCE SUB TABLE HELPERS ---
+async def add_force_sub(chat_id: int, channel_id: int, channel_title: str = None, channel_username: str = None, added_by: int = 0):
+    """Add a force-subscribe channel for a group"""
+    try:
+        data = {
+            "chat_id": chat_id,
+            "channel_id": channel_id,
+            "channel_title": channel_title,
+            "channel_username": channel_username,
+            "added_by": added_by,
+            "is_active": True,
+        }
+        supabase.table('force_sub').upsert(data, on_conflict='chat_id,channel_id').execute()
+    except Exception as e:
+        logger.error(f"Error adding force_sub for {chat_id}: {e}")
+
+async def get_active_force_subs(chat_id: int):
+    """Get all active force-subscribe channels for a group"""
+    try:
+        result = supabase.table('force_sub').select("*").eq('chat_id', chat_id).eq('is_active', True).execute()
+        return result.data
+    except Exception as e:
+        logger.error(f"Error getting force_sub channels: {e}")
+        return []
+
+async def remove_force_sub(chat_id: int, channel_id: int):
+    """Deactivate a force-subscribe channel"""
+    try:
+        supabase.table('force_sub').update({"is_active": False}).eq('chat_id', chat_id).eq('channel_id', channel_id).execute()
+    except Exception as e:
+        logger.error(f"Error removing force_sub: {e}")
+
+async def check_user_force_sub(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> tuple:
+    """
+    Check if user is subscribed to all required force-sub channels.
+    Returns (is_subscribed, missing_channels)
+    """
+    force_subs = await get_active_force_subs(chat_id)
+    if not force_subs:
+        return True, []
+
+    missing = []
+    for fs in force_subs:
+        try:
+            member = await context.bot.get_chat_member(fs['channel_id'], user_id)
+            if member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]:
+                missing.append(fs)
+        except Exception:
+            missing.append(fs)
+
+    return len(missing) == 0, missing
+
+# --- GROUP MEMBER COUNT HELPER ---
+async def increment_member_count(chat_id: int):
+    """Increment member count in groups table"""
+    try:
+        settings = await get_group_settings(chat_id)
+        if settings:
+            current = settings.get('member_count', 0)
+            supabase.table('groups').update({"member_count": current + 1}).eq('chat_id', chat_id).execute()
+    except Exception as e:
+        logger.error(f"Error incrementing member count: {e}")
+
+async def decrement_member_count(chat_id: int):
+    """Decrement member count in groups table"""
+    try:
+        settings = await get_group_settings(chat_id)
+        if settings:
+            current = settings.get('member_count', 0)
+            supabase.table('groups').update({"member_count": max(0, current - 1)}).eq('chat_id', chat_id).execute()
+    except Exception as e:
+        logger.error(f"Error decrementing member count: {e}")
+
+async def get_banned_words(chat_id: int):
+    """Get all banned words for a group"""
+    try:
+        result = supabase.table('banned_words').select("word").eq('chat_id', chat_id).execute()
+        return [item['word'] for item in result.data]
+    except Exception as e:
+        logger.error(f"Error getting banned words: {e}")
+        return []
+
+async def update_promotion_setting(chat_id: int, delete_promotions: bool):
+    """Update promotion deletion setting"""
+    try:
+        result = supabase.table('groups').update({"delete_promotions": delete_promotions}).eq('chat_id', chat_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error updating promotion setting: {e}")
+        return None
+
+async def update_link_setting(chat_id: int, delete_links: bool):
+    """Update link deletion setting"""
+    try:
+        result = supabase.table('groups').update({"delete_links": delete_links}).eq('chat_id', chat_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error updating link setting: {e}")
+        return None
+
+async def update_warning_timer(chat_id: int, seconds: int):
+    """Update the warning deletion timer"""
+    try:
+        result = supabase.table('groups').update({"warning_timer": seconds}).eq('chat_id', chat_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error updating warning timer: {e}")
+        return None
+
+async def update_word_limit(chat_id: int, limit: int):
+    """Update the max word count limit (0 = disabled)"""
+    try:
+        result = supabase.table('groups').update({"max_word_count": limit}).eq('chat_id', chat_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error updating word limit: {e}")
+        return None
+
+async def update_welcome_message(chat_id: int, welcome_html: str, timer: int):
+    """Update welcome message and timer"""
+    try:
+        result = supabase.table('groups').update({
+            "welcome_message": welcome_html,
+            "welcome_timer": timer
+        }).eq('chat_id', chat_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error updating welcome message: {e}")
+        return None
+
+async def update_delete_join_messages(chat_id: int, delete_join: bool):
+    """Update delete join messages setting"""
+    try:
+        result = supabase.table('groups').update({"delete_join_messages": delete_join}).eq('chat_id', chat_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error updating delete join messages setting: {e}")
+        return None
+
+# NEW: Update max warnings setting
+async def update_max_warnings(chat_id: int, max_warnings: int):
+    """Update the maximum warnings before auto-mute (3-31)"""
+    try:
+        # Validate max_warnings range
+        if max_warnings < 3 or max_warnings > 31:
+            raise ValueError("Max warnings must be between 3 and 31")
+        result = supabase.table('groups').update({"max_warnings": max_warnings}).eq('chat_id', chat_id).execute()
+        return result
+    except Exception as e:
+        logger.error(f"Error updating max warnings: {e}")
+        return None
+
+async def update_require_approval(chat_id: int, require_approval: bool):
+    """Update require approval setting"""
+    try:
+        supabase.table('groups').update({"require_approval": require_approval}).eq('chat_id', chat_id).execute()
+    except Exception as e:
+        logger.error(f"Error updating require_approval: {e}")
+
+async def update_auto_approve(chat_id: int, auto_approve: bool):
+    """Update auto approve setting"""
+    try:
+        supabase.table('groups').update({"auto_approve": auto_approve}).eq('chat_id', chat_id).execute()
+    except Exception as e:
+        logger.error(f"Error updating auto_approve: {e}")
+
+async def update_sticker_protect(chat_id: int, sticker_protect: bool):
+    """Update sticker protect setting"""
+    try:
+        supabase.table('groups').update({"sticker_protect": sticker_protect}).eq('chat_id', chat_id).execute()
+    except Exception as e:
+        logger.error(f"Error updating sticker_protect: {e}")
+
+async def update_force_sub_channel(chat_id: int, channel: str):
+    """Update force sub channel in groups table"""
+    try:
+        supabase.table('groups').update({"force_sub_channel": channel}).eq('chat_id', chat_id).execute()
+    except Exception as e:
+        logger.error(f"Error updating force_sub_channel: {e}")
+
+async def schedule_message_deletion(chat_id: int, message_id: int, delay_seconds: int):
+    """Schedule a message for deletion via DB (for Cron)"""
+    try:
+        delete_time = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        data = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "delete_at": delete_time.isoformat()
+        }
+        supabase.table('pending_deletions').insert(data).execute()
+    except Exception as e:
+        logger.error(f"Error scheduling deletion: {e}")
+
+async def get_due_deletions():
+    """Get messages that are ready to be deleted"""
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        # Use proper Supabase query with explicit filtering
+        query = supabase.table('pending_deletions').select("*").lte('delete_at', now)
+        result = query.execute()
+        
+        # Verify we got data back
+        if hasattr(result, 'data') and result.data is not None:
+            return result.data
+        else:
+            logger.warning("get_due_deletions returned None or empty data")
+            return []
+    except Exception as e:
+        logger.error(f"Error getting due deletions: {e}")
+        return []
+
+async def remove_pending_deletion(row_id: int):
+    """Remove entry from pending_deletions table"""
+    try:
+        supabase.table('pending_deletions').delete().eq('id', row_id).execute()
+    except Exception as e:
+        logger.error(f"Error removing pending deletion row: {e}")
+
+async def is_channel_linked_to_group(context: ContextTypes.DEFAULT_TYPE, channel_id: int, chat_id: int) -> bool:
+    """Check if a channel is linked to a group"""
+    try:
+        channel_chat = await context.bot.get_chat(channel_id)
+        return True
+    except Exception:
+        return False
+
+# --- GEMINI HELPER FOR MUTE REASON GENERATION ---
+async def generate_mute_reason_with_gemini(warning_count: int, recent_warnings: list, offense_type: str) -> str:
+    """
+    Use Gemini API to generate a human-readable mute reason based on user's warning history.
+    """
+    try:
+        # Build context for Gemini
+        warnings_summary = ""
+        if recent_warnings:
+            warnings_summary = "\n".join([f"- {w['reason']} ({w['warned_at']})" for w in recent_warnings[-5:]])
+        
+        prompt = f"""Generate a concise, professional mute reason (2-3 sentences) for a Telegram group moderation.
+        
+Context:
+- Warning count: {warning_count}
+- Offense type: {offense_type}
+- Recent warnings: {warnings_summary if warnings_summary else "None"}
+
+The reason should explain WHY the user is being muted so other group members understand.
+Focus on the pattern of behavior (spamming, repeated violations, etc.).
+Keep it under 150 characters if possible.
+Format as plain text, no markdown."""
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [({
+                "parts": [({
+                    "text": prompt
+                })]
+            })],
+            "generationConfig": {
+                "maxOutputTokens": 100
+            }
+        }
+        headers = {"Content-Type": "application/json"}
+        
+        response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=5)
+        if response.status_code == 200:
+            result = response.json()
+            generated_reason = result['candidates'][0]['content']['parts'][0]['text'].strip()
+            return generated_reason
+        else:
+            logger.error(f"Gemini API error: {response.status_code} - {response.text}")
+            return f"Multiple violations ({offense_type})"
+    except Exception as e:
+        logger.error(f"Error generating mute reason with Gemini: {e}")
+        return f"Repeated violations ({offense_type})"
+
+# --- HELPER FUNCTION: PARSE DURATION ---
+def parse_duration(duration_str: str) -> int:
+    """
+    Parse duration string and return seconds
+    Supported formats: 10m, 1h, 2d, 1w
+    Returns: duration in seconds
+    """
+    duration_str_lower = duration_str.lower().strip()
+    
+    # Check for 'm' (minutes)
+    if duration_str_lower.endswith('m'):
+        try:
+            return int(duration_str_lower[:-1]) * 60
+        except ValueError:
+            return 0
+    
+    # Check for 'h' (hours)
+    elif duration_str_lower.endswith('h'):
+        try:
+            return int(duration_str_lower[:-1]) * 60 * 60
+        except ValueError:
+            return 0
+    
+    # Check for 'd' (days)
+    elif duration_str_lower.endswith('d'):
+        try:
+            return int(duration_str_lower[:-1]) * 60 * 60 * 24
+        except ValueError:
+            return 0
+    
+    # Check for 'w' (weeks)
+    elif duration_str_lower.endswith('w'):
+        try:
+            return int(duration_str_lower[:-1]) * 60 * 60 * 24 * 7
+        except ValueError:
+            return 0
+    
+    # Try plain number (assume minutes)
+    try:
+        return int(duration_str_lower) * 60
     except ValueError:
         return 0
 
-
-# ════════════════════════════════════════════════════════════
-# DATABASE — GROUPS
-# ════════════════════════════════════════════════════════════
-
-async def get_group_settings(chat_id: int):
-    try:
-        r = supabase.table("groups").select("*").eq("chat_id", chat_id).execute()
-        return r.data[0] if r.data else None
-    except Exception as e:
-        logger.error(f"get_group_settings: {e}")
-        return None
-
-
-async def add_group_to_db(chat_id, chat_title, added_by, username, bot_is_admin):
-    try:
-        existing = await get_group_settings(chat_id)
-        defaults = {
-            "delete_promotions": False, "delete_links": False,
-            "warning_timer": 30, "max_word_count": 0,
-            "welcome_message": None, "welcome_timer": 0,
-            "delete_join_messages": False, "max_warnings": 3,
-            "require_approval": False, "auto_approve": False,
-            "sticker_protect": False, "force_sub_message_timer": 60,
-        }
-        if existing:
-            for k in defaults:
-                defaults[k] = existing.get(k, defaults[k])
-        defaults.update({
-            "chat_id": chat_id, "chat_title": chat_title,
-            "added_by": added_by, "added_by_username": username,
-            "bot_is_admin": bot_is_admin,
-        })
-        supabase.table("groups").upsert(defaults, on_conflict="chat_id").execute()
-    except Exception as e:
-        logger.error(f"add_group_to_db: {e}")
-
-
-async def delete_group_and_words(chat_id: int):
-    try:
-        for t in ("banned_words", "group_members", "notes", "force_sub",
-                  "warnings", "bans", "mutes", "reports",
-                  "pending_deletions", "join_requests"):
-            supabase.table(t).delete().eq("chat_id", chat_id).execute()
-        supabase.table("groups").delete().eq("chat_id", chat_id).execute()
-    except Exception as e:
-        logger.error(f"delete_group_and_words: {e}")
-
-
-async def get_user_groups(user_id: int):
-    try:
-        r = supabase.table("groups").select("*").eq("added_by", user_id).execute()
-        return r.data or []
-    except Exception as e:
-        logger.error(f"get_user_groups: {e}")
-        return []
-
-
-async def update_setting(chat_id: int, **kwargs):
-    try:
-        supabase.table("groups").update(kwargs).eq("chat_id", chat_id).execute()
-    except Exception as e:
-        logger.error(f"update_setting: {e}")
-
-
-# ════════════════════════════════════════════════════════════
-# DATABASE — MEMBER ACTIVITY
-# ════════════════════════════════════════════════════════════
-
-async def track_member_activity(chat_id: int, user_id: int,
-                                 username: str = None, first_name: str = None):
-    try:
-        r = supabase.table("group_members").select("message_count") \
-            .eq("chat_id", chat_id).eq("user_id", user_id).execute()
-        count = (r.data[0]["message_count"] + 1) if r.data else 1
-        supabase.table("group_members").upsert({
-            "chat_id": chat_id, "user_id": user_id,
-            "username": username, "first_name": first_name,
-            "last_active": datetime.now(timezone.utc).isoformat(),
-            "message_count": count,
-        }, on_conflict="chat_id,user_id").execute()
-    except Exception as e:
-        logger.error(f"track_member_activity: {e}")
-
-
-async def get_group_members(chat_id: int):
-    try:
-        r = supabase.table("group_members").select("*").eq("chat_id", chat_id).execute()
-        return r.data or []
-    except Exception as e:
-        logger.error(f"get_group_members: {e}")
-        return []
-
-
-async def remove_member(chat_id: int, user_id: int):
-    try:
-        supabase.table("group_members").delete() \
-            .eq("chat_id", chat_id).eq("user_id", user_id).execute()
-    except Exception as e:
-        logger.error(f"remove_member: {e}")
-
-
-# ════════════════════════════════════════════════════════════
-# DATABASE — WARNINGS / BANS / MUTES
-# ════════════════════════════════════════════════════════════
-
-async def add_warning(chat_id, user_id, warned_by, reason, username=None):
-    try:
-        supabase.table("warnings").insert({
-            "chat_id": chat_id, "user_id": user_id, "username": username,
-            "warned_by": warned_by, "reason": reason,
-            "warned_at": datetime.now(timezone.utc).isoformat(),
-        }).execute()
-    except Exception as e:
-        logger.error(f"add_warning: {e}")
-
-
-async def get_user_warnings(chat_id, user_id):
-    try:
-        r = supabase.table("warnings").select("*") \
-            .eq("chat_id", chat_id).eq("user_id", user_id).execute()
-        return r.data or []
-    except Exception:
-        return []
-
-
-async def clear_user_warnings(chat_id: int, user_id: int):
-    try:
-        supabase.table("warnings").delete() \
-            .eq("chat_id", chat_id).eq("user_id", user_id).execute()
-    except Exception as e:
-        logger.error(f"clear_user_warnings: {e}")
-
-
-async def add_ban(chat_id, user_id, banned_by, reason, username=None):
-    try:
-        supabase.table("bans").insert({
-            "chat_id": chat_id, "user_id": user_id, "username": username,
-            "banned_by": banned_by, "reason": reason,
-            "banned_at": datetime.now(timezone.utc).isoformat(), "is_active": True,
-        }).execute()
-    except Exception as e:
-        logger.error(f"add_ban: {e}")
-
-
-async def unban_user_in_db(chat_id, user_id):
-    try:
-        supabase.table("bans").update({"is_active": False}) \
-            .eq("chat_id", chat_id).eq("user_id", user_id).execute()
-    except Exception as e:
-        logger.error(f"unban_user_in_db: {e}")
-
-
-async def add_mute(chat_id, user_id, muted_by, reason, duration_minutes, username=None):
-    try:
-        mute_until = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
-        supabase.table("mutes").insert({
-            "chat_id": chat_id, "user_id": user_id, "username": username,
-            "muted_by": muted_by, "reason": reason,
-            "muted_at": datetime.now(timezone.utc).isoformat(),
-            "mute_until": mute_until.isoformat(), "is_active": True,
-        }).execute()
-    except Exception as e:
-        logger.error(f"add_mute: {e}")
-
-
-async def unmute_user_in_db(chat_id, user_id):
-    try:
-        supabase.table("mutes").update({"is_active": False}) \
-            .eq("chat_id", chat_id).eq("user_id", user_id).execute()
-    except Exception as e:
-        logger.error(f"unmute_user_in_db: {e}")
-
-
-async def cleanup_expired_mutes(bot):
-    """Called from cron — receives bot object directly, not a context."""
-    try:
-        now = datetime.now(timezone.utc).isoformat()
-        r   = supabase.table("mutes").select("*").eq("is_active", True).lte("mute_until", now).execute()
-        count = 0
-        for m in (r.data or []):
-            try:
-                perms = ChatPermissions(
-                    can_send_messages=True, can_send_photos=True,
-                    can_send_videos=True, can_send_documents=True,
-                    can_send_audios=True, can_send_voice_notes=True,
-                    can_send_video_notes=True, can_send_polls=True,
-                )
-                await bot.restrict_chat_member(m["chat_id"], m["user_id"], perms, until_date=0)
-                await unmute_user_in_db(m["chat_id"], m["user_id"])
-                count += 1
-            except Exception as e:
-                logger.error(f"auto-unmute {m['user_id']}: {e}")
-        return count
-    except Exception as e:
-        logger.error(f"cleanup_expired_mutes: {e}")
-        return 0
-
-
-# ════════════════════════════════════════════════════════════
-# DATABASE — REPORTS / BANNED WORDS / NOTES / FORCE SUB
-# ════════════════════════════════════════════════════════════
-
-async def add_report(chat_id, reporter_id, reported_user_id, reason,
-                     reporter_username=None, reported_username=None):
-    try:
-        supabase.table("reports").insert({
-            "chat_id": chat_id, "reporter_id": reporter_id,
-            "reporter_username": reporter_username,
-            "reported_user_id": reported_user_id,
-            "reported_username": reported_username, "reason": reason,
-            "reported_at": datetime.now(timezone.utc).isoformat(), "status": "pending",
-        }).execute()
-    except Exception as e:
-        logger.error(f"add_report: {e}")
-
-
-async def get_banned_words(chat_id):
-    try:
-        r = supabase.table("banned_words").select("word").eq("chat_id", chat_id).execute()
-        return [i["word"] for i in (r.data or [])]
-    except Exception:
-        return []
-
-
-async def add_banned_word(chat_id, word, added_by):
-    try:
-        supabase.table("banned_words").insert({
-            "chat_id": chat_id, "word": word.lower(), "added_by": added_by,
-        }).execute()
-    except Exception as e:
-        logger.error(f"add_banned_word: {e}")
-
-
-async def remove_banned_word(chat_id, word):
-    try:
-        supabase.table("banned_words").delete() \
-            .eq("chat_id", chat_id).eq("word", word.lower()).execute()
-    except Exception as e:
-        logger.error(f"remove_banned_word: {e}")
-
-
-async def save_note(chat_id: int, name: str, content: str, added_by: int):
-    try:
-        supabase.table("notes").upsert({
-            "chat_id": chat_id, "name": name.lower(), "content": content,
-            "added_by": added_by,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="chat_id,name").execute()
-    except Exception as e:
-        logger.error(f"save_note: {e}")
-
-
-async def get_note(chat_id: int, name: str):
-    try:
-        r = supabase.table("notes").select("*") \
-            .eq("chat_id", chat_id).eq("name", name.lower()).execute()
-        return r.data[0] if r.data else None
-    except Exception:
-        return None
-
-
-async def delete_note(chat_id: int, name: str):
-    try:
-        supabase.table("notes").delete() \
-            .eq("chat_id", chat_id).eq("name", name.lower()).execute()
-    except Exception as e:
-        logger.error(f"delete_note: {e}")
-
-
-async def get_all_notes(chat_id: int):
-    try:
-        r = supabase.table("notes").select("name").eq("chat_id", chat_id).execute()
-        return [i["name"] for i in (r.data or [])]
-    except Exception:
-        return []
-
-
-async def get_force_sub_channels(chat_id: int):
-    try:
-        r = supabase.table("force_sub").select("*") \
-            .eq("chat_id", chat_id).eq("is_active", True).execute()
-        return r.data or []
-    except Exception:
-        return []
-
-
-async def add_force_sub_channel(chat_id, channel_id, channel_title, channel_username, added_by):
-    try:
-        supabase.table("force_sub").upsert({
-            "chat_id": chat_id, "channel_id": channel_id,
-            "channel_title": channel_title, "channel_username": channel_username,
-            "added_by": added_by, "is_active": True,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="chat_id,channel_id").execute()
-    except Exception as e:
-        logger.error(f"add_force_sub_channel: {e}")
-
-
-async def remove_force_sub_channel(chat_id: int, channel_id):
-    try:
-        supabase.table("force_sub").update({"is_active": False}) \
-            .eq("chat_id", chat_id).eq("channel_id", channel_id).execute()
-    except Exception as e:
-        logger.error(f"remove_force_sub_channel: {e}")
-
-
-async def schedule_message_deletion(chat_id, message_id, delay_seconds):
-    try:
-        delete_time = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
-        supabase.table("pending_deletions").insert({
-            "chat_id": chat_id, "message_id": message_id,
-            "delete_at": delete_time.isoformat(),
-        }).execute()
-    except Exception as e:
-        logger.error(f"schedule_message_deletion: {e}")
-
-
-async def get_due_deletions():
-    try:
-        now = datetime.now(timezone.utc).isoformat()
-        r   = supabase.table("pending_deletions").select("*").lte("delete_at", now).execute()
-        return r.data or []
-    except Exception:
-        return []
-
-
-async def remove_pending_deletion(row_id):
-    try:
-        supabase.table("pending_deletions").delete().eq("id", row_id).execute()
-    except Exception as e:
-        logger.error(f"remove_pending_deletion: {e}")
-
-
-async def save_join_request(chat_id, user_id, username, first_name):
-    try:
-        supabase.table("join_requests").upsert({
-            "chat_id": chat_id, "user_id": user_id,
-            "username": username, "first_name": first_name,
-            "requested_at": datetime.now(timezone.utc).isoformat(),
-            "status": "pending",
-        }, on_conflict="chat_id,user_id").execute()
-    except Exception as e:
-        logger.error(f"save_join_request: {e}")
-
-
-# ════════════════════════════════════════════════════════════
-# ADMIN CHECK HELPERS
-# ════════════════════════════════════════════════════════════
-
-async def is_user_admin(chat_id, user_id, context) -> bool:
-    try:
-        m = await context.bot.get_chat_member(chat_id, user_id)
-        return m.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
-    except Exception:
-        return False
-
-
-async def is_sender_admin(chat_id, message, context) -> bool:
-    try:
-        if message.sender_chat and message.sender_chat.id == chat_id:
-            return True
-        if message.from_user:
-            return await is_user_admin(chat_id, message.from_user.id, context)
-        return False
-    except Exception:
-        return False
-
-
-async def verify_callback_admin(chat_id, query, context):
-    try:
-        if query.from_user:
-            ok = await is_user_admin(chat_id, query.from_user.id, context)
-            return (True, query.from_user.id, None) if ok \
-                else (False, query.from_user.id, "Admins only.")
-        return False, None, "Admins only."
-    except Exception:
-        return False, None, "Admins only."
-
-
-# ════════════════════════════════════════════════════════════
-# GEMINI AI
-# ════════════════════════════════════════════════════════════
-
-async def generate_mute_reason_with_gemini(warning_count, recent_warnings, offense_type) -> str:
-    try:
-        summary = "\n".join(
-            f"- {w['reason']}" for w in recent_warnings[-5:]
-        ) if recent_warnings else "None"
-        prompt = (
-            f"Write a concise (max 150 chars) professional mute reason for Telegram moderation.\n"
-            f"Warnings: {warning_count} | Offense: {offense_type}\n"
-            f"History: {summary}\nPlain text only, no markdown."
-        )
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-        )
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 80},
-        }
-        resp = http_requests.post(
-            url, headers={"Content-Type": "application/json"},
-            data=json.dumps(payload), timeout=5,
-        )
-        if resp.status_code == 200:
-            return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception as e:
-        logger.error(f"Gemini error: {e}")
-    return f"Repeated violations ({offense_type})"
-
-
-# ════════════════════════════════════════════════════════════
-# FORCE SUBSCRIBE
-# ════════════════════════════════════════════════════════════
-
-async def check_force_sub(chat_id: int, user_id: int, context) -> list:
-    channels   = await get_force_sub_channels(chat_id)
-    not_joined = []
-    for fc in channels:
-        try:
-            m = await context.bot.get_chat_member(fc["channel_id"], user_id)
-            if m.status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]:
-                not_joined.append(fc)
-        except Exception:
-            not_joined.append(fc)
-    return not_joined
-
-
-async def send_force_sub_message(chat, user, not_joined: list, context, warning_timer=60):
-    try:
-        user_link = get_user_mention_html(user)
-        ch_names  = ", ".join(f"<b>{fc['channel_title']}</b>" for fc in not_joined)
-        text      = (
-            f"{user_link}, you must join the required channel(s) before chatting here.\n\n"
-            f"Please join: {ch_names}\n\nThen send your message again."
-        )
-        kb = []
-        for fc in not_joined:
-            link = (f"https://t.me/{fc['channel_username']}"
-                    if fc.get("channel_username")
-                    else f"https://t.me/c/{str(fc['channel_id']).replace('-100','')}")
-            kb.append([InlineKeyboardButton(f"Join {fc['channel_title']}", url=link)])
-        msg = await chat.send_message(
-            text, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(kb) if kb else None,
-        )
-        if warning_timer > 0:
-            await schedule_message_deletion(chat.id, msg.message_id, warning_timer)
-    except Exception as e:
-        logger.error(f"send_force_sub_message: {e}")
-
-
-# ════════════════════════════════════════════════════════════
-# AUTO-MUTE (shared helper)
-# ════════════════════════════════════════════════════════════
-
-async def auto_mute_user(chat, user_id, username, count, warnings, max_w, context):
-    reason     = await generate_mute_reason_with_gemini(count, warnings, "Max warnings")
-    until_date = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())
-    try:
-        await context.bot.restrict_chat_member(
-            chat.id, user_id,
-            ChatPermissions(
-                can_send_messages=False, can_send_photos=False,
-                can_send_videos=False, can_send_documents=False,
-                can_send_audios=False, can_send_voice_notes=False,
-                can_send_video_notes=False, can_send_polls=False,
-            ),
-            until_date=until_date,
-        )
-        await add_mute(chat.id, user_id, 0, reason, 60, username)
-        mention = f"@{username}" if username else f"User {user_id}"
-        kb = [[InlineKeyboardButton("Unmute User",
-                callback_data=f"unmute_user_{user_id}_{chat.id}")]]
-        await chat.send_message(
-            f"<b>AUTO-MUTED</b>\nUser: {mention}\nDuration: 1 hour\n"
-            f"Reason: {reason}\nReached {max_w} warnings.",
-            reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.error(f"auto_mute_user: {e}")
-
-
-async def send_warning_with_count(chat, user_id, username, reason, context,
-                                   offense_type="general"):
-    s          = await get_group_settings(chat.id) or {}
-    max_w      = s.get("max_warnings", 3)
-    warn_timer = s.get("warning_timer", 30)
-    mention    = f"@{username}" if username else f"User {user_id}"
-
-    if offense_type == "banned_word":
-        m = await chat.send_message(f"{mention}, your message was removed (banned word).")
-        if warn_timer > 0:
-            await schedule_message_deletion(chat.id, m.message_id, warn_timer)
-        return
-
-    await add_warning(chat.id, user_id, 0, reason, username)
-    warnings = await get_user_warnings(chat.id, user_id)
-    count    = len(warnings)
-    text     = (
-        f"<b>WARNING #{count}/{max_w}</b>\n"
-        f"User: {mention}\nReason: {reason}\nIssued by: Bot"
-    )
-    msg = await chat.send_message(text, parse_mode="HTML")
-    if warn_timer > 0:
-        await schedule_message_deletion(chat.id, msg.message_id, warn_timer)
-    if count >= max_w:
-        await auto_mute_user(chat, user_id, username, count, warnings, max_w, context)
-
-
-# ════════════════════════════════════════════════════════════
-# RESOLVE TARGET HELPER
-# ════════════════════════════════════════════════════════════
-
-async def resolve_target(message, context):
-    if message.reply_to_message and message.reply_to_message.from_user:
-        u = message.reply_to_message.from_user
-        return u, u.username
-    if context.args:
-        raw = context.args[0].replace("@", "")
-        try:
-            m = await context.bot.get_chat_member(message.chat.id, int(raw))
-            return m.user, m.user.username
-        except Exception:
-            pass
-    return None, None
-
-
-# ════════════════════════════════════════════════════════════
-# MODERATION COMMANDS
-# ════════════════════════════════════════════════════════════
-
+# --- MODERATION COMMAND HANDLERS ---
 async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not await is_sender_admin(chat.id, msg, context):
-        await msg.reply_text("Admins only.")
+    """Handle /warn command - Admin only (supports anonymous admins)"""
+    message = update.message
+    chat = message.chat
+    
+    # Support anonymous admins - check if sender is admin
+    if not await is_sender_admin(chat.id, message, context):
+        await message.reply_text("⚠️ This command is only for admins!")
         return
+    
+    # Parse arguments: /warn @username reason
     if not context.args or len(context.args) < 2:
-        await msg.reply_text("Usage: /warn <@user or ID> <reason>")
+        await message.reply_text(
+            "❌ Usage: /warn <username/ID> <reason>\n\n"
+            "Example: /warn @user123 Spamming in group"
+        )
         return
+    
+    # Extract user and reason
+    target = context.args[0]
     reason = " ".join(context.args[1:])
-    target, _ = await resolve_target(msg, context)
-    if not target:
-        await msg.reply_text("User not found. Reply to their message or give user ID.")
+    
+    # Get target user
+    target_user = None
+    target_username = None
+    
+    if target.startswith("@"):
+        target_username = target[1:]
+        # Try to get user by username (reply to message is better)
+        if message.reply_to_message and message.reply_to_message.from_user:
+            target_user = message.reply_to_message.from_user
+            target_username = target_user.username
+    elif message.reply_to_message and message.reply_to_message.from_user:
+        target_user = message.reply_to_message.from_user
+        target_username = target_user.username
+    else:
+        try:
+            target_id = int(target)
+            target_user = await context.bot.get_chat_member(chat.id, target_id)
+            if target_user.user:
+                target_user = target_user.user
+                target_username = target_user.username
+        except Exception:
+            await message.reply_text("❌ Could not find user. Please reply to their message or use @username")
+            return
+    
+    if not target_user:
+        await message.reply_text("❌ User not found. Please reply to the user's message or mention them with @username")
         return
-    warned_by = msg.from_user.id if msg.from_user else 0
-    await add_warning(chat.id, target.id, warned_by, reason, target.username)
-    warnings = await get_user_warnings(chat.id, target.id)
-    count    = len(warnings)
-    s        = await get_group_settings(chat.id) or {}
-    max_w    = s.get("max_warnings", 3)
-    mention  = get_user_mention_html(target)
-    adm_men  = "Anonymous Admin" if not msg.from_user else msg.from_user.mention_html()
-    kb       = [
-        [InlineKeyboardButton("Ban User",  callback_data=f"ban_from_warn_{target.id}_{chat.id}")],
-        [InlineKeyboardButton("Mute User", callback_data=f"mute_from_warn_{target.id}_{chat.id}")],
-    ]
-    await msg.reply_html(
-        f"<b>WARNING #{count}/{max_w}</b>\nUser: {mention}\nAdmin: {adm_men}\nReason: {reason}",
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
-    if count >= max_w:
-        await auto_mute_user(chat, target.id, target.username, count, warnings, max_w, context)
+    
+    # For anonymous admin, use bot ID or 0 as warned_by
+    warned_by = message.from_user.id if message.from_user else 0
+    
+    # Add warning to database
+    await add_warning(chat.id, target_user.id, warned_by, reason, target_username)
+    
+    # Get warning count
+    warnings = await get_user_warnings(chat.id, target_user.id)
+    warning_count = len(warnings)
+    
+    # NEW: Check if max warnings reached
+    settings = await get_group_settings(chat.id)
+    max_warnings = settings.get('max_warnings', 3) if settings else 3
+    
+    # Send warning message with count (NOT scheduled for deletion)
+    user_mention = target_user.mention_html()
+    admin_mention = "Anonymous Admin" if not message.from_user else message.from_user.mention_html()
+    
+    warn_msg = f"""
+⚠️ <b>WARNING #{warning_count}/{max_warnings}</b>
+👤 User: {user_mention}
+🛡️ Admin: {admin_mention}
+📝 Reason: {reason}
 
+This user has been warned by admin.
+    """
+    
+    # Check if max warnings reached - auto-mute
+    if warning_count >= max_warnings:
+        # Generate mute reason with Gemini
+        mute_reason = await generate_mute_reason_with_gemini(warning_count, warnings, "Maximum warnings reached")
+        
+        # Auto-mute user for 1 hour
+        duration_seconds = 3600  # 1 hour
+        until_date = int((datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)).timestamp())
+        
+        try:
+            permissions = ChatPermissions(
+                can_send_messages=False,
+                can_send_photos=False,
+                can_send_videos=False,
+                can_send_documents=False,
+                can_send_audios=False,
+                can_send_voice_notes=False,
+                can_send_video_notes=False,
+                can_send_polls=False
+            )
+            await context.bot.restrict_chat_member(chat.id, target_user.id, permissions, until_date=until_date)
+            muted_by = warned_by
+            await add_mute(chat.id, target_user.id, muted_by, mute_reason, 60, target_username)
+            
+            # Create mute message with unmute button
+            mute_msg = f"""
+🔇 <b>USER MUTED (AUTO)</b>
+👤 User: {user_mention}
+🛡️ Muted by: Admin
+⏱ Duration: 1 hour
+📝 Reason: {mute_reason}
+
+User has reached {max_warnings} warnings and has been automatically muted.
+            """
+            
+            # Create admin keyboard with unmute button
+            keyboard = [
+                [InlineKeyboardButton("🔊 Unmute User", callback_data=f"unmute_user_{target_user.id}_{chat.id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await message.reply_html(mute_msg, reply_markup=reply_markup)
+        except Exception as e:
+            logger.error(f"Error auto-muting user: {e}")
+    
+    # Create admin keyboard (only visible to admins)
+    keyboard = [
+        [InlineKeyboardButton("🚫 Ban User", callback_data=f"ban_from_warn_{target_user.id}_{chat.id}")],
+        [InlineKeyboardButton("🔇 Mute User", callback_data=f"mute_from_warn_{target_user.id}_{chat.id}")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    sent_message = await message.reply_html(warn_msg, reply_markup=reply_markup)
+    
+    # FIXED: Do NOT schedule deletion for warning messages - they should stay
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not await is_sender_admin(chat.id, msg, context):
-        await msg.reply_text("Admins only.")
+    """Handle /ban command - Admin only (supports anonymous admins)"""
+    message = update.message
+    chat = message.chat
+    
+    # Support anonymous admins - check if sender is admin
+    if not await is_sender_admin(chat.id, message, context):
+        await message.reply_text("⚠️ This command is only for admins!")
         return
-    if not context.args:
-        await msg.reply_text("Usage: /ban <@user or ID> [reason]")
-        return
-    reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason"
-    target, _ = await resolve_target(msg, context)
-    if not target:
-        await msg.reply_text("User not found.")
-        return
-    banned_by = msg.from_user.id if msg.from_user else 0
-    try:
-        await context.bot.ban_chat_member(chat.id, target.id)
-        await add_ban(chat.id, target.id, banned_by, reason, target.username)
-        mention = get_user_mention_html(target)
-        kb = [[InlineKeyboardButton("Unban User",
-                callback_data=f"unban_user_{target.id}_{chat.id}")]]
-        await msg.reply_html(
-            f"<b>BANNED</b>\nUser: {mention}\nReason: {reason}",
-            reply_markup=InlineKeyboardMarkup(kb),
+    
+    # Parse arguments: /ban @username reason
+    if not context.args or len(context.args) < 1:
+        await message.reply_text(
+            "❌ Usage: /ban <username/ID> <reason>\n\n"
+            "Example: /ban @user123 Repeated spam"
         )
+        return
+    
+    # Extract user and reason
+    target = context.args[0]
+    reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason provided"
+    
+    # Get target user
+    target_user = None
+    target_username = None
+    
+    if target.startswith("@"):
+        target_username = target[1:]
+        if message.reply_to_message and message.reply_to_message.from_user:
+            target_user = message.reply_to_message.from_user
+            target_username = target_user.username
+    elif message.reply_to_message and message.reply_to_message.from_user:
+        target_user = message.reply_to_message.from_user
+        target_username = target_user.username
+    else:
+        try:
+            target_id = int(target)
+            target_user = await context.bot.get_chat_member(chat.id, target_id)
+            if target_user.user:
+                target_user = target_user.user
+                target_username = target_user.username
+        except Exception:
+            await message.reply_text("❌ Could not find user. Please reply to their message or use @username")
+            return
+    
+    if not target_user:
+        await message.reply_text("❌ User not found. Please reply to the user's message or mention them with @username")
+        return
+    
+    # Check if already banned
+    existing_ban = await get_active_ban(chat.id, target_user.id)
+    if existing_ban:
+        await message.reply_text("❌ This user is already banned!")
+        return
+    
+    # FIXED: Ban user in Telegram using ban_chat_member (v20+)
+    try:
+        await context.bot.ban_chat_member(chat.id, target_user.id)
     except Exception as e:
-        await msg.reply_text(f"Failed to ban: {e}")
+        await message.reply_text(f"❌ Error banning user: {e}")
+        return
+    
+    # For anonymous admin, use bot ID or 0 as banned_by
+    banned_by = message.from_user.id if message.from_user else 0
+    
+    # Add ban to database
+    await add_ban(chat.id, target_user.id, banned_by, reason, target_username)
+    
+    # Send ban message
+    user_mention = target_user.mention_html()
+    admin_mention = "Anonymous Admin" if not message.from_user else message.from_user.mention_html()
+    
+    ban_msg = f"""
+🚫 <b>USER BANNED</b>
+👤 User: {user_mention}
+🛡️ Banned by: {admin_mention}
+📝 Reason: {reason}
 
+This user has been banned from the group.
+    """
+    
+    # Create admin keyboard with unban button
+    keyboard = [
+        [InlineKeyboardButton("✅ Unban User", callback_data=f"unban_user_{target_user.id}_{chat.id}")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await message.reply_html(ban_msg, reply_markup=reply_markup)
 
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not await is_sender_admin(chat.id, msg, context):
-        await msg.reply_text("Admins only.")
+    """Handle /unban command - Admin only (supports anonymous admins)"""
+    message = update.message
+    chat = message.chat
+    
+    # Support anonymous admins - check if sender is admin
+    if not await is_sender_admin(chat.id, message, context):
+        await message.reply_text("⚠️ This command is only for admins!")
         return
+    
+    # Parse arguments: /unban @username or /unban user_id
     if not context.args:
-        await msg.reply_text("Usage: /unban <ID>")
+        await message.reply_text(
+            "❌ Usage: /unban <username/ID>\n\n"
+            "Example: /unban @user123"
+        )
         return
+    
+    target = context.args[0]
+    target_user_id = None
+    
+    if target.startswith("@"):
+        # Find user by username from database
+        target_username = target[1:]
+        result = supabase.table('bans').select("*").eq('chat_id', chat.id).eq('username', target_username).eq('is_active', True).execute()
+        if result.data:
+            target_user_id = result.data[0]['user_id']
+    else:
+        try:
+            target_user_id = int(target)
+        except ValueError:
+            pass
+    
+    if not target_user_id:
+        await message.reply_text("❌ User not found or not banned!")
+        return
+    
+    # Check if user is actually banned
+    active_ban = await get_active_ban(chat.id, target_user_id)
+    if not active_ban:
+        await message.reply_text("❌ This user is not currently banned!")
+        return
+    
+    # Unban user in Telegram
     try:
-        raw = context.args[0].replace("@", "")
-        uid = int(raw)
-        await context.bot.unban_chat_member(chat.id, uid, only_if_banned=True)
-        await unban_user_in_db(chat.id, uid)
-        await msg.reply_text("User unbanned.")
+        await context.bot.unban_chat_member(chat.id, target_user_id)
     except Exception as e:
-        await msg.reply_text(f"Failed: {e}")
-
+        await message.reply_text(f"❌ Error unbanning user: {e}")
+        return
+    
+    # Mark ban as inactive in database
+    await unban_user_in_db(chat.id, target_user_id)
+    
+    await message.reply_text("✅ User has been unbanned successfully!")
 
 async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not await is_sender_admin(chat.id, msg, context):
-        await msg.reply_text("Admins only.")
+    """Handle /mute command - Admin only (supports anonymous admins) with custom duration support"""
+    message = update.message
+    chat = message.chat
+    
+    # Support anonymous admins - check if sender is admin
+    if not await is_sender_admin(chat.id, message, context):
+        await message.reply_text("⚠️ This command is only for admins!")
         return
+    
+    # Parse arguments: /mute @username duration reason
+    # Duration format: 10m, 1h, 1d, 1w, etc.
     if not context.args or len(context.args) < 2:
-        await msg.reply_text("Usage: /mute <@user or ID> <duration> [reason]\nEx: /mute @user 1h Spamming")
+        await message.reply_text(
+            "❌ Usage: /mute <username/ID> <duration> <reason>\n\n"
+            "Duration examples: 10m, 1h, 1d, 1w\n"
+            "Example: /mute @user123 1h Spamming"
+        )
         return
-    dur_str = context.args[1]
-    reason  = " ".join(context.args[2:]) if len(context.args) > 2 else "No reason"
-    secs    = parse_duration(dur_str)
-    if secs == 0:
-        await msg.reply_text("Invalid duration. Use: 10m, 1h, 1d, 1w")
+    
+    # Extract user, duration, and reason
+    target = context.args[0]
+    duration_str = context.args[1]
+    reason = " ".join(context.args[2:]) if len(context.args) > 2 else "No reason provided"
+    
+    # Parse duration using helper function
+    duration_seconds = parse_duration(duration_str)
+    
+    if duration_seconds == 0:
+        await message.reply_text(
+            "❌ Invalid duration format!\n\n"
+            "Supported formats:\n"
+            "• 10m (10 minutes)\n"
+            "• 1h (1 hour)\n"
+            "• 1d (1 day)\n"
+            "• 1w (1 week)\n"
+            "• 30 (30 minutes, default)\n\n"
+            "Maximum duration: 366 days"
+        )
         return
-    target, _ = await resolve_target(msg, context)
-    if not target:
-        await msg.reply_text("User not found.")
+    
+    # Validate maximum duration (366 days in seconds)
+    max_duration_seconds = 366 * 24 * 60 * 60
+    if duration_seconds > max_duration_seconds:
+        await message.reply_text(
+            "❌ Duration exceeds maximum limit!\n\n"
+            f"Maximum allowed: 366 days\n"
+            f"Your duration: {duration_str}"
+        )
         return
-    muted_by   = msg.from_user.id if msg.from_user else 0
-    until_date = int((datetime.now(timezone.utc) + timedelta(seconds=secs)).timestamp())
+    
+    # Get target user
+    target_user = None
+    target_username = None
+    
+    if target.startswith("@"):
+        target_username = target[1:]
+        if message.reply_to_message and message.reply_to_message.from_user:
+            target_user = message.reply_to_message.from_user
+            target_username = target_user.username
+    elif message.reply_to_message and message.reply_to_message.from_user:
+        target_user = message.reply_to_message.from_user
+        target_username = target_user.username
+    else:
+        try:
+            target_id = int(target)
+            target_user = await context.bot.get_chat_member(chat.id, target_id)
+            if target_user.user:
+                target_user = target_user.user
+                target_username = target_user.username
+        except Exception:
+            await message.reply_text("❌ Could not find user. Please reply to their message or use @username")
+            return
+    
+    if not target_user:
+        await message.reply_text("❌ User not found. Please reply to the user's message or mention them with @username")
+        return
+    
+    # Check if already muted
+    existing_mute = await get_active_mute(chat.id, target_user.id)
+    if existing_mute:
+        await message.reply_text("❌ This user is already muted!")
+        return
+    
+    # Calculate until_date (Unix timestamp)
+    from datetime import datetime, timezone
+    until_date = int((datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)).timestamp())
+    
+    # Mute user in Telegram using restrict_chat_member with until_date
     try:
-        await context.bot.restrict_chat_member(
-            chat.id, target.id,
-            ChatPermissions(can_send_messages=False, can_send_photos=False,
-                            can_send_videos=False, can_send_documents=False),
-            until_date=until_date,
+        permissions = ChatPermissions(
+            can_send_messages=False,
+            can_send_photos=False,
+            can_send_videos=False,
+            can_send_documents=False,
+            can_send_audios=False,
+            can_send_voice_notes=False,
+            can_send_video_notes=False,
+            can_send_polls=False
         )
-        await add_mute(chat.id, target.id, muted_by, reason, secs // 60, target.username)
-        mention = get_user_mention_html(target)
-        kb = [[InlineKeyboardButton("Unmute User",
-                callback_data=f"unmute_user_{target.id}_{chat.id}")]]
-        await msg.reply_html(
-            f"<b>MUTED</b>\nUser: {mention}\nDuration: {dur_str}\nReason: {reason}",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
+        await context.bot.restrict_chat_member(chat.id, target_user.id, permissions, until_date=until_date)
     except Exception as e:
-        await msg.reply_text(f"Failed: {e}")
+        await message.reply_text(f"❌ Error muting user: {e}")
+        return
+    
+    # Convert duration to minutes for database
+    duration_minutes = duration_seconds // 60
+    
+    # For anonymous admin, use bot ID or 0 as muted_by
+    muted_by = message.from_user.id if message.from_user else 0
+    
+    # Get user's warning history for better mute reason
+    user_warnings = await get_user_warnings(chat.id, target_user.id)
+    warning_count = len(user_warnings)
+    
+    # Generate mute reason with Gemini
+    mute_reason = await generate_mute_reason_with_gemini(warning_count, user_warnings, f"Manual mute: {reason}")
+    
+    # Add mute to database
+    await add_mute(chat.id, target_user.id, muted_by, mute_reason, duration_minutes, target_username)
+    
+    # Format duration display
+    if duration_seconds >= 604800:  # 1 week
+        weeks = duration_seconds // 604800
+        duration_display = f"{weeks} week{'s' if weeks > 1 else ''}"
+    elif duration_seconds >= 86400:  # 1 day
+        days = duration_seconds // 86400
+        duration_display = f"{days} day{'s' if days > 1 else ''}"
+    elif duration_seconds >= 3600:  # 1 hour
+        hours = duration_seconds // 3600
+        mins = (duration_seconds % 3600) // 60
+        duration_display = f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
+    else:
+        duration_display = f"{duration_minutes}m"
+    
+    # Send mute message with unmute button
+    user_mention = target_user.mention_html()
+    admin_mention = "Anonymous Admin" if not message.from_user else message.from_user.mention_html()
+    
+    mute_msg = f"""
+🔇 <b>USER MUTED</b>
+👤 User: {user_mention}
+🛡️ Muted by: {admin_mention}
+⏱ Duration: {duration_display}
+📝 Reason: {mute_reason}
 
+This user has been muted and cannot send messages.
+    """
+    
+    # Create admin keyboard with unmute button
+    keyboard = [
+        [InlineKeyboardButton("🔊 Unmute User", callback_data=f"unmute_user_{target_user.id}_{chat.id}")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await message.reply_html(mute_msg, reply_markup=reply_markup)
 
 async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not await is_sender_admin(chat.id, msg, context):
-        await msg.reply_text("Admins only.")
+    """Handle /unmute command - Admin only (supports anonymous admins)"""
+    message = update.message
+    chat = message.chat
+    
+    # Support anonymous admins - check if sender is admin
+    if not await is_sender_admin(chat.id, message, context):
+        await message.reply_text("⚠️ This command is only for admins!")
         return
-    target, _ = await resolve_target(msg, context)
-    if not target:
-        await msg.reply_text("Reply to user's message or provide their ID.")
+    
+    # Parse arguments: /unmute @username or /unmute user_id
+    if not context.args:
+        await message.reply_text(
+            "❌ Usage: /unmute <username/ID>\n\n"
+            "Example: /unmute @user123"
+        )
         return
-    perms = ChatPermissions(
-        can_send_messages=True, can_send_photos=True, can_send_videos=True,
-        can_send_documents=True, can_send_audios=True, can_send_voice_notes=True,
-        can_send_video_notes=True, can_send_polls=True,
-    )
+    
+    target = context.args[0]
+    target_user_id = None
+    
+    if target.startswith("@"):
+        # Find user by username from database
+        target_username = target[1:]
+        result = supabase.table('mutes').select("*").eq('chat_id', chat.id).eq('username', target_username).eq('is_active', True).execute()
+        if result.data:
+            target_user_id = result.data[0]['user_id']
+    else:
+        try:
+            target_user_id = int(target)
+        except ValueError:
+            pass
+    
+    if not target_user_id:
+        await message.reply_text("❌ User not found or not muted!")
+        return
+    
+    # Check if user is actually muted
+    active_mute = await get_active_mute(chat.id, target_user_id)
+    if not active_mute:
+        await message.reply_text("❌ This user is not currently muted!")
+        return
+    
+    # Unmute user in Telegram using restrict_chat_member with until_date=0 (unlimited)
     try:
-        await context.bot.restrict_chat_member(chat.id, target.id, perms, until_date=0)
-        await unmute_user_in_db(chat.id, target.id)
-        await clear_user_warnings(chat.id, target.id)   # ← reset warnings on unmute
-        mention = get_user_mention_html(target)
-        await msg.reply_html(f"<b>Unmuted</b>\n{mention} unmuted. Warnings reset to 0.")
+        permissions = ChatPermissions(
+            can_send_messages=True,
+            can_send_photos=True,
+            can_send_videos=True,
+            can_send_documents=True,
+            can_send_audios=True,
+            can_send_voice_notes=True,
+            can_send_video_notes=True,
+            can_send_polls=True
+        )
+        await context.bot.restrict_chat_member(chat.id, target_user_id, permissions, until_date=0)
     except Exception as e:
-        await msg.reply_text(f"Failed: {e}")
-
+        await message.reply_text(f"❌ Error unmuting user: {e}")
+        return
+    
+    # Mark mute as inactive in database
+    await unmute_user_in_db(chat.id, target_user_id)
+    
+    # Get user info for professional message
+    try:
+        target_user = await context.bot.get_chat_member(chat.id, target_user_id)
+        if target_user.user:
+            username = target_user.user.username or target_user.user.first_name or f"User {target_user_id}"
+            if target_user.user.username:
+                user_mention = f"@{target_user.user.username}"
+            else:
+                user_mention = target_user.user.mention_html()
+        else:
+            user_mention = f"User {target_user_id}"
+    except Exception:
+        user_mention = f"User {target_user_id}"
+    
+    await message.reply_html(
+        f"✅ <b>User Unmuted</b>\n\n"
+        f"{user_mention} has been unmuted and can now send messages in the group."
+    )
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not msg.from_user:
-        return
-    if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        await msg.reply_text("Reply to the message you want to report.")
-        return
-    reported = msg.reply_to_message.from_user
-    if await is_user_admin(chat.id, reported.id, context):
-        await msg.reply_text("You cannot report admins.")
-        return
-    reason = " ".join(context.args) if context.args else "No reason"
-    await add_report(chat.id, msg.from_user.id, reported.id, reason,
-                     msg.from_user.username, reported.username)
-    await msg.reply_text("Report submitted. Thank you.")
-
-
-async def show_admin_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not await is_sender_admin(chat.id, msg, context):
-        await msg.reply_text("Admins only.")
-        return
-    kb = [
-        [InlineKeyboardButton("Warn",    callback_data=f"cmd_warn_{chat.id}"),
-         InlineKeyboardButton("Mute",    callback_data=f"cmd_mute_{chat.id}"),
-         InlineKeyboardButton("Ban",     callback_data=f"cmd_ban_{chat.id}")],
-        [InlineKeyboardButton("Unmute",  callback_data=f"cmd_unmute_{chat.id}"),
-         InlineKeyboardButton("Unban",   callback_data=f"cmd_unban_{chat.id}")],
-        [InlineKeyboardButton("Reports", callback_data=f"cmd_reports_{chat.id}"),
-         InlineKeyboardButton("Tag All", callback_data=f"cmd_tagall_{chat.id}")],
-    ]
-    await msg.reply_html("<b>Admin Panel</b>", reply_markup=InlineKeyboardMarkup(kb))
-
-
-# ════════════════════════════════════════════════════════════
-# TAG ALL / NOTES / FORCE SUB / FILTER DELETED
-# ════════════════════════════════════════════════════════════
-
-async def tag_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not await is_sender_admin(chat.id, msg, context):
-        await msg.reply_text("Admins only.")
-        return
-    note_text = " ".join(context.args) if context.args else "Attention everyone!"
-    members   = await get_group_members(chat.id)
-    if not members:
-        await msg.reply_text("No members tracked yet. Members are tracked as they send messages.")
-        return
-    mentions = []
-    for m in members:
-        uid   = m["user_id"]
-        uname = m.get("username")
-        fname = m.get("first_name") or "User"
-        if uname:
-            mentions.append(f'<a href="https://t.me/{uname}">@{uname}</a>')
-        else:
-            mentions.append(f'<a href="tg://user?id={uid}">{fname}</a>')
-    chunks = [mentions[i:i+30] for i in range(0, len(mentions), 30)]
-    for idx, chunk in enumerate(chunks):
-        text = (note_text + "\n\n" if idx == 0 else "") + " ".join(chunk)
-        try:
-            await chat.send_message(text, parse_mode="HTML")
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            logger.error(f"tagall chunk {idx}: {e}")
-
-
-async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not await is_sender_admin(chat.id, msg, context):
-        await msg.reply_text("Admins only.")
-        return
+    """Handle /report command - Available to all members, but cannot report admins"""
+    message = update.message
+    chat = message.chat
+    
+    # Parse arguments: /report @username reason
     if not context.args or len(context.args) < 2:
-        await msg.reply_text("Usage: /note <name> <content>")
-        return
-    name     = context.args[0].lower()
-    content  = " ".join(context.args[1:])
-    added_by = msg.from_user.id if msg.from_user else 0
-    await save_note(chat.id, name, content, added_by)
-    await msg.reply_html(f"Note <b>{name}</b> saved.")
-
-
-async def get_note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not context.args:
-        await msg.reply_text("Usage: /get <name>")
-        return
-    note = await get_note(chat.id, context.args[0].lower())
-    if note:
-        await msg.reply_html(f"<b>{context.args[0]}</b>\n\n{note['content']}")
-    else:
-        await msg.reply_text(f"No note named '{context.args[0]}'.")
-
-
-async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg   = update.message
-    chat  = msg.chat
-    names = await get_all_notes(chat.id)
-    if names:
-        lines = "\n".join(f"- <code>{n}</code>" for n in names)
-        await msg.reply_html(f"<b>Notes ({len(names)}):</b>\n{lines}\n\nUse /get &lt;name&gt;")
-    else:
-        await msg.reply_text("No notes yet. Use /note <name> <content>.")
-
-
-async def delnote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not await is_sender_admin(chat.id, msg, context):
-        await msg.reply_text("Admins only.")
-        return
-    if not context.args:
-        await msg.reply_text("Usage: /delnote <name>")
-        return
-    await delete_note(chat.id, context.args[0].lower())
-    await msg.reply_html(f"Note <b>{context.args[0]}</b> deleted.")
-
-
-async def forcesub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not await is_sender_admin(chat.id, msg, context):
-        await msg.reply_text("Admins only.")
-        return
-    if not context.args:
-        channels = await get_force_sub_channels(chat.id)
-        if not channels:
-            await msg.reply_text("No force-subscribe channels.\nUsage: /forcesub @channel")
-        else:
-            lines = "\n".join(f"- {c['channel_title']} (@{c.get('channel_username') or c['channel_id']})"
-                              for c in channels)
-            await msg.reply_html(f"<b>Force Subscribe Channels:</b>\n{lines}")
-        return
-    try:
-        co  = await context.bot.get_chat(context.args[0])
-        bm  = await context.bot.get_chat_member(co.id, context.bot.id)
-        if bm.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER]:
-            await msg.reply_text("I must be a member of that channel first.")
-            return
-        await add_force_sub_channel(
-            chat.id, co.id, co.title or context.args[0],
-            co.username, msg.from_user.id if msg.from_user else 0,
+        await message.reply_text(
+            "❌ Usage: /report <username> <reason>\n\n"
+            "Example: /report @user123 Sending spam messages\n\n"
+            "Your report will be sent to the group admins privately."
         )
-        await msg.reply_html(
-            f"Force subscribe enabled for <b>{co.title}</b>.\n"
-            f"Members must join before chatting."
-        )
-    except Exception as e:
-        logger.error(f"forcesub: {e}")
-        await msg.reply_text("Could not access that channel. Make sure I'm a member.")
-
-
-async def removeforcesub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not await is_sender_admin(chat.id, msg, context):
-        await msg.reply_text("Admins only.")
         return
-    if not context.args:
-        await msg.reply_text("Usage: /removeforcesub @channel")
-        return
-    try:
-        co = await context.bot.get_chat(context.args[0])
-        await remove_force_sub_channel(chat.id, co.id)
-        await msg.reply_html(f"Force subscribe removed for <b>{co.title}</b>.")
-    except Exception as e:
-        await msg.reply_text(f"Failed: {e}")
-
-
-async def filter_deleted_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    chat = msg.chat
-    if not await is_sender_admin(chat.id, msg, context):
-        await msg.reply_text("Admins only.")
-        return
-    members = await get_group_members(chat.id)
-    removed = 0
-    for m in members:
+    
+    # Extract user and reason
+    target = context.args[0]
+    reason = " ".join(context.args[1:])
+    
+    # Get target user
+    target_user = None
+    target_username = None
+    
+    if target.startswith("@"):
+        target_username = target[1:]
+        if message.reply_to_message and message.reply_to_message.from_user:
+            target_user = message.reply_to_message.from_user
+            target_username = target_user.username
+    elif message.reply_to_message and message.reply_to_message.from_user:
+        target_user = message.reply_to_message.from_user
+        target_username = target_user.username
+    else:
         try:
-            cm   = await context.bot.get_chat_member(chat.id, m["user_id"])
-            user = cm.user
-            if is_deleted_account(user):
-                try:
-                    await context.bot.ban_chat_member(chat.id, user.id)
-                    await context.bot.unban_chat_member(chat.id, user.id)
-                except Exception:
-                    pass
-                await remove_member(chat.id, user.id)
-                removed += 1
-        except (Forbidden, BadRequest):
-            await remove_member(chat.id, m["user_id"])
-            removed += 1
+            target_id = int(target)
+            target_user = await context.bot.get_chat_member(chat.id, target_id)
+            if target_user.user:
+                target_user = target_user.user
+                target_username = target_user.username
         except Exception:
-            pass
-    await msg.reply_html(f"Done. Removed <b>{removed}</b> deleted/ghost accounts.")
-
-
-# ════════════════════════════════════════════════════════════
-# CALLBACK HANDLERS
-# ════════════════════════════════════════════════════════════
-
-async def unban_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    p = q.data.split("_")   # unban_user_<uid>_<cid>
-    uid, cid = int(p[2]), int(p[3])
-    ok, _, err = await verify_callback_admin(cid, q, context)
-    if not ok: await q.answer(err, show_alert=True); return
+            await message.reply_text("❌ Could not find user. Please reply to their message or use @username")
+            return
+    
+    if not target_user:
+        await message.reply_text("❌ User not found. Please reply to the user's message or mention them with @username")
+        return
+    
+    # Check if the target user is an admin
     try:
-        await context.bot.unban_chat_member(cid, uid, only_if_banned=True)
-        await unban_user_in_db(cid, uid)
-        await q.message.edit_reply_markup(reply_markup=None)
-        await q.answer("Unbanned.", show_alert=True)
+        target_member = await context.bot.get_chat_member(chat.id, target_user.id)
+        if target_member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+            await message.reply_text("❌ You cannot report an admin!")
+            return
     except Exception as e:
-        await q.answer(f"Failed: {e}", show_alert=True)
+        logger.error(f"Error checking if target is admin: {e}")
+        # If we can't check, allow the report to proceed
+        pass
+    
+    # Add report to database
+    reporter_username = message.from_user.username or message.from_user.first_name
+    await add_report(chat.id, message.from_user.id, target_user.id, reason, reporter_username, target_username)
+    
+    # Send confirmation to reporter
+    await message.reply_text(
+        "✅ Your report has been sent to the group admins privately. Thank you for helping keep the group safe!"
+    )
+    
+    # Send report to all admins privately
+    admins = await get_chat_admins(chat.id, context)
+    user_mention = target_user.mention_html() if target_user else f"@{target_username}"
+    reporter_mention = message.from_user.mention_html()
+    
+    report_msg = f"""
+🚨 <b>NEW REPORT</b>
+📱 Group: {chat.title}
+👤 Reported User: {user_mention}
+📝 Reporter: {reporter_mention}
+📋 Reason: {reason}
+⏰ Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+    """
+    
+    for admin_id in admins:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                report_msg,
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            logger.error(f"Error sending report to admin {admin_id}: {e}")
 
+# --- CALLBACK QUERY HANDLERS FOR MODERATION ---
+async def unban_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle unban button callback - works with anonymous admins"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Parse callback data: unban_user_{user_id}_{chat_id}
+    parts = query.data.split("_")
+    if len(parts) < 4:
+        return
+    
+    user_id = int(parts[2])
+    chat_id = int(parts[3])
+    
+    # Verify the callback user is an admin
+    is_admin, user_id_clicker, admin_message = await verify_callback_admin(chat_id, query, context)
+    
+    if not is_admin:
+        await query.answer(admin_message, show_alert=True)
+        return
+    
+    # Unban user
+    try:
+        await context.bot.unban_chat_member(chat_id, user_id)
+        await unban_user_in_db(chat_id, user_id)
+        
+        # Get user info for professional message
+        try:
+            target_user = await context.bot.get_chat_member(chat_id, user_id)
+            if target_user.user:
+                username = target_user.user.username or target_user.user.first_name or f"User {user_id}"
+                if target_user.user.username:
+                    user_mention = f"@{target_user.user.username}"
+                else:
+                    user_mention = target_user.user.mention_html()
+            else:
+                user_mention = f"User {user_id}"
+        except Exception:
+            user_mention = f"User {user_id}"
+        
+        # Update message
+        try:
+            await query.message.edit_text(
+                f"✅ <b>User Unbanned</b>\n\n{user_mention} has been unbanned and can join the group again.",
+                reply_markup=None,
+                parse_mode='HTML'
+            )
+        except BadRequest:
+            pass
+    except Exception as e:
+        await query.answer(f"❌ Error: {e}", show_alert=True)
 
 async def unmute_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    p = q.data.split("_")   # unmute_user_<uid>_<cid>
-    uid, cid = int(p[2]), int(p[3])
-    ok, _, err = await verify_callback_admin(cid, q, context)
-    if not ok: await q.answer(err, show_alert=True); return
-    perms = ChatPermissions(
-        can_send_messages=True, can_send_photos=True, can_send_videos=True,
-        can_send_documents=True, can_send_audios=True, can_send_voice_notes=True,
-        can_send_video_notes=True, can_send_polls=True,
-    )
+    """Handle unmute button callback - works with anonymous admins"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Parse callback data: unmute_user_{user_id}_{chat_id}
+    parts = query.data.split("_")
+    if len(parts) < 4:
+        return
+    
+    user_id = int(parts[2])
+    chat_id = int(parts[3])
+    
+    # Verify the callback user is an admin
+    is_admin, user_id_clicker, admin_message = await verify_callback_admin(chat_id, query, context)
+    
+    if not is_admin:
+        await query.answer(admin_message, show_alert=True)
+        return
+    
+    # Unmute user using restrict_chat_member with until_date=0 (unlimited)
     try:
-        await context.bot.restrict_chat_member(cid, uid, perms, until_date=0)
-        await unmute_user_in_db(cid, uid)
-        await clear_user_warnings(cid, uid)    # ← reset warnings
-        await q.message.edit_reply_markup(reply_markup=None)
-        await q.answer("Unmuted. Warnings reset.", show_alert=True)
+        permissions = ChatPermissions(
+            can_send_messages=True,
+            can_send_photos=True,
+            can_send_videos=True,
+            can_send_documents=True,
+            can_send_audios=True,
+            can_send_voice_notes=True,
+            can_send_video_notes=True,
+            can_send_polls=True
+        )
+        await context.bot.restrict_chat_member(chat_id, user_id, permissions, until_date=0)
+        await unmute_user_in_db(chat_id, user_id)
+        
+        # Get user info for professional message
+        try:
+            target_user = await context.bot.get_chat_member(chat_id, user_id)
+            if target_user.user:
+                username = target_user.user.username or target_user.user.first_name or f"User {user_id}"
+                if target_user.user.username:
+                    user_mention = f"@{target_user.user.username}"
+                else:
+                    user_mention = target_user.user.mention_html()
+            else:
+                user_mention = f"User {user_id}"
+        except Exception:
+            user_mention = f"User {user_id}"
+        
+        # Update message
+        try:
+            await query.message.edit_text(
+                f"✅ <b>User Unmuted</b>\n\n{user_mention} has been unmuted and can now send messages in the group.",
+                reply_markup=None,
+                parse_mode='HTML'
+            )
+        except BadRequest:
+            pass
     except Exception as e:
-        await q.answer(f"Failed: {e}", show_alert=True)
-
+        await query.answer(f"❌ Error: {e}", show_alert=True)
 
 async def ban_from_warn_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    p = q.data.split("_")   # ban_from_warn_<uid>_<cid>
-    uid, cid = int(p[3]), int(p[4])
-    ok, clicker, err = await verify_callback_admin(cid, q, context)
-    if not ok: await q.answer(err, show_alert=True); return
+    """Handle ban from warning button callback - works with anonymous admins"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Parse callback data: ban_from_warn_{user_id}_{chat_id}
+    parts = query.data.split("_")
+    if len(parts) < 5:
+        return
+    
+    user_id = int(parts[3])
+    chat_id = int(parts[4])
+    
+    # Verify the callback user is an admin
+    is_admin, user_id_clicker, admin_message = await verify_callback_admin(chat_id, query, context)
+    
+    if not is_admin:
+        await query.answer(admin_message, show_alert=True)
+        return
+    
+    # Ban user using ban_chat_member (v20+)
     try:
-        await context.bot.ban_chat_member(cid, uid)
-        await add_ban(cid, uid, clicker or 0, "Banned from warn panel")
-        await q.message.edit_reply_markup(reply_markup=None)
-        await q.answer("Banned.", show_alert=True)
+        await context.bot.ban_chat_member(chat_id, user_id)
+        banned_by = user_id_clicker if user_id_clicker else 0
+        await add_ban(chat_id, user_id, banned_by, "Banned from warning")
+        
+        # Update message
+        keyboard = [
+            [InlineKeyboardButton("✅ Unban User", callback_data=f"unban_user_{user_id}_{chat_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        try:
+            await query.message.edit_text(
+                f"🚫 User has been banned!\n\nUser ID: {user_id}",
+                reply_markup=reply_markup
+            )
+        except BadRequest:
+            pass
     except Exception as e:
-        await q.answer(f"Failed: {e}", show_alert=True)
-
+        await query.answer(f"❌ Error: {e}", show_alert=True)
 
 async def mute_from_warn_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    p = q.data.split("_")   # mute_from_warn_<uid>_<cid>
-    uid, cid = int(p[3]), int(p[4])
-    ok, clicker, err = await verify_callback_admin(cid, q, context)
-    if not ok: await q.answer(err, show_alert=True); return
-    until = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())
+    """Handle mute from warning button callback - works with anonymous admins"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Parse callback data: mute_from_warn_{user_id}_{chat_id}
+    parts = query.data.split("_")
+    if len(parts) < 5:
+        return
+    
+    user_id = int(parts[3])
+    chat_id = int(parts[4])
+    
+    # Verify the callback user is an admin
+    is_admin, user_id_clicker, admin_message = await verify_callback_admin(chat_id, query, context)
+    
+    if not is_admin:
+        await query.answer(admin_message, show_alert=True)
+        return
+    
+    # Mute user for 1 hour using restrict_chat_member with until_date
     try:
-        await context.bot.restrict_chat_member(
-            cid, uid,
-            ChatPermissions(can_send_messages=False, can_send_photos=False,
-                            can_send_videos=False, can_send_documents=False),
-            until_date=until,
+        from datetime import datetime, timezone
+        until_date = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())
+        
+        permissions = ChatPermissions(
+            can_send_messages=False,
+            can_send_photos=False,
+            can_send_videos=False,
+            can_send_documents=False,
+            can_send_audios=False,
+            can_send_voice_notes=False,
+            can_send_video_notes=False,
+            can_send_polls=False
         )
-        await add_mute(cid, uid, clicker or 0, "Muted from warn panel", 60)
-        await q.message.edit_reply_markup(reply_markup=None)
-        await q.answer("Muted 1 hour.", show_alert=True)
+        await context.bot.restrict_chat_member(chat_id, user_id, permissions, until_date=until_date)
+        
+        # Get user's warning history for mute reason
+        user_warnings = await get_user_warnings(chat_id, user_id)
+        warning_count = len(user_warnings)
+        
+        # Generate mute reason with Gemini
+        mute_reason = await generate_mute_reason_with_gemini(warning_count, user_warnings, "Muted from warning")
+        
+        muted_by = user_id_clicker if user_id_clicker else 0
+        await add_mute(chat_id, user_id, muted_by, mute_reason, 60)
+        
+        # Update message with unmute button
+        keyboard = [
+            [InlineKeyboardButton("🔊 Unmute User", callback_data=f"unmute_user_{user_id}_{chat_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        try:
+            await query.message.edit_text(
+                f"🔇 User has been muted for 1 hour!\n\nUser ID: {user_id}\nReason: {mute_reason}",
+                reply_markup=reply_markup
+            )
+        except BadRequest:
+            pass
     except Exception as e:
-        await q.answer(f"Failed: {e}", show_alert=True)
+        await query.answer(f"❌ Error: {e}", show_alert=True)
 
-
-# ════════════════════════════════════════════════════════════
-# SETTINGS CALLBACKS
-# ════════════════════════════════════════════════════════════
-
-async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    cid   = int(query.data.split("_")[2])
-    s     = await get_group_settings(cid)
-    if not s:
-        await query.message.edit_text("Group not found!"); return
-    bw  = await get_banned_words(cid)
-    fcs = await get_force_sub_channels(cid)
-    tv  = s.get("warning_timer", 30)
-    td  = f"{tv//60}m" if tv >= 60 else f"{tv}s"
-    text = (
-        f"<b>Group Settings — {s['chat_title']}</b>\n\n"
-        f"Delete Links: {'ON' if s.get('delete_links') else 'OFF'}\n"
-        f"Delete Promotions: {'ON' if s.get('delete_promotions') else 'OFF'}\n"
-        f"Delete Join Msgs: {'ON' if s.get('delete_join_messages') else 'OFF'}\n"
-        f"Sticker Protect: {'ON' if s.get('sticker_protect') else 'OFF'}\n"
-        f"Require Approval: {'ON' if s.get('require_approval') else 'OFF'}\n"
-        f"Auto Approve: {'ON' if s.get('auto_approve') else 'OFF'}\n"
-        f"Max Warnings: {s.get('max_warnings', 3)}\n"
-        f"Max Words: {s.get('max_word_count') or 'Unlimited'}\n"
-        f"Warning Timer: {td}\n"
-        f"Force Sub: {', '.join(c['channel_title'] for c in fcs) or 'None'}\n"
-        f"Banned Words: {', '.join(bw) if bw else 'None'}"
-    )
-    kb = [
-        [InlineKeyboardButton("Set Welcome",         callback_data=f"set_welcome_{cid}")],
-        [InlineKeyboardButton("+ Word",              callback_data=f"add_word_{cid}"),
-         InlineKeyboardButton("- Word",              callback_data=f"remove_word_{cid}")],
-        [InlineKeyboardButton("Word Limit",          callback_data=f"set_word_limit_{cid}"),
-         InlineKeyboardButton("Warn Timer",          callback_data=f"set_timer_{cid}")],
-        [InlineKeyboardButton("Toggle Promos",       callback_data=f"toggle_promo_{cid}"),
-         InlineKeyboardButton("Toggle Links",        callback_data=f"toggle_links_{cid}")],
-        [InlineKeyboardButton("Max Warnings",        callback_data=f"set_max_warnings_{cid}"),
-         InlineKeyboardButton("Toggle Join Delete",  callback_data=f"toggle_join_delete_{cid}")],
-        [InlineKeyboardButton("Toggle Stickers",     callback_data=f"toggle_sticker_{cid}"),
-         InlineKeyboardButton("Toggle Auto Approve", callback_data=f"toggle_autoapprove_{cid}")],
-        [InlineKeyboardButton("Back to Groups",      callback_data="my_groups")],
+# --- ADMIN KEYBOARD HANDLER ---
+async def show_admin_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show admin-only keyboard in group chat"""
+    message = update.message
+    chat = message.chat
+    
+    # Support anonymous admins - check if sender is admin
+    if not await is_sender_admin(chat.id, message, context):
+        await message.reply_text("⚠️ This keyboard is only visible to admins!")
+        return
+    
+    # Create admin keyboard
+    keyboard = [
+        [
+            InlineKeyboardButton("⚠️ Warn", callback_data=f"cmd_warn_{chat.id}"),
+            InlineKeyboardButton("🔇 Mute", callback_data=f"cmd_mute_{chat.id}"),
+            InlineKeyboardButton("🚫 Ban", callback_data=f"cmd_ban_{chat.id}")
+        ],
+        [
+            InlineKeyboardButton("🔊 Unmute", callback_data=f"cmd_unmute_{chat.id}"),
+            InlineKeyboardButton("✅ Unban", callback_data=f"cmd_unban_{chat.id}")
+        ],
+        [
+            InlineKeyboardButton("📋 Reports", callback_data=f"cmd_reports_{chat.id}")
+        ]
     ]
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            logger.error(f"group_settings_handler edit: {e}")
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    admin_msg = """
+🛡️ <b>Admin Commands</b>
+Click a button to use moderation commands:
 
+⚠️ <b>Warn</b> - Warn a user
+🔇 <b>Mute</b> - Mute a user temporarily
+🚫 <b>Ban</b> - Ban a user permanently
+🔊 <b>Unmute</b> - Unmute a muted user
+✅ <b>Unban</b> - Unban a banned user
+📋 <b>Reports</b> - View pending reports
 
-async def _toggle(update, context, field):
-    q = update.callback_query; await q.answer()
-    cid = int(q.data.rsplit("_", 1)[-1])
-    s   = await get_group_settings(cid) or {}
-    nv  = not s.get(field, False)
-    await update_setting(cid, **{field: nv})
-    await q.answer(f"{field.replace('_',' ').title()}: {'ON' if nv else 'OFF'}", show_alert=True)
-    q.data = f"group_settings_{cid}"
-    await group_settings_handler(update, context)
-
-
-async def toggle_promo_handler(u, c):        await _toggle(u, c, "delete_promotions")
-async def toggle_links_handler(u, c):        await _toggle(u, c, "delete_links")
-async def toggle_join_delete_handler(u, c):  await _toggle(u, c, "delete_join_messages")
-async def toggle_sticker_handler(u, c):      await _toggle(u, c, "sticker_protect")
-async def toggle_autoapprove_handler(u, c):  await _toggle(u, c, "auto_approve")
-
-
-async def _prompt(query, context, cid, action, text):
-    context.user_data["awaiting_input"] = cid
-    context.user_data["action"]         = action
-    try:   await query.message.edit_text(text)
-    except BadRequest: pass
-
-
-async def set_welcome_handler(update, context):
-    q = update.callback_query; await q.answer()
-    cid = int(q.data.split("_")[2])
-    await _prompt(q, context, cid, "set_welcome",
-        "Send your HTML welcome message.\nVariables: {USER_NAME} {CHAT_TITLE} {BOT_NAME} {USER_ID}\n\n/cancel to abort.")
-
-async def add_word_handler(update, context):
-    q = update.callback_query; await q.answer()
-    cid = int(q.data.split("_")[2])
-    await _prompt(q, context, cid, "add_word", "Send word to ban:\n\n/cancel to abort.")
-
-async def remove_word_handler(update, context):
-    q = update.callback_query; await q.answer()
-    cid = int(q.data.split("_")[2])
-    words = await get_banned_words(cid)
-    if not words:
-        await q.answer("No banned words!", show_alert=True); return
-    await _prompt(q, context, cid, "remove_word",
-        f"Current: {', '.join(words)}\n\nSend word to remove:\n\n/cancel to abort.")
-
-async def set_timer_handler(update, context):
-    q = update.callback_query; await q.answer()
-    cid = int(q.data.split("_")[2])
-    await _prompt(q, context, cid, "set_timer", "Send warning timer (e.g. 30 or 1m):\n\n/cancel.")
-
-async def set_word_limit_handler(update, context):
-    q = update.callback_query; await q.answer()
-    cid = int(q.data.split("_")[3])
-    await _prompt(q, context, cid, "set_word_limit", "Send max word count (0 = unlimited):\n\n/cancel.")
-
-async def set_max_warnings_handler(update, context):
-    q = update.callback_query; await q.answer()
-    cid = int(q.data.split("_")[3])
-    await _prompt(q, context, cid, "set_max_warnings", "Send max warnings (3–31):\n\n/cancel.")
-
-
-# ════════════════════════════════════════════════════════════
-# PRIVATE TEXT INPUT
-# ════════════════════════════════════════════════════════════
-
-async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "awaiting_input" not in context.user_data:
-        return
-    cid    = context.user_data["awaiting_input"]
-    action = context.user_data.get("action", "")
-    txt    = update.message.text.strip()
-    reply  = ""
-
-    if action == "set_welcome":
-        context.user_data["welcome_message_html"] = txt
-        context.user_data["action"] = "set_welcome_timer"
-        await update.message.reply_text(
-            "Welcome message saved!\nNow send auto-delete timer (0 = never, e.g. 30 or 2m):"
-        )
-        return
-    elif action == "set_welcome_timer":
-        m = re.match(r"^(\d+)\s*(s|m)?$", txt)
-        if m:
-            val  = int(m.group(1))
-            secs = val * 60 if m.group(2) == "m" else val
-            wm   = context.user_data.get("welcome_message_html", "")
-            await update_setting(cid, welcome_message=wm, welcome_timer=secs)
-            reply = f"Welcome message set! Timer: {val}{'m' if m.group(2)=='m' else 's'}."
-        else:
-            await update.message.reply_text("Invalid. Use '0', '30', or '2m'."); return
-    elif action == "add_word":
-        word = txt.lower()
-        await add_banned_word(cid, word, update.effective_user.id)
-        reply = f"Word <b>{word}</b> banned!"
-    elif action == "remove_word":
-        word = txt.lower()
-        await remove_banned_word(cid, word)
-        reply = f"Word <b>{word}</b> removed!"
-    elif action == "set_timer":
-        m = re.match(r"^(\d+)\s*(s|m)?$", txt)
-        if m:
-            secs = int(m.group(1)) * 60 if m.group(2) == "m" else int(m.group(1))
-            await update_setting(cid, warning_timer=secs)
-            reply = f"Warning timer set to {txt}."
-        else:
-            await update.message.reply_text("Invalid. Use '30' or '1m'."); return
-    elif action == "set_word_limit":
-        if txt.isdigit():
-            await update_setting(cid, max_word_count=int(txt))
-            reply = f"Word limit: {txt}." if int(txt) > 0 else "Word limit disabled."
-        else:
-            await update.message.reply_text("Send a number."); return
-    elif action == "set_max_warnings":
-        if txt.isdigit() and 3 <= int(txt) <= 31:
-            await update_setting(cid, max_warnings=int(txt))
-            reply = f"Max warnings set to {txt}."
-        else:
-            await update.message.reply_text("Must be 3–31."); return
-
-    for k in ("awaiting_input", "action", "welcome_message_html"):
-        context.user_data.pop(k, None)
-    kb = [[InlineKeyboardButton("Back to Settings", callback_data=f"group_settings_{cid}")]]
-    await update.message.reply_html(reply, reply_markup=InlineKeyboardMarkup(kb))
-
-
-async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for k in ("awaiting_input", "action", "welcome_message_html"):
-        context.user_data.pop(k, None)
-    await update.message.reply_text("Cancelled.")
-
-
-# ════════════════════════════════════════════════════════════
-# WELCOME MESSAGE
-# ════════════════════════════════════════════════════════════
-
-def parse_welcome_template(html_tmpl, bot_name, user_name, user_id, chat_title):
-    msg = (html_tmpl
-           .replace("{BOT_NAME}", bot_name)
-           .replace("{USER_NAME}", user_name)
-           .replace("{USER_ID}", str(user_id))
-           .replace("{CHAT_TITLE}", chat_title))
-    buttons = re.findall(r"\[([^\]]+)\]\(([^)]+)\)", msg)
-    msg     = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", "", msg).strip()
-    return msg, buttons
-
-
-async def send_welcome_message(chat, new_member, context, settings):
-    try:
-        bot_name  = context.bot.username or "GroupPilot"
-        user_name = (new_member.first_name or new_member.username or "Member").strip()
-        if settings and settings.get("welcome_message"):
-            text, buttons = parse_welcome_template(
-                settings["welcome_message"], bot_name, user_name,
-                new_member.id, chat.title,
-            )
-            kb = []
-            for i in range(0, len(buttons), 2):
-                row = [InlineKeyboardButton(buttons[i][0], url=buttons[i][1])]
-                if i + 1 < len(buttons):
-                    row.append(InlineKeyboardButton(buttons[i+1][0], url=buttons[i+1][1]))
-                kb.append(row)
-            try:
-                wm = await chat.send_message(
-                    text, parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup(kb) if kb else None,
-                )
-                wt = settings.get("welcome_timer", 0)
-                if wt > 0:
-                    await schedule_message_deletion(chat.id, wm.message_id, wt)
-            except BadRequest as e:
-                logger.error(f"send_welcome_message template: {e}")
-                await chat.send_message(f"Welcome {user_name} to {chat.title}!")
-        else:
-            await chat.send_message(f"Welcome to {chat.title}, {user_name}!")
-    except Exception as e:
-        logger.error(f"send_welcome_message: {e}")
-
-
-# ════════════════════════════════════════════════════════════
-# JOIN REQUEST HANDLER
-# ════════════════════════════════════════════════════════════
-
-async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    jr   = update.chat_join_request
-    if not jr:
-        return
-    chat = jr.chat
-    user = jr.from_user
-    s    = await get_group_settings(chat.id)
-    if not s:
-        return
-    await save_join_request(chat.id, user.id, user.username, user.first_name)
-    if s.get("auto_approve", False):
-        try:
-            await context.bot.approve_chat_join_request(chat.id, user.id)
-        except Exception as e:
-            logger.error(f"auto-approve: {e}")
-
-
-# ════════════════════════════════════════════════════════════
-# MEMBER JOIN/LEAVE TRACKING
-# ════════════════════════════════════════════════════════════
-
-async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mc   = update.my_chat_member
-    chat = mc.chat
-    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        return
-    new = mc.new_chat_member
-    old = mc.old_chat_member
-    if old.status == ChatMemberStatus.LEFT and new.status != ChatMemberStatus.LEFT:
-        adder = mc.from_user
-        try:
-            m = await chat.get_member(adder.id)
-            if m.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-                await chat.send_message("Only group admins can add me.")
-                await chat.leave()
-                return
-        except Exception:
-            await chat.leave()
-            return
-        try:
-            bm           = await chat.get_member(context.bot.id)
-            bot_is_admin = bm.status == ChatMemberStatus.ADMINISTRATOR
-        except Exception:
-            bot_is_admin = False
-        if not bot_is_admin:
-            await chat.send_message(
-                "Please make me an admin with Delete Messages permission.\n"
-                "I'll leave now. Add me again after granting admin rights."
-            )
-            await chat.leave()
-            return
-        uname = adder.username or f"user_{adder.id}"
-        await add_group_to_db(chat.id, chat.title, adder.id, uname, bot_is_admin)
-        await chat.send_message(
-            "<b>GroupPilot is now active!</b>\n\n"
-            "<b>Admin Commands:</b>\n"
-            "/warn /mute /unmute /ban /unban\n"
-            "/tagall /note /get /notes /delnote\n"
-            "/forcesub /removeforcesub /filterdeleted\n"
-            "/admin\n\n"
-            "<b>Members:</b>\n"
-            "/report /get &lt;note&gt;\n\n"
-            "Open the Mini App to configure settings.",
-            parse_mode="HTML",
-        )
-
-
-async def user_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cu   = update.chat_member
-    if not cu:
-        return
-    chat = cu.chat
-    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        return
-    new = cu.new_chat_member
-    old = cu.old_chat_member
-    if (old.status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]
-            and new.status == ChatMemberStatus.MEMBER):
-        user = new.user
-        if is_deleted_account(user):
-            try:
-                await context.bot.ban_chat_member(chat.id, user.id)
-                await context.bot.unban_chat_member(chat.id, user.id)
-            except Exception:
-                pass
-            return
-        await track_member_activity(chat.id, user.id, user.username, user.first_name)
-        s = await get_group_settings(chat.id)
-        await send_welcome_message(chat, user, context, s)
-    elif new.status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]:
-        await remove_member(chat.id, new.user.id)
-
-
-# ════════════════════════════════════════════════════════════
-# CHECK MESSAGE — MAIN FILTER
-# ════════════════════════════════════════════════════════════
-
-def caption_has_link(caption, entities):
-    if not caption:
-        return False
-    if entities:
-        for e in entities:
-            if e.type in [MessageEntity.TEXT_LINK, MessageEntity.URL]:
-                return True
-    for pat in [r"https?://\S+", r"www\.\S+", r"t\.me/\S+"]:
-        if re.search(pat, caption, re.IGNORECASE):
-            return True
-    return False
-
-
-async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
-    if not msg:
-        return
-    chat = msg.chat
-    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        return
-    s = await get_group_settings(chat.id)
-    if not s:
-        return
-
-    # ── Determine exempt status ──────────────────────────────
-    exempt = False
-    if msg.sender_chat and msg.sender_chat.id == chat.id:
-        exempt = True
-    elif msg.from_user:
-        if msg.from_user.id == 1087968824:
-            exempt = True
-        else:
-            try:
-                m = await chat.get_member(msg.from_user.id)
-                if m.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-                    exempt = True
-            except Exception:
-                pass
-    if msg.sender_chat and msg.sender_chat.type == ChatType.CHANNEL:
-        exempt = True
-
-    uid  = msg.from_user.id       if msg.from_user else 0
-    uname = ((msg.from_user.username or msg.from_user.first_name)
-             if msg.from_user else None)
-
-    if not exempt and msg.from_user:
-        user = msg.from_user
-        # Deleted account
-        if is_deleted_account(user):
-            try:
-                await msg.delete()
-                await context.bot.ban_chat_member(chat.id, user.id)
-                await context.bot.unban_chat_member(chat.id, user.id)
-            except Exception:
-                pass
-            return
-        # Track activity
-        await track_member_activity(chat.id, uid, user.username, user.first_name)
-        # Force sub
-        not_joined = await check_force_sub(chat.id, uid, context)
-        if not_joined:
-            try: await msg.delete()
-            except Exception: pass
-            await send_force_sub_message(
-                chat, user, not_joined, context,
-                warning_timer=s.get("force_sub_message_timer", 60),
-            )
-            return
-        # Sticker protect
-        if s.get("sticker_protect") and msg.sticker:
-            try:
-                await msg.delete()
-                wm = await chat.send_message(
-                    f"@{uname or uid}, stickers are not allowed here."
-                )
-                wt = s.get("warning_timer", 30)
-                if wt > 0:
-                    await schedule_message_deletion(chat.id, wm.message_id, wt)
-            except Exception as e:
-                logger.error(f"sticker protect: {e}")
-            return
-
-    if exempt:
-        return
-
-    # Photo caption link
-    if s.get("delete_links") and msg.photo and msg.caption:
-        if caption_has_link(msg.caption, msg.caption_entities):
-            try:
-                await msg.delete()
-                await send_warning_with_count(chat, uid, uname,
-                    "Links in photo captions are not allowed", context, "photo_caption_link")
-            except Exception as e:
-                logger.error(f"photo link: {e}")
-            return
-
-    if not msg.text:
-        return
-
-    # Word count
-    max_wc = s.get("max_word_count", 0)
-    if max_wc > 0:
-        wc = len(msg.text.split())
-        if wc > max_wc:
-            try:
-                await msg.delete()
-                await send_warning_with_count(chat, uid, uname,
-                    f"Message too long ({wc} words, max {max_wc})", context, "word_limit")
-            except Exception as e:
-                logger.error(f"word count: {e}")
-            return
-
-    # Promotions
-    if s.get("delete_promotions"):
-        reason = None
-        if is_forwarded_or_channel_message(msg):    reason = "forwarded/channel message"
-        elif msg.via_bot:                           reason = "sent via bot"
-        elif msg.from_user and msg.from_user.is_bot:reason = "bot message"
-        else:
-            ep = r"[\U0001F000-\U0001FFFF\U00002600-\U000027BF\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF]"
-            em = re.findall(ep, msg.text)
-            if len(em) > 15 or (len(msg.text) > 10 and len(em) / len(msg.text) > 0.4):
-                reason = "too many emojis"
-        if reason:
-            try:
-                await msg.delete()
-                await send_warning_with_count(chat, uid, uname,
-                    f"{reason} not allowed", context, reason.replace(" ","_"))
-            except Exception as e:
-                logger.error(f"promo: {e}")
-            return
-
-    # Links
-    if s.get("delete_links"):
-        has_link = bool(re.search(r"(https?://\S+|www\.\S+|t\.me/\S+)", msg.text))
-        if not has_link and msg.entities:
-            for e in msg.entities:
-                if e.type in [MessageEntity.URL, MessageEntity.TEXT_LINK]:
-                    has_link = True
-        if has_link:
-            try:
-                await msg.delete()
-                await send_warning_with_count(chat, uid, uname,
-                    "Links are not allowed", context, "link")
-            except Exception as e:
-                logger.error(f"link: {e}")
-            return
-
-    # Banned words
-    bwords = await get_banned_words(chat.id)
-    if bwords:
-        low = msg.text.lower()
-        for word in bwords:
-            if re.search(r"\b" + re.escape(word) + r"\b", low):
-                try:
-                    await msg.delete()
-                    await send_warning_with_count(chat, uid, uname,
-                        "banned word", context, "banned_word")
-                except Exception as e:
-                    logger.error(f"banned word: {e}")
-                return
-
-
-# ════════════════════════════════════════════════════════════
-# /start /help /mygroups  (private chat)
-# ════════════════════════════════════════════════════════════
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    kb   = [
-        [InlineKeyboardButton("Add to Group", url=f"https://t.me/{context.bot.username}?startgroup=true")],
-        [InlineKeyboardButton("My Groups",    callback_data="my_groups")],
-        [InlineKeyboardButton("Help",         callback_data="help")],
-    ]
-    text = (
-        f"Welcome {user.mention_html()}!\n\n"
-        "<b>GroupPilot</b> — Intelligent Group Moderation\n\n"
-        "Add me to your group to get started."
-    )
-    if update.message:
-        await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup(kb))
-    elif update.callback_query:
-        try:
-            await update.callback_query.message.edit_text(
-                text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML",
-            )
-        except BadRequest:
-            pass
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "<b>GroupPilot Commands</b>\n\n"
-        "<b>Admin (Group):</b>\n"
-        "/warn /mute /unmute /ban /unban\n"
-        "/tagall [msg] — tag all tracked members\n"
-        "/note &lt;name&gt; &lt;text&gt; — save note\n"
-        "/get &lt;name&gt; — retrieve note\n"
-        "/notes — list all notes\n"
-        "/delnote &lt;name&gt; — delete note\n"
-        "/forcesub @ch — add force subscribe\n"
-        "/removeforcesub @ch — remove it\n"
-        "/filterdeleted — kick deleted accounts\n"
-        "/admin — show admin keyboard\n\n"
-        "<b>Members (Group):</b>\n"
-        "/report — reply to user to report them\n"
-        "/get &lt;name&gt; — read a note\n\n"
-        "<b>Private:</b>\n"
-        "/start /mygroups /help"
-    )
-    if update.message:
-        await update.message.reply_html(text)
-    elif update.callback_query:
-        try:
-            await update.callback_query.message.edit_text(text, parse_mode="HTML")
-        except BadRequest:
-            pass
-
-
-async def my_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid    = update.effective_user.id
-    groups = await get_user_groups(uid)
-    bot_u  = context.bot.username or "GroupPilotBot"
-    if not groups:
-        text = "You haven't added me to any groups yet!"
-        kb   = [[InlineKeyboardButton("Add to Group",
-                    url=f"https://t.me/{bot_u}?startgroup=true")]]
-    else:
-        text = "<b>Your Groups:</b>\nSelect a group to manage:"
-        kb   = [[InlineKeyboardButton(g["chat_title"],
-                    callback_data=f"group_settings_{g['chat_id']}")] for g in groups]
-        kb.append([InlineKeyboardButton("Back", callback_data="back_to_main")])
-    rm = InlineKeyboardMarkup(kb)
-    if update.callback_query:
-        try:
-            await update.callback_query.message.edit_text(text, reply_markup=rm, parse_mode="HTML")
-        except BadRequest:
-            pass
-    else:
-        await update.message.reply_html(text, reply_markup=rm)
-
+This keyboard is only visible to admins.
+    """
+    
+    await message.reply_html(admin_msg, reply_markup=reply_markup)
 
 async def admin_keyboard_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    parts = q.data.split("_")
-    if len(parts) < 3: return
-    cmd, cid = parts[1], int(parts[2])
-    ok, _, err = await verify_callback_admin(cid, q, context)
-    if not ok: await q.answer(err, show_alert=True); return
-    tips = {
-        "warn":    "/warn @user reason",
-        "mute":    "/mute @user 1h reason",
-        "ban":     "/ban @user reason",
-        "unmute":  "/unmute @user  (resets warnings to 0)",
-        "unban":   "/unban <user_id>",
-        "reports": "Check Mini App → Reports tab.",
-        "tagall":  "/tagall Your announcement",
+    """Handle admin keyboard button clicks - works with anonymous admins"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Parse callback data
+    parts = query.data.split("_")
+    if len(parts) < 3:
+        return
+    
+    command = parts[1]
+    chat_id = int(parts[2])
+    
+    # Verify the callback user is an admin
+    is_admin, user_id_clicker, admin_message = await verify_callback_admin(chat_id, query, context)
+    
+    if not is_admin:
+        await query.answer(admin_message, show_alert=True)
+        return
+    
+    # Show usage instructions
+    instructions = {
+        "warn": "⚠️ <b>Warn Usage</b>\n\nReply to a message and use: /warn @username reason\nExample: /warn @user123 Spamming",
+        "mute": "🔇 <b>Mute Usage</b>\n\nReply to a message and use: /mute @username duration reason\nExample: /mute @user123 1h Spamming\nDuration: 10m, 1h, 1d, 1w",
+        "ban": "🚫 <b>Ban Usage</b>\n\nReply to a message and use: /ban @username reason\nExample: /ban @user123 Repeated spam",
+        "unmute": "🔊 <b>Unmute Usage</b>\n\nUse: /unmute @username\nExample: /unmute @user123",
+        "unban": "✅ <b>Unban Usage</b>\n\nUse: /unban @username\nExample: /unban @user123",
+        "reports": "📋 <b>View Reports</b>\n\nReports are sent privately to admins. Check your private messages for new reports."
     }
-    await q.message.reply_html(f"<b>{cmd.title()} usage:</b>\n{tips.get(cmd,'?')}")
+    
+    instruction_text = instructions.get(command, "Unknown command")
+    
+    try:
+        await query.message.reply_html(instruction_text)
+    except Exception as e:
+        logger.error(f"Error sending instructions: {e}")
 
+# --- ORIGINAL BOT COMMAND HANDLERS ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    user = update.effective_user
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Bot to Group", url=f"https://t.me/{context.bot.username}?startgroup=true")],
+        [InlineKeyboardButton("📋 My Groups", callback_data="my_groups")],
+        [InlineKeyboardButton("❓ Help", callback_data="help")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    welcome_text = f"""
+👋 Welcome {user.mention_html()}!
+I'm a powerful group moderation bot that helps you:
+✅ Delete messages with banned words
+✅ Delete links and URLs (including photo captions)
+✅ Delete promotional/forwarded messages
+✅ Limit maximum words per message
+✅ Auto-delete warning messages after set time
+✅ Custom welcome messages with HTML support
+✅ Admin commands: /warn, /mute, /ban, /unmute, /unban
+✅ User reports: /report
+✅ Auto-mute users who reach max warnings (3-31)
+🚀 Get started by adding me to your group!
+    """
+    await update.message.reply_html(welcome_text, reply_markup=reply_markup)
 
-# ════════════════════════════════════════════════════════════
-# CALLBACK ROUTER
-# ════════════════════════════════════════════════════════════
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
+    help_text = """
+📚 <b>Bot Commands & Features</b>
+<b>Admin Commands (Group only):</b>
+/warn <username> <reason> - Warn a user (auto-mutes at max warnings)
+/mute <username> <duration> <reason> - Mute a user (supports 10m, 1h, 1d, 1w)
+/ban <username> <reason> - Ban a user
+/unmute <username> - Unmute a user
+/unban <username> - Unban a user
+/admin - Show admin command keyboard
+
+<b>Member Commands (Group only):</b>
+/report <username> <reason> - Report a user to admins (cannot report admins)
+
+<b>Commands (Use in private chat):</b>
+/start - Start the bot and see main menu
+/mygroups - View your groups
+/help - Show this help message
+
+<b>Features:</b>
+• <b>Banned Words:</b> Auto-delete specific words.
+• <b>Links:</b> Auto-delete messages and photo captions containing http/https/t.me links.
+• <b>Word Limit:</b> Delete messages that are too long (e.g., >100 words).
+• <b>Anti-Promo:</b> Delete forwarded messages, spam bots, and promotional text (excessive emojis).
+• <b>Timer:</b> Set how long warning messages stay visible.
+• <b>Auto-Mute:</b> Users reaching max warnings (3-31) are automatically muted for 1 hour.
+• <b>Welcome Messages:</b> Custom HTML welcome messages for new members.
+<b>Note:</b> Admins and Anonymous Admins are exempt from deletion.
+    """
+    if update.message:
+        await update.message.reply_html(help_text)
+    else:
+        try:
+            await update.callback_query.message.edit_text(help_text, parse_mode='HTML')
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                pass
+            else:
+                logger.error(f"Error in help command: {e}")
+
+async def my_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user's groups"""
+    user_id = update.effective_user.id
+    groups = await get_user_groups(user_id)
+    
+    if not groups:
+        text = "❌ You haven't added me to any groups yet!\n\nClick the button below to add me to a group."
+        keyboard = [[InlineKeyboardButton("➕ Add to Group", url=f"https://t.me/{context.bot.username}?startgroup=true")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+    else:
+        text = "📋 <b>Your Groups:</b>\n\nSelect a group to manage settings:"
+        keyboard = []
+        for group in groups:
+            keyboard.append([InlineKeyboardButton(
+                f"🔧 {group['chat_title']}",
+                callback_data=f"group_settings_{group['chat_id']}"
+            )])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_main")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        try:
+            await update.callback_query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                pass
+            else:
+                logger.error(f"Error in my_groups: {e}")
+    else:
+        await update.message.reply_html(text, reply_markup=reply_markup)
+
+async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show group settings"""
+    query = update.callback_query
+    await query.answer()
+    chat_id = int(query.data.split("_")[2])
+    
+    settings = await get_group_settings(chat_id)
+    if not settings:
+        try:
+            await query.message.edit_text("❌ Group not found!")
+        except BadRequest:
+            pass
+        return
+    
+    banned_words = await get_banned_words(chat_id)
+    banned_words_text = ", ".join(banned_words) if banned_words else "None"
+    
+    promo_status = "✅ Enabled" if settings.get('delete_promotions', False) else "❌ Disabled"
+    link_status = "✅ Enabled" if settings.get('delete_links', False) else "❌ Disabled"
+    word_limit = settings.get('max_word_count', 0)
+    word_limit_status = f"{word_limit} words" if word_limit > 0 else "❌ Disabled (Unlimited)"
+    
+    timer_val = settings.get('warning_timer', 30)
+    if timer_val >= 60:
+        timer_display = f"{timer_val // 60}m"
+    else:
+        timer_display = f"{timer_val}s"
+    
+    welcome_msg = settings.get('welcome_message', None)
+    welcome_status = "✅ Enabled" if welcome_msg else "❌ Not Set"
+    welcome_timer_val = settings.get('welcome_timer', 0)
+    welcome_timer_display = f"{welcome_timer_val}s" if welcome_timer_val > 0 else "Never"
+    
+    delete_join = settings.get('delete_join_messages', False)
+    delete_join_status = "✅ Enabled" if delete_join else "❌ Disabled"
+    
+    max_warnings = settings.get('max_warnings', 3)
+    max_warnings_status = f"{max_warnings}"
+
+    require_approval = settings.get('require_approval', False)
+    require_approval_status = "✅ Enabled" if require_approval else "❌ Disabled"
+    auto_approve = settings.get('auto_approve', False)
+    auto_approve_status = "✅ Enabled" if auto_approve else "❌ Disabled"
+    sticker_protect = settings.get('sticker_protect', False)
+    sticker_protect_status = "✅ Enabled" if sticker_protect else "❌ Disabled"
+    force_sub_channel = settings.get('force_sub_channel', None)
+    force_sub_status = f"@{force_sub_channel}" if force_sub_channel else "❌ Not Set"
+    member_count = settings.get('member_count', 0)
+
+    text = f"""
+⚙️ <b>Group Settings</b>
+📱 Group: {settings['chat_title']}
+👤 Added by: @{settings['added_by_username']}
+👥 <b>Member Count:</b> {member_count}
+🎉 <b>Welcome Message:</b> {welcome_status} (Delete in: {welcome_timer_display})
+🚫 <b>Banned Words:</b>
+{banned_words_text}
+📝 <b>Max Word Limit:</b> {word_limit_status}
+📨 <b>Delete Promotions (Forwards/Bots/Emojis):</b> {promo_status}
+🌐 <b>Delete Links (URLs):</b> {link_status}
+⏱ <b>Warning Delete Timer:</b> {timer_display}
+⚠️ <b>Max Warnings:</b> {max_warnings_status} (Auto-mute at limit)
+👋 <b>Delete Join Messages:</b> {delete_join_status}
+🔐 <b>Require Approval:</b> {require_approval_status}
+✅ <b>Auto Approve:</b> {auto_approve_status}
+🎭 <b>Sticker Protect:</b> {sticker_protect_status}
+📢 <b>Force Subscribe:</b> {force_sub_status}
+    """
+    
+    keyboard = [
+        [InlineKeyboardButton("🎉 Set Welcome Message", callback_data=f"set_welcome_{chat_id}")],
+        [InlineKeyboardButton("➕ Add Banned Word", callback_data=f"add_word_{chat_id}"),
+         InlineKeyboardButton("➖ Remove Word", callback_data=f"remove_word_{chat_id}")],
+        [InlineKeyboardButton("📝 Word Count Limit", callback_data=f"set_word_limit_{chat_id}"),
+         InlineKeyboardButton("⏱ Warning Timer", callback_data=f"set_timer_{chat_id}")],
+        [InlineKeyboardButton("📨 Toggle Promotions", callback_data=f"toggle_promo_{chat_id}"),
+         InlineKeyboardButton("🌐 Toggle Links", callback_data=f"toggle_links_{chat_id}")],
+        [InlineKeyboardButton("⚠️ Max Warnings", callback_data=f"set_max_warnings_{chat_id}"),
+         InlineKeyboardButton("👋 Toggle Join Delete", callback_data=f"toggle_join_delete_{chat_id}")],
+        [InlineKeyboardButton("🔙 Back to Groups", callback_data="my_groups")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            pass
+        else:
+            logger.error(f"Error editing message in settings: {e}")
+
+async def set_welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle welcome message setup"""
+    query = update.callback_query
+    await query.answer()
+    chat_id = int(query.data.split("_")[2])
+    
+    context.user_data['awaiting_input'] = chat_id
+    context.user_data['action'] = 'set_welcome'
+    
+    text = """
+🎉 <b>Set Welcome Message</b>
+You can use HTML formatting and variables:
+• <code>{BOT_NAME}</code> - Bot's username
+• <code>{USER_NAME}</code> - Member's name
+• <code>{USER_ID}</code> - Member's user ID
+• <code>{CHAT_TITLE}</code> - Group's title
+
+<b>HTML Example:</b>
+<code>👋 Welcome {USER_NAME} to {CHAT_TITLE}!
+I'm {BOT_NAME}, your group's guardian.</code>
+
+<b>With Inline Buttons Example:</b>
+<code>Welcome to {CHAT_TITLE}! {USER_NAME}
+📋 Read rules: [Rules](http://t.me/yourgroup/rules)
+💬 Chat: [Join](http://t.me/yourgroup)</code>
+
+Button Format: <code>[Button Text](https://link)</code>
+
+⏱ After setting message, I'll ask for auto-delete timer (0 = never delete).
+✏️ Send your welcome message HTML now:
+    """
+    await query.message.edit_text(text, parse_mode='HTML')
+
+async def set_welcome_timer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle welcome timer setup"""
+    chat_id = context.user_data['awaiting_input']
+    context.user_data['action'] = 'set_welcome_timer'
+    
+    text = """
+⏱ <b>Set Welcome Message Auto-Delete Timer</b>
+How long should welcome messages stay before deleting?
+Examples:
+• <code>0</code> (Never delete)
+• <code>30</code> (30 seconds)
+• <code>1m</code> (1 minute)
+• <code>5m</code> (5 minutes)
+
+✏️ Send the time now:
+    """
+    await update.message.reply_html(text)
+
+async def add_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = int(query.data.split("_")[2])
+    
+    context.user_data['awaiting_input'] = chat_id
+    context.user_data['action'] = 'add_word'
+    
+    text = "✏️ Please send the word you want to ban.\n\n💡 Send /cancel to cancel."
+    await query.message.edit_text(text)
+
+async def remove_word_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = int(query.data.split("_")[2])
+    
+    banned_words = await get_banned_words(chat_id)
+    if not banned_words:
+        await query.answer("No banned words to remove!", show_alert=True)
+        return
+    
+    context.user_data['awaiting_input'] = chat_id
+    context.user_data['action'] = 'remove_word'
+    
+    text = f"✏️ Current banned words:\n{', '.join(banned_words)}\n\nSend the word you want to remove.\n\n💡 Send /cancel to cancel."
+    await query.message.edit_text(text)
+
+async def set_timer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = int(query.data.split("_")[2])
+    
+    context.user_data['awaiting_input'] = chat_id
+    context.user_data['action'] = 'set_timer'
+    
+    text = """
+⏱ <b>Set Warning Deletion Time</b>
+How long should warning messages stay before deleting?
+Examples:
+• <code>5s</code> (5 seconds)
+• <code>1m</code> (1 minute)
+• <code>30</code> (30 seconds)
+
+✏️ Send the time duration now.
+    """
+    await query.message.edit_text(text, parse_mode='HTML')
+
+async def set_word_limit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = int(query.data.split("_")[3])
+    
+    context.user_data['awaiting_input'] = chat_id
+    context.user_data['action'] = 'set_word_limit'
+    
+    text = """
+📝 <b>Set Max Word Count</b>
+Any message with more words than this number will be deleted.
+Examples:
+• <code>100</code> (Max 100 words)
+• <code>35</code> (Max 35 words)
+• <code>2</code> (Max 2 words)
+• <code>0</code> (Disable limit / Unlimited)
+
+✏️ Send the maximum number of words allowed now.
+    """
+    await query.message.edit_text(text, parse_mode='HTML')
+
+# NEW: Set max warnings handler
+async def set_max_warnings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle max warnings setup"""
+    query = update.callback_query
+    await query.answer()
+    chat_id = int(query.data.split("_")[3])
+    
+    context.user_data['awaiting_input'] = chat_id
+    context.user_data['action'] = 'set_max_warnings'
+    
+    text = """
+⚠️ <b>Set Maximum Warnings Before Auto-Mute</b>
+When a user reaches this many warnings, they will be automatically muted for 1 hour.
+Allowed range: 3 to 31
+Examples:
+• <code>3</code> (Auto-mute after 3 warnings)
+• <code>5</code> (Auto-mute after 5 warnings)
+• <code>10</code> (Auto-mute after 10 warnings)
+
+✏️ Send the maximum number of warnings (3-31) now.
+    """
+    await query.message.edit_text(text, parse_mode='HTML')
+
+async def toggle_promo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = int(query.data.split("_")[2])
+    
+    settings = await get_group_settings(chat_id)
+    new_value = not settings.get('delete_promotions', False)
+    await update_promotion_setting(chat_id, new_value)
+    
+    status = "enabled" if new_value else "disabled"
+    await query.answer(f"Promotion deletion {status}!", show_alert=True)
+    await group_settings_handler(update, context)
+
+async def toggle_links_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle toggling link deletion"""
+    query = update.callback_query
+    await query.answer()
+    chat_id = int(query.data.split("_")[2])
+    
+    settings = await get_group_settings(chat_id)
+    new_value = not settings.get('delete_links', False)
+    await update_link_setting(chat_id, new_value)
+    
+    status = "enabled" if new_value else "disabled"
+    await query.answer(f"Link deletion {status}!", show_alert=True)
+    await group_settings_handler(update, context)
+
+async def toggle_join_delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle toggling join message deletion"""
+    query = update.callback_query
+    await query.answer()
+    chat_id = int(query.data.split("_")[3])
+    
+    settings = await get_group_settings(chat_id)
+    new_value = not settings.get('delete_join_messages', False)
+    await update_delete_join_messages(chat_id, new_value)
+    
+    status = "enabled" if new_value else "disabled"
+    await query.answer(f"Join message deletion {status}!", show_alert=True)
+    await group_settings_handler(update, context)
+
+async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'awaiting_input' not in context.user_data:
+        return
+    
+    chat_id = context.user_data['awaiting_input']
+    action = context.user_data['action']
+    user_text = update.message.text.strip()
+    
+    if action == 'set_welcome':
+        context.user_data['welcome_message_html'] = user_text
+        context.user_data['action'] = 'set_welcome_timer'
+        
+        text = """
+⏱ <b>Set Welcome Message Auto-Delete Timer</b>
+How long should welcome messages stay before deleting?
+Examples:
+• <code>0</code> (Never delete)
+• <code>30</code> (30 seconds)
+• <code>1m</code> (1 minute)
+• <code>5m</code> (5 minutes)
+
+✏️ Send the time now:
+        """
+        await update.message.reply_html(text)
+        return
+    
+    elif action == 'set_welcome_timer':
+        welcome_html = context.user_data.get('welcome_message_html', '')
+        match = re.match(r'^(\d+)\s*(s|m)?$', user_text.strip())
+        if match:
+            value = int(match.group(1))
+            unit = match.group(2)
+            if unit == 'm':
+                timer_seconds = value * 60
+                display_unit = "minutes"
+            else:
+                timer_seconds = value
+                display_unit = "seconds"
+            await update_welcome_message(chat_id, welcome_html, timer_seconds)
+            text = f"✅ Welcome message set! Auto-delete in <b>{value} {display_unit}</b>"
+        else:
+            text = "❌ Invalid format! Please use '0', '30s', or '1m'"
+            await update.message.reply_html(text)
+            return
+    
+    elif action == 'add_word':
+        user_text_lower = user_text.lower()
+        await add_banned_word(chat_id, user_text_lower, update.effective_user.id)
+        text = f"✅ Word '<b>{user_text_lower}</b>' added to banned words!"
+    
+    elif action == 'remove_word':
+        user_text_lower = user_text.lower()
+        await remove_banned_word(chat_id, user_text_lower)
+        text = f"✅ Word '<b>{user_text_lower}</b>' removed from banned words!"
+    
+    elif action == 'set_timer':
+        match = re.match(r'^(\d+)\s*(s|m)?$', user_text)
+        if match:
+            value = int(match.group(1))
+            unit = match.group(2)
+            if unit == 'm':
+                seconds = value * 60
+                display_unit = "minutes"
+            else:
+                seconds = value
+                display_unit = "seconds"
+            await update_warning_timer(chat_id, seconds)
+            text = f"✅ Warning deletion timer set to <b>{value} {display_unit}</b>!"
+        else:
+            text = "❌ Invalid format! Please use '10s' for seconds or '1m' for minutes."
+    
+    elif action == 'set_word_limit':
+        if user_text.isdigit():
+            limit = int(user_text)
+            await update_word_limit(chat_id, limit)
+            if limit == 0:
+                text = "✅ Word limit disabled. Messages can be any length."
+            else:
+                text = f"✅ Max word count set to <b>{limit} words</b>!"
+        else:
+            text = "❌ Invalid number! Please send a number like 100, 35, or 2."
+    
+    elif action == 'set_max_warnings':
+        if user_text.isdigit():
+            max_warnings = int(user_text)
+            if 3 <= max_warnings <= 31:
+                await update_max_warnings(chat_id, max_warnings)
+                text = f"✅ Max warnings set to <b>{max_warnings}</b>! Users will be auto-muted after reaching this limit."
+            else:
+                text = "❌ Invalid number! Max warnings must be between 3 and 31."
+                await update.message.reply_html(text)
+                return
+        else:
+            text = "❌ Invalid number! Please send a number between 3 and 31."
+            await update.message.reply_html(text)
+            return
+    
+    # Clear state
+    if 'awaiting_input' in context.user_data:
+        del context.user_data['awaiting_input']
+    if 'action' in context.user_data:
+        del context.user_data['action']
+    if 'welcome_message_html' in context.user_data:
+        del context.user_data['welcome_message_html']
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back to Settings", callback_data=f"group_settings_{chat_id}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_html(text, reply_markup=reply_markup)
+
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'awaiting_input' in context.user_data:
+        del context.user_data['awaiting_input']
+        del context.user_data['action']
+    if 'welcome_message_html' in context.user_data:
+        del context.user_data['welcome_message_html']
+    await update.message.reply_text("✅ Operation cancelled.")
+
+def parse_welcome_message(html_template: str, bot_name: str, user_name: str, user_id: int, chat_title: str) -> tuple:
+    """Parse welcome message template and extract buttons"""
+    message = html_template.replace('{BOT_NAME}', bot_name)
+    message = message.replace('{USER_NAME}', user_name)
+    message = message.replace('{USER_ID}', str(user_id))
+    message = message.replace('{CHAT_TITLE}', chat_title)
+    
+    button_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
+    buttons = re.findall(button_pattern, message)
+    message = re.sub(button_pattern, '', message).strip()
+    
+    return message, buttons
+
+async def send_welcome_message(chat: any, new_member: any, context: ContextTypes.DEFAULT_TYPE, settings: dict):
+    """Send custom welcome message to new member"""
+    try:
+        if settings and settings.get('welcome_message'):
+            welcome_html = settings['welcome_message']
+            bot_name = context.bot.username or "Bot"
+            user_name = new_member.first_name or new_member.username or "Member"
+            user_id = new_member.id
+            message_text, buttons = parse_welcome_message(welcome_html, bot_name, user_name, user_id, chat.title)
+            
+            # Translation logic
+            user_lang = new_member.language_code or 'en'
+            if user_lang != 'en':
+                # Prepare texts to translate: message_text and button texts
+                texts_to_translate = [message_text]
+                for btn_text, _ in buttons:
+                    texts_to_translate.append(btn_text)
+                
+                text_to_translate = "\n---\n".join(texts_to_translate)
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+                prompt = f"Translate the following texts to {user_lang}, preserving all HTML tags, emojis, and formatting intact. Each section separated by --- should be translated separately and output in the same order separated by ---:\n{text_to_translate}"
+                
+                payload = {
+                    "contents": [({
+                        "parts": [({
+                            "text": prompt
+                        })],
+                    })],
+                    "generationConfig": {
+                        "maxOutputTokens": 500
+                    }
+                }
+                headers = {"Content-Type": "application/json"}
+                
+                try:
+                    response = requests.post(url, headers=headers, data=json.dumps(payload))
+                    if response.status_code == 200:
+                        result = response.json()
+                        translated_text = result['candidates'][0]['content']['parts'][0]['text']
+                        translated_parts = translated_text.split("\n---\n")
+                        if len(translated_parts) == len(texts_to_translate):
+                            message_text = translated_parts[0]
+                            for i in range(len(buttons)):
+                                buttons[i] = (translated_parts[i+1], buttons[i][1])
+                except Exception as e:
+                    logger.error(f"Error translating welcome message: {e}")
+                    # Fallback to English
+            
+            keyboard = []
+            if buttons:
+                for i in range(0, len(buttons), 2):
+                    row = []
+                    btn_text, btn_url = buttons[i]
+                    row.append(InlineKeyboardButton(btn_text, url=btn_url))
+                    if i + 1 < len(buttons):
+                        btn_text2, btn_url2 = buttons[i + 1]
+                        row.append(InlineKeyboardButton(btn_text2, url=btn_url2))
+                    keyboard.append(row)
+            
+            reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+            
+            try:
+                welcome_msg = await chat.send_message(message_text, reply_markup=reply_markup, parse_mode='HTML')
+                welcome_timer = settings.get('welcome_timer', 0)
+                if welcome_timer > 0:
+                    await schedule_message_deletion(chat.id, welcome_msg.message_id, welcome_timer)
+            except BadRequest as e:
+                logger.error(f"Error sending welcome message: {e}")
+                default_welcome = f"👋 Welcome {new_member.mention_html()} to {chat.title}!"
+                try:
+                    welcome_msg = await chat.send_message(default_welcome, parse_mode='HTML')
+                except Exception as ex:
+                    logger.error(f"Error sending fallback welcome: {ex}")
+        else:
+            default_welcome = f"👋 Welcome {new_member.mention_html()} to {chat.title}!"
+            try:
+                welcome_msg = await chat.send_message(default_welcome, parse_mode='HTML')
+            except Exception as e:
+                logger.error(f"Error sending default welcome: {e}")
+    except Exception as e:
+        logger.error(f"Error in send_welcome_message: {e}")
+
+async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track when bot is added/removed from group"""
+    my_chat_member = update.my_chat_member
+    chat = my_chat_member.chat
+    
+    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        return
+    
+    new_member = my_chat_member.new_chat_member
+    old_member = my_chat_member.old_chat_member
+    
+    if old_member.status == ChatMemberStatus.LEFT and new_member.status != ChatMemberStatus.LEFT:
+        added_by = my_chat_member.from_user
+        
+        try:
+            member = await chat.get_member(added_by.id)
+            if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                await chat.send_message("⚠️ Only group admins can add me!")
+                await chat.leave()
+                return
+        except Exception as e:
+            logger.error(f"Error checking admin status: {e}")
+            await chat.leave()
+            return
+        
+        try:
+            bot_member = await chat.get_member(context.bot.id)
+            bot_is_admin = bot_member.status == ChatMemberStatus.ADMINISTRATOR
+        except Exception:
+            bot_is_admin = False
+        
+        if not bot_is_admin:
+            await chat.send_message(
+                "⚠️ Please make me an admin with 'Delete Messages' permission!\n\n"
+                "I'll leave now, add me again after making me admin."
+            )
+            await chat.leave()
+            return
+        
+        username = added_by.username or f"user_{added_by.id}"
+        chat_username = chat.username if hasattr(chat, 'username') else None
+        await add_group_to_db(chat.id, chat.title, added_by.id, username, bot_is_admin, chat_username)
+        
+        welcome_text = f"""
+🎉 Thank you for adding me!
+✅ I'm now protecting this group!
+👤 Added by: @{username}
+⚙️ To configure settings, open a private chat with me and click "My Groups".
+📝 You can also set a custom welcome message for new members!
+
+<b>Admin Commands:</b>
+/warn <username> <reason> - Warn a user (auto-mutes at max warnings)
+/mute <username> <duration> <reason> - Mute a user
+/ban <username> <reason> - Ban a user
+/admin - Show admin command keyboard
+
+<b>Member Commands:</b>
+/report <username> <reason> - Report a user to admins
+        """
+        await chat.send_message(welcome_text, parse_mode='HTML')
+
+async def user_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle when any user joins or leaves the group"""
+    chat_member_update = update.chat_member
+    if not chat_member_update:
+        return
+    
+    chat = chat_member_update.chat
+    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        return
+    
+    new_member = chat_member_update.new_chat_member
+    old_member = chat_member_update.old_chat_member
+    user = new_member.user
+
+    # FIXED: Use ChatMemberStatus.BANNED instead of non-existent .KICKED
+    if old_member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED] and new_member.status == ChatMemberStatus.MEMBER:
+        logger.info(f"New member {user.id} ({user.first_name}) joined group {chat.id}")
+        settings = await get_group_settings(chat.id)
+
+        # Upsert user and group_member records
+        await upsert_user(user.id, user.username, user.first_name, user.last_name)
+        await upsert_group_member(chat.id, user.id, user.username, user.first_name)
+        await increment_member_count(chat.id)
+
+        # Auto-approve join request if it exists
+        if settings and settings.get('auto_approve', False):
+            try:
+                await context.bot.approve_chat_join_request(chat.id, user.id)
+                await update_join_request_status(chat.id, user.id, 'approved', context.bot.id)
+            except Exception:
+                pass
+
+        # Track join message for deletion if enabled
+        if settings and settings.get('delete_join_messages', False):
+            context.user_data['last_join_message_id'] = None
+
+        # Force sub check: if active force_subs exist, warn the user
+        is_subscribed, missing_channels = await check_user_force_sub(chat.id, user.id, context)
+        if not is_subscribed and missing_channels:
+            timer = settings.get('force_sub_message_timer', 60) if settings else 60
+            channel_links = "\n".join([
+                f"• <a href='https://t.me/{fs['channel_username']}'>{fs['channel_title'] or fs['channel_username']}</a>"
+                if fs.get('channel_username') else f"• {fs.get('channel_title', 'Channel')}"
+                for fs in missing_channels
+            ])
+            force_msg = await chat.send_message(
+                f"👋 Welcome {user.mention_html()}!\n\n"
+                f"⚠️ Please subscribe to the following channel(s) to stay in this group:\n{channel_links}",
+                parse_mode='HTML'
+            )
+            if timer > 0:
+                await schedule_message_deletion(chat.id, force_msg.message_id, timer)
+            return  # Skip normal welcome if force sub is pending
+
+        await send_welcome_message(chat, user, context, settings)
+
+    elif new_member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]:
+        # User left or was banned — remove from group_members, decrement count
+        logger.info(f"Member {user.id} left/banned from group {chat.id}")
+        await remove_group_member(chat.id, user.id)
+        await decrement_member_count(chat.id)
+
+async def send_warning_with_count(chat: any, user_id: int, username: str, reason: str, context: ContextTypes.DEFAULT_TYPE, offense_type: str = "general"):
+    """
+    Send a warning message with count (except for banned words)
+    and add warning to database if not a banned word offense
+    """
+    warnings = await get_user_warnings(chat.id, user_id)
+    warning_count = len(warnings)
+    
+    settings = await get_group_settings(chat.id)
+    max_warnings = settings.get('max_warnings', 3) if settings else 3
+    
+    user_mention = f"@{username}" if username else f"User {user_id}"
+    
+    # For banned words, don't add to warning count and don't show count
+    if offense_type == "banned_word":
+        warning_msg = f"⚠️ {user_mention}, your message was hidden because it contained a banned word."
+        await chat.send_message(warning_msg)
+        return
+    
+    # For all other offenses, add warning and show count
+    await add_warning(chat.id, user_id, 0, reason, username)
+    warning_count += 1
+    
+    warning_msg = f"""
+⚠️ <b>WARNING #{warning_count}/{max_warnings}</b>
+👤 User: {user_mention}
+📝 Reason: {reason}
+
+This user has been warned by the bot.
+    """
+    
+    # Check if max warnings reached - auto-mute
+    if warning_count >= max_warnings:
+        # Get updated warnings for mute reason
+        updated_warnings = await get_user_warnings(chat.id, user_id)
+        
+        # Generate mute reason with Gemini
+        mute_reason = await generate_mute_reason_with_gemini(warning_count, updated_warnings, f"Maximum warnings reached: {offense_type}")
+        
+        # Auto-mute user for 1 hour
+        duration_seconds = 3600  # 1 hour
+        until_date = int((datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)).timestamp())
+        
+        try:
+            permissions = ChatPermissions(
+                can_send_messages=False,
+                can_send_photos=False,
+                can_send_videos=False,
+                can_send_documents=False,
+                can_send_audios=False,
+                can_send_voice_notes=False,
+                can_send_video_notes=False,
+                can_send_polls=False
+            )
+            await context.bot.restrict_chat_member(chat.id, user_id, permissions, until_date=until_date)
+            await add_mute(chat.id, user_id, 0, mute_reason, 60, username)
+            
+            # Create mute message with unmute button
+            mute_msg = f"""
+🔇 <b>USER MUTED (AUTO)</b>
+👤 User: {user_mention}
+🛡️ Muted by: Bot
+⏱ Duration: 1 hour
+📝 Reason: {mute_reason}
+
+User has reached {max_warnings} warnings and has been automatically muted.
+            """
+            
+            # Create admin keyboard with unmute button
+            keyboard = [
+                [InlineKeyboardButton("🔊 Unmute User", callback_data=f"unmute_user_{user_id}_{chat.id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await chat.send_message(mute_msg, reply_markup=reply_markup, parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Error auto-muting user: {e}")
+    
+    # Send warning message (NOT scheduled for deletion - it stays)
+    await chat.send_message(warning_msg, parse_mode='HTML')
+
+def contains_link_in_caption(caption: str, caption_entities: list) -> bool:
+    """
+    Check if a photo caption contains a link using proper URL regex detection.
+    
+    Detects:
+    - http://
+    - https://
+    - www.
+    - t.me/
+    - Any valid external URL format
+    - TEXT_LINK entities
+    
+    Args:
+        caption: The caption text to check
+        caption_entities: List of MessageEntity objects from the caption
+        
+    Returns:
+        bool: True if a link is detected, False otherwise
+    """
+    if not caption:
+        return False
+    
+    # Check caption entities for TEXT_LINK or URL entities
+    if caption_entities:
+        for entity in caption_entities:
+            if entity.type in [MessageEntity.TEXT_LINK, MessageEntity.URL]:
+                return True
+    
+    # Check caption text with regex for various link patterns
+    # This regex matches:
+    # - http:// or https://
+    # - www.
+    # - t.me/ (Telegram links)
+    link_patterns = [
+        r'https?://\S+',  # http:// or https://
+        r'www\.\S+',  # www.
+        r't\.me/\S+',  # t.me/ links
+    ]
+    
+    for pattern in link_patterns:
+        if re.search(pattern, caption, re.IGNORECASE):
+            return True
+    
+    return False
+
+async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    
+    chat = message.chat
+    if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        return
+    
+    settings = await get_group_settings(chat.id)
+    if not settings:
+        return
+    
+    warning_timer = settings.get('warning_timer', 30)
+    
+    is_admin_or_exempt = False
+    if message.from_user and message.from_user.id == 1087968824 or (message.sender_chat and message.sender_chat.id == chat.id):
+        is_admin_or_exempt = True
+    else:
+        try:
+            if message.from_user:
+                member = await chat.get_member(message.from_user.id)
+                if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                    is_admin_or_exempt = True
+        except Exception:
+            pass
+    
+    if message.sender_chat and message.sender_chat.type == ChatType.CHANNEL:
+        is_admin_or_exempt = True
+    
+    if is_admin_or_exempt:
+        return
+    
+    # Get user information
+    user_id = message.from_user.id if message.from_user else 0
+    username = message.from_user.username or message.from_user.first_name if message.from_user else "Anonymous"
+
+    # Track user activity in users and group_members tables
+    if message.from_user and user_id:
+        await upsert_user(user_id, message.from_user.username, message.from_user.first_name, message.from_user.last_name if hasattr(message.from_user, 'last_name') else None)
+        await upsert_group_member(chat.id, user_id, message.from_user.username, message.from_user.first_name)
+    
+    # --- STICKER PROTECTION ---
+    if settings.get('sticker_protect', False) and message.sticker:
+        try:
+            await message.delete()
+            sticker_warn = await chat.send_message(
+                f"⚠️ @{username}, stickers are not allowed in this group.",
+                parse_mode='HTML'
+            )
+            warning_timer = settings.get('warning_timer', 30)
+            if warning_timer > 0:
+                await schedule_message_deletion(chat.id, sticker_warn.message_id, warning_timer)
+        except Exception as e:
+            logger.error(f"Error deleting sticker: {e}")
+        return
+
+    # --- PHOTO CAPTION LINK MODERATION (INCLUDING FORWARDED MESSAGES) ---
+    # This applies to both normal photo messages and forwarded photo messages
+    if settings.get('delete_links', False) and message.photo and message.caption:
+        # Check if photo caption contains a link
+        if contains_link_in_caption(message.caption, message.caption_entities):
+            try:
+                await message.delete()
+                # Send warning WITH count (adds to warning system)
+                await send_warning_with_count(chat, user_id, username, "Links in photo captions are not allowed in this group", context, "photo_caption_link")
+                return
+            except Exception as e:
+                logger.error(f"Error deleting photo with caption link: {e}")
+    
+    # Check text messages (existing logic)
+    if message.text:
+        # Check word count
+        max_word_count = settings.get('max_word_count', 0)
+        if max_word_count > 0:
+            word_count = len(message.text.split())
+            if word_count > max_word_count:
+                try:
+                    await message.delete()
+                    # Send warning WITH count (adds to warning system)
+                    await send_warning_with_count(chat, user_id, username, f"Message too long ({word_count} words. Max: {max_word_count})", context, "word_limit")
+                    return
+                except Exception as e:
+                    logger.error(f"Error deleting long message: {e}")
+        
+        # Check for promotional/forwarded content (WITHOUT spam keyword patterns)
+        if settings.get('delete_promotions', False):
+            is_promotion = False
+            reason = "promotional content"
+            
+            # Check for forwarded messages
+            if is_forwarded_or_channel_message(message):
+                is_promotion = True
+                reason = "forwarded or channel message"
+            elif message.via_bot:
+                is_promotion = True
+                reason = "sent via bot"
+            elif message.from_user and message.from_user.is_bot:
+                is_promotion = True
+                reason = "bot message"
+            # REMOVED: Spam keyword patterns check - now only using banned words
+            
+            # Check for excessive emojis
+            if message.text:
+                emoji_pattern = r'[\U0001F000-\U0001FFFF]|[\U00002600-\U000027BF]|[\U0001F600-\U0001F64F]|[\U0001F300-\U0001F5FF]|[\U0001F680-\U0001F6FF]|[\u200d\u2600-\u26FF\u2700-\u27BF]'
+                emojis = re.findall(emoji_pattern, message.text)
+                emoji_count = len(emojis)
+                text_len = len(message.text)
+                if emoji_count > 15 or (text_len > 10 and (emoji_count / text_len) > 0.4):
+                    is_promotion = True
+                    reason = "too many emojis"
+            
+            if is_promotion:
+                try:
+                    await message.delete()
+                    # Send warning WITH count (adds to warning system)
+                    await send_warning_with_count(chat, user_id, username, f"{reason} is not allowed", context, reason.replace(" ", "_"))
+                    return
+                except Exception as e:
+                    logger.error(f"Error deleting promotional message: {e}")
+        
+        # Check for links in text messages
+        if settings.get('delete_links', False):
+            link_pattern = r'(https?://\S+|www\.\S+|t\.me/\S+)'
+            has_link = False
+            
+            if re.search(link_pattern, message.text):
+                has_link = True
+            
+            if message.entities:
+                for entity in message.entities:
+                    if entity.type in [MessageEntity.URL, MessageEntity.TEXT_LINK]:
+                        has_link = True
+            
+            if has_link:
+                try:
+                    await message.delete()
+                    # Send warning WITH count (adds to warning system)
+                    await send_warning_with_count(chat, user_id, username, "Links are not allowed in this group", context, "link")
+                    return
+                except Exception as e:
+                    logger.error(f"Error deleting link message: {e}")
+        
+        # Check for banned words (NO count added)
+        banned_words = await get_banned_words(chat.id)
+        if not banned_words:
+            return
+        
+        message_text = message.text.lower()
+        for word in banned_words:
+            pattern = r'\b' + re.escape(word) + r'\b'
+            if re.search(pattern, message_text):
+                try:
+                    await message.delete()
+                    # Send warning WITHOUT count (banned words don't add to warning count)
+                    await send_warning_with_count(chat, user_id, username, "banned word", context, "banned_word")
+                    return
+                except Exception as e:
+                    logger.error(f"Error deleting message with banned word: {e}")
+                    return
 
 async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = update.callback_query.data
+    query = update.callback_query
+    data = query.data
+    
+    # FIXED: Handle join/leave delete toggles separately to avoid callback parsing error
+    if data == "toggle_join_delete":
+        await query.answer("⚠️ Invalid callback data!", show_alert=True)
+        return
+    
+    if data == "my_groups":
+        await my_groups_handler(update, context)
+    elif data == "help":
+        await help_command(update, context)
+    elif data == "back_to_main":
+        await start(update, context)
+    elif data.startswith("group_settings_"):
+        await group_settings_handler(update, context)
+    elif data.startswith("set_welcome_"):
+        await set_welcome_handler(update, context)
+    elif data.startswith("add_word_"):
+        await add_word_handler(update, context)
+    elif data.startswith("remove_word_"):
+        await remove_word_handler(update, context)
+    elif data.startswith("set_timer_"):
+        await set_timer_handler(update, context)
+    elif data.startswith("set_word_limit_"):
+        await set_word_limit_handler(update, context)
+    elif data.startswith("toggle_promo_"):
+        await toggle_promo_handler(update, context)
+    elif data.startswith("toggle_links_"):
+        await toggle_links_handler(update, context)
+    elif data.startswith("toggle_join_delete_"):
+        await toggle_join_delete_handler(update, context)
+    elif data.startswith("set_max_warnings_"):
+        await set_max_warnings_handler(update, context)
+    # Moderation callbacks
+    elif data.startswith("unban_user_"):
+        await unban_callback_handler(update, context)
+    elif data.startswith("unmute_user_"):
+        await unmute_callback_handler(update, context)
+    elif data.startswith("ban_from_warn_"):
+        await ban_from_warn_callback_handler(update, context)
+    elif data.startswith("mute_from_warn_"):
+        await mute_from_warn_callback_handler(update, context)
+    elif data.startswith("cmd_"):
+        await admin_keyboard_callback_handler(update, context)
 
-    if   data == "my_groups":                    await my_groups_handler(update, context)
-    elif data == "help":                         await help_command(update, context)
-    elif data == "back_to_main":                 await start(update, context)
-    elif data.startswith("group_settings_"):     await group_settings_handler(update, context)
-    elif data.startswith("set_welcome_"):        await set_welcome_handler(update, context)
-    elif data.startswith("add_word_"):           await add_word_handler(update, context)
-    elif data.startswith("remove_word_"):        await remove_word_handler(update, context)
-    elif data.startswith("set_timer_"):          await set_timer_handler(update, context)
-    elif data.startswith("set_word_limit_"):     await set_word_limit_handler(update, context)
-    elif data.startswith("toggle_promo_"):       await toggle_promo_handler(update, context)
-    elif data.startswith("toggle_links_"):       await toggle_links_handler(update, context)
-    elif data.startswith("toggle_join_delete_"): await toggle_join_delete_handler(update, context)
-    elif data.startswith("toggle_sticker_"):     await toggle_sticker_handler(update, context)
-    elif data.startswith("toggle_autoapprove_"): await toggle_autoapprove_handler(update, context)
-    elif data.startswith("set_max_warnings_"):   await set_max_warnings_handler(update, context)
-    elif data.startswith("unban_user_"):         await unban_callback_handler(update, context)
-    elif data.startswith("unmute_user_"):        await unmute_callback_handler(update, context)
-    elif data.startswith("ban_from_warn_"):      await ban_from_warn_callback_handler(update, context)
-    elif data.startswith("mute_from_warn_"):     await mute_from_warn_callback_handler(update, context)
-    elif data.startswith("cmd_"):                await admin_keyboard_callback_handler(update, context)
-    else:                                        await update.callback_query.answer()
-
-
-# ════════════════════════════════════════════════════════════
-# FASTAPI STARTUP + ENDPOINTS
-# ════════════════════════════════════════════════════════════
-
+# --- FASTAPI / WEBHOOK SETUP ---
 @app.on_event("startup")
 async def startup_event():
+    """Initialize the bot and set webhook with required allowed_updates"""
     global ptb_application
-    if ptb_application is not None:
-        return
-    ptb_application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    gf = filters.ChatType.GROUP | filters.ChatType.SUPERGROUP
+    
+    if ptb_application is None:
+        ptb_application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        
+        # Add all handlers
+        ptb_application.add_handler(CommandHandler("start", start, filters.ChatType.PRIVATE))
+        ptb_application.add_handler(CommandHandler("help", help_command, filters.ChatType.PRIVATE))
+        ptb_application.add_handler(CommandHandler("mygroups", my_groups_handler, filters.ChatType.PRIVATE))
+        ptb_application.add_handler(CommandHandler("cancel", cancel_handler, filters.ChatType.PRIVATE))
+        
+        # Moderation commands - Group only
+        ptb_application.add_handler(CommandHandler("warn", warn_command, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
+        ptb_application.add_handler(CommandHandler("mute", mute_command, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
+        ptb_application.add_handler(CommandHandler("unmute", unmute_command, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
+        ptb_application.add_handler(CommandHandler("ban", ban_command, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
+        ptb_application.add_handler(CommandHandler("unban", unban_command, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
+        ptb_application.add_handler(CommandHandler("report", report_command, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
+        ptb_application.add_handler(CommandHandler("admin", show_admin_keyboard, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
+        
+        ptb_application.add_handler(CallbackQueryHandler(callback_query_router))
+        ptb_application.add_handler(MessageHandler(
+            filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+            handle_input
+        ))
+        ptb_application.add_handler(ChatMemberHandler(
+            track_chat_member,
+            ChatMemberHandler.MY_CHAT_MEMBER
+        ))
+        ptb_application.add_handler(ChatMemberHandler(
+            user_chat_member,
+            ChatMemberHandler.CHAT_MEMBER
+        ))
+        
+        # NEW: Add photo filter handler for photo caption link detection
+        ptb_application.add_handler(MessageHandler(
+            filters.PHOTO & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
+            check_message
+        ))
 
-    # Private
-    ptb_application.add_handler(CommandHandler("start",         start,                 filters.ChatType.PRIVATE))
-    ptb_application.add_handler(CommandHandler("help",          help_command,          filters.ChatType.PRIVATE))
-    ptb_application.add_handler(CommandHandler("mygroups",      my_groups_handler,     filters.ChatType.PRIVATE))
-    ptb_application.add_handler(CommandHandler("cancel",        cancel_handler,        filters.ChatType.PRIVATE))
-
-    # Group moderation
-    ptb_application.add_handler(CommandHandler("warn",          warn_command,          gf))
-    ptb_application.add_handler(CommandHandler("mute",          mute_command,          gf))
-    ptb_application.add_handler(CommandHandler("unmute",        unmute_command,        gf))
-    ptb_application.add_handler(CommandHandler("ban",           ban_command,           gf))
-    ptb_application.add_handler(CommandHandler("unban",         unban_command,         gf))
-    ptb_application.add_handler(CommandHandler("report",        report_command,        gf))
-    ptb_application.add_handler(CommandHandler("admin",         show_admin_keyboard,   gf))
-
-    # Group new features
-    ptb_application.add_handler(CommandHandler("tagall",        tag_all_command,       gf))
-    ptb_application.add_handler(CommandHandler("note",          note_command,          gf))
-    ptb_application.add_handler(CommandHandler("get",           get_note_command,      gf))
-    ptb_application.add_handler(CommandHandler("notes",         notes_command,         gf))
-    ptb_application.add_handler(CommandHandler("delnote",       delnote_command,       gf))
-    ptb_application.add_handler(CommandHandler("forcesub",      forcesub_command,      gf))
-    ptb_application.add_handler(CommandHandler("removeforcesub",removeforcesub_command,gf))
-    ptb_application.add_handler(CommandHandler("filterdeleted", filter_deleted_command,gf))
-
-    # Callbacks + private input
-    ptb_application.add_handler(CallbackQueryHandler(callback_query_router))
-    ptb_application.add_handler(MessageHandler(
-        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, handle_input,
-    ))
-
-    # Member tracking
-    ptb_application.add_handler(ChatMemberHandler(track_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    ptb_application.add_handler(ChatMemberHandler(user_chat_member,  ChatMemberHandler.CHAT_MEMBER))
-
-    # Join requests
-    ptb_application.add_handler(ChatJoinRequestHandler(handle_join_request))
-
-    # Group messages
-    ptb_application.add_handler(MessageHandler(filters.PHOTO       & gf, check_message))
-    ptb_application.add_handler(MessageHandler(filters.Sticker.ALL & gf, check_message))
-    ptb_application.add_handler(MessageHandler(filters.TEXT        & gf, check_message))
-
-    await ptb_application.initialize()
-    await ptb_application.start()
-
-    if WEBHOOK_URL:
-        try:
-            await ptb_application.bot.set_webhook(
-                url=WEBHOOK_URL,
-                allowed_updates=[
-                    "message", "edited_message", "callback_query",
-                    "my_chat_member", "chat_member", "chat_join_request",
-                ],
-            )
-            logger.info(f"Webhook set → {WEBHOOK_URL}")
-        except RetryAfter as e:
-            logger.warning(f"Rate-limited on webhook: {e}")
-        except Exception as e:
-            logger.error(f"set_webhook: {e}")
-    else:
-        logger.error("WEBHOOK_URL env var not set!")
-
+        # NEW: Add sticker handler for sticker protection
+        ptb_application.add_handler(MessageHandler(
+            filters.Sticker.ALL & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
+            check_message
+        ))
+        
+        # Text message handler (existing)
+        ptb_application.add_handler(MessageHandler(
+            filters.TEXT & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
+            check_message
+        ))
+        
+        await ptb_application.initialize()
+        await ptb_application.start()
+        
+        # Set webhook safely with retry for flood control
+        if WEBHOOK_URL:
+            try:
+                await ptb_application.bot.set_webhook(
+                    url=WEBHOOK_URL,
+                    allowed_updates=[
+                        "message",
+                        "edited_message",
+                        "callback_query",
+                        "my_chat_member",
+                        "chat_member",
+                        "chat_join_request",
+                    ]
+                )
+                logger.info(f"Webhook successfully set to {WEBHOOK_URL} with chat_member updates")
+            except RetryAfter as e:
+                logger.warning(f"Rate limited when setting webhook. Will retry in {e.retry_after} seconds...")
+            except Exception as e:
+                logger.error(f"Failed to set webhook: {e}")
+        else:
+            logger.error("WEBHOOK_URL is not set! Please add it to your .env file.")
 
 @app.post("/webhook/webhook")
 async def telegram_webhook(request: Request):
+    """Handle incoming Telegram updates"""
     try:
-        data   = await request.json()
+        data = await request.json()
         update = Update.de_json(data, ptb_application.bot)
         await ptb_application.process_update(update)
         return Response(status_code=200)
     except Exception as e:
-        logger.error(f"webhook: {e}")
+        logger.error(f"Error in webhook: {e}")
         return Response(status_code=500)
-
 
 @app.api_route("/", methods=["GET", "POST"])
 async def health_check():
-    return {"status": "ok", "bot": "GroupPilot"}
+    return {"status": "ok", "message": "Bot is running"}
 
-
-@app.post("/approve-join")
-async def approve_join_api(request: Request):
-    try:
-        d = await request.json()
-        await ptb_application.bot.approve_chat_join_request(int(d["chat_id"]), int(d["user_id"]))
-        supabase.table("join_requests").update({"status": "approved"}) \
-            .eq("chat_id", d["chat_id"]).eq("user_id", d["user_id"]).execute()
-        return {"status": "ok"}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
-
-
-@app.post("/reject-join")
-async def reject_join_api(request: Request):
-    try:
-        d = await request.json()
-        await ptb_application.bot.decline_chat_join_request(int(d["chat_id"]), int(d["user_id"]))
-        supabase.table("join_requests").update({"status": "rejected"}) \
-            .eq("chat_id", d["chat_id"]).eq("user_id", d["user_id"]).execute()
-        return {"status": "ok"}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
-
-
+# --- CRON JOB ENDPOINT ---
 @app.get("/run-cleanup")
 async def run_cleanup_job():
+    """Check database for messages that need to be deleted and cleanup expired mutes"""
     if ptb_application is None:
         await startup_event()
-    unmuted = deleted = 0
+    
+    deleted_count = 0
+    unmuted_count = 0
+    
+    # Cleanup expired mutes first
     try:
-        unmuted = await cleanup_expired_mutes(ptb_application.bot)
+        unmuted_count = await cleanup_expired_mutes(ptb_application)
     except Exception as e:
-        logger.error(f"mute cleanup: {e}")
+        logger.error(f"Error in mute cleanup: {e}")
+    
+    # Get due deletions
     try:
-        for item in await get_due_deletions():
+        due_items = await get_due_deletions()
+        if not due_items:
+            return {"status": "ok", "deleted_count": 0, "unmuted_count": unmuted_count}
+        
+        for item in due_items:
+            chat_id = item['chat_id']
+            message_id = item['message_id']
+            row_id = item['id']
             try:
-                await ptb_application.bot.delete_message(
-                    chat_id=item["chat_id"], message_id=item["message_id"],
-                )
-                deleted += 1
-            except Exception:
-                pass
-            await remove_pending_deletion(item["id"])
+                await ptb_application.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                deleted_count += 1
+            except Exception as e:
+                logger.error(f"Failed to delete message {message_id} in chat {chat_id}: {e}")
+            await remove_pending_deletion(row_id)
     except Exception as e:
-        logger.error(f"deletion cleanup: {e}")
-    return {"status": "ok", "deleted_count": deleted, "unmuted_count": unmuted}
+        logger.error(f"Error in cleanup job: {e}")
+        return {"status": "error", "error": str(e)}
+    
+    return {"status": "ok", "deleted_count": deleted_count, "unmuted_count": unmuted_count}
 
+async def delete_group_and_words(chat_id: int):
+    """Delete group and associated banned words from database"""
+    try:
+        supabase.table('banned_words').delete().eq('chat_id', chat_id).execute()
+        supabase.table('groups').delete().eq('chat_id', chat_id).execute()
+    except Exception as e:
+        logger.error(f"Error deleting group {chat_id} and banned words: {e}")
 
 @app.get("/run-group-cleanup")
 async def run_group_cleanup():
+    """Cleanup dead groups from database"""
     if ptb_application is None:
         await startup_event()
+    
     try:
-        result    = supabase.table("groups").select("chat_id").execute()
-        group_ids = [g["chat_id"] for g in result.data]
-    except Exception:
+        result = supabase.table('groups').select('chat_id').execute()
+        groups = [g['chat_id'] for g in result.data]
+    except Exception as e:
+        logger.error(f"Error getting groups: {e}")
         return {"status": "error"}
+    
     removed = []
-    for cid in group_ids:
+    for chat_id in groups:
         try:
-            await ptb_application.bot.get_chat(cid)
-        except Forbidden:
-            await delete_group_and_words(cid)
-            removed.append(cid)
+            await ptb_application.bot.get_chat(chat_id)
+        except Forbidden as e:
+            logger.info(f"Removing forbidden chat {chat_id}: {e}")
+            await delete_group_and_words(chat_id)
+            removed.append(chat_id)
         except BadRequest as e:
             if "chat not found" in str(e).lower():
-                await delete_group_and_words(cid)
-                removed.append(cid)
+                logger.info(f"Removing not found chat {chat_id}: {e}")
+                await delete_group_and_words(chat_id)
+                removed.append(chat_id)
+            else:
+                logger.warning(f"Other BadRequest for {chat_id}: {e}")
         except RetryAfter as e:
+            logger.warning(f"Rate limit hit: {e}")
             await asyncio.sleep(e.retry_after)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Unexpected error for {chat_id}: {e}")
+    
     return {"status": "ok", "removed": removed}
