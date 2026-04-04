@@ -750,6 +750,20 @@ async def update_force_sub_channel(chat_id: int, channel: str):
     except Exception as e:
         logger.error(f"Error updating force_sub_channel: {e}")
 
+async def update_setting(chat_id: int, **kwargs):
+    """Generic setting updater — pass any column=value pairs."""
+    try:
+        supabase.table('groups').update(kwargs).eq('chat_id', chat_id).execute()
+    except Exception as e:
+        logger.error(f"update_setting: {e}")
+
+# Toggle handler shims using the _toggle helper (defined later, but registered after)
+async def toggle_sticker_handler(update, context):
+    await _toggle(update, context, "sticker_protect")
+
+async def toggle_autoapprove_handler(update, context):
+    await _toggle(update, context, "auto_approve")
+
 async def schedule_message_deletion(chat_id: int, message_id: int, delay_seconds: int):
     """Schedule a message for deletion via DB (for Cron)"""
     try:
@@ -2094,68 +2108,81 @@ async def _prompt(query, context, cid, action, text):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user = update.effective_user
+    bot_username = context.bot.username or "GroupPilotBot"
     keyboard = [
-        [InlineKeyboardButton("➕ Add Bot to Group", url=f"https://t.me/{context.bot.username}?startgroup=true")],
-        [InlineKeyboardButton("📋 My Groups", callback_data="my_groups")],
-        [InlineKeyboardButton("❓ Help", callback_data="help")]
+        [InlineKeyboardButton("➕ Add to Group", url=f"https://t.me/{bot_username}?startgroup=true")],
+        [InlineKeyboardButton("📋 My Groups",    callback_data="my_groups"),
+         InlineKeyboardButton("❓ Help",         callback_data="help")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    welcome_text = f"""
-👋 Welcome {user.mention_html()}!
-I'm a powerful group moderation bot that helps you:
-✅ Delete messages with banned words
-✅ Delete links and URLs (including photo captions)
-✅ Delete promotional/forwarded messages
-✅ Limit maximum words per message
-✅ Auto-delete warning messages after set time
-✅ Custom welcome messages with HTML support
-✅ Admin commands: /warn, /mute, /ban, /unmute, /unban
-✅ User reports: /report
-✅ Auto-mute users who reach max warnings (3-31)
-🚀 Get started by adding me to your group!
-    """
-    await update.message.reply_html(welcome_text, reply_markup=reply_markup)
+    welcome_text = (
+        f"👋 Welcome {user.mention_html()}!\n\n"
+        "<b>GroupPilot</b> — Intelligent Group Moderation\n\n"
+        "✅ Auto-delete banned words, links, promotions\n"
+        "✅ Warn / Mute / Ban with inline buttons\n"
+        "✅ Auto-mute at configurable warning limit (3–31)\n"
+        "✅ Custom welcome messages with HTML & buttons\n"
+        "✅ Force-subscribe channels enforcement\n"
+        "✅ Tag all members with /tagall\n"
+        "✅ Per-group notes (/note /get /notes /delnote)\n"
+        "✅ Join request management (auto-approve)\n"
+        "✅ Filter & remove deleted/ghost accounts\n"
+        "✅ Sticker protection\n\n"
+        "🚀 Add me to your group to get started!"
+    )
+    if update.message:
+        await update.message.reply_html(welcome_text, reply_markup=reply_markup)
+    elif update.callback_query:
+        try:
+            await update.callback_query.message.edit_text(
+                welcome_text, reply_markup=reply_markup, parse_mode="HTML"
+            )
+        except BadRequest:
+            pass
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
-    help_text = """
-📚 <b>Bot Commands & Features</b>
-<b>Admin Commands (Group only):</b>
-/warn <username> <reason> - Warn a user (auto-mutes at max warnings)
-/mute <username> <duration> <reason> - Mute a user (supports 10m, 1h, 1d, 1w)
-/ban <username> <reason> - Ban a user
-/unmute <username> - Unmute a user
-/unban <username> - Unban a user
-/admin - Show admin command keyboard
-
-<b>Member Commands (Group only):</b>
-/report <username> <reason> - Report a user to admins (cannot report admins)
-
-<b>Commands (Use in private chat):</b>
-/start - Start the bot and see main menu
-/mygroups - View your groups
-/help - Show this help message
-
-<b>Features:</b>
-• <b>Banned Words:</b> Auto-delete specific words.
-• <b>Links:</b> Auto-delete messages and photo captions containing http/https/t.me links.
-• <b>Word Limit:</b> Delete messages that are too long (e.g., >100 words).
-• <b>Anti-Promo:</b> Delete forwarded messages, spam bots, and promotional text (excessive emojis).
-• <b>Timer:</b> Set how long warning messages stay visible.
-• <b>Auto-Mute:</b> Users reaching max warnings (3-31) are automatically muted for 1 hour.
-• <b>Welcome Messages:</b> Custom HTML welcome messages for new members.
-<b>Note:</b> Admins and Anonymous Admins are exempt from deletion.
-    """
+    help_text = (
+        "<b>GroupPilot Commands</b>\n\n"
+        "<b>Admin (Group only):</b>\n"
+        "/warn &lt;@user&gt; &lt;reason&gt; — Warn user (auto-mutes at limit)\n"
+        "/mute &lt;@user&gt; &lt;dur&gt; &lt;reason&gt; — Mute (10m, 1h, 1d, 1w)\n"
+        "/unmute &lt;@user&gt; — Unmute &amp; reset warnings\n"
+        "/ban &lt;@user&gt; &lt;reason&gt; — Ban user\n"
+        "/unban &lt;ID&gt; — Unban user\n"
+        "/admin — Show admin keyboard\n"
+        "/tagall [msg] — Mention all tracked members\n"
+        "/note &lt;name&gt; &lt;text&gt; — Save a group note\n"
+        "/get &lt;name&gt; — Retrieve a note\n"
+        "/notes — List all notes\n"
+        "/delnote &lt;name&gt; — Delete a note\n"
+        "/forcesub @channel — Require channel subscription\n"
+        "/removeforcesub @channel — Remove requirement\n"
+        "/filterdeleted — Kick ghost/deleted accounts\n\n"
+        "<b>Members (Group only):</b>\n"
+        "/report — Reply to a message to report user\n"
+        "/get &lt;name&gt; — Read a note\n\n"
+        "<b>Private:</b>\n"
+        "/start — Main menu\n"
+        "/mygroups — Manage your groups\n"
+        "/help — This message\n\n"
+        "<b>Auto Features:</b>\n"
+        "• Banned words, link &amp; promo deletion\n"
+        "• Sticker protection\n"
+        "• Force-subscribe enforcement\n"
+        "• Auto-mute at warning limit\n"
+        "• Welcome messages with buttons\n"
+        "• Join request auto-approve"
+    )
     if update.message:
         await update.message.reply_html(help_text)
-    else:
+    elif update.callback_query:
         try:
-            await update.callback_query.message.edit_text(help_text, parse_mode='HTML')
-        except BadRequest as e:
-            if "Message is not modified" in str(e):
-                pass
-            else:
-                logger.error(f"Error in help command: {e}")
+            await update.callback_query.message.edit_text(help_text, parse_mode="HTML")
+        except BadRequest:
+            pass
+
 
 async def my_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user's groups"""
@@ -3087,111 +3114,88 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    data = query.data
-    
-    # FIXED: Handle join/leave delete toggles separately to avoid callback parsing error
-    if data == "toggle_join_delete":
-        await query.answer("⚠️ Invalid callback data!", show_alert=True)
-        return
-    
-    if data == "my_groups":
-        await my_groups_handler(update, context)
-    elif data == "help":
-        await help_command(update, context)
-    elif data == "back_to_main":
-        await start(update, context)
-    elif data.startswith("group_settings_"):
-        await group_settings_handler(update, context)
-    elif data.startswith("set_welcome_"):
-        await set_welcome_handler(update, context)
-    elif data.startswith("add_word_"):
-        await add_word_handler(update, context)
-    elif data.startswith("remove_word_"):
-        await remove_word_handler(update, context)
-    elif data.startswith("set_timer_"):
-        await set_timer_handler(update, context)
-    elif data.startswith("set_word_limit_"):
-        await set_word_limit_handler(update, context)
-    elif data.startswith("toggle_promo_"):
-        await toggle_promo_handler(update, context)
-    elif data.startswith("toggle_links_"):
-        await toggle_links_handler(update, context)
-    elif data.startswith("toggle_join_delete_"):
-        await toggle_join_delete_handler(update, context)
-    elif data.startswith("set_max_warnings_"):
-        await set_max_warnings_handler(update, context)
-    # Moderation callbacks
-    elif data.startswith("unban_user_"):
-        await unban_callback_handler(update, context)
-    elif data.startswith("unmute_user_"):
-        await unmute_callback_handler(update, context)
-    elif data.startswith("ban_from_warn_"):
-        await ban_from_warn_callback_handler(update, context)
-    elif data.startswith("mute_from_warn_"):
-        await mute_from_warn_callback_handler(update, context)
-    elif data.startswith("cmd_"):
-        await admin_keyboard_callback_handler(update, context)
+    data  = query.data
+
+    if   data == "my_groups":                    await my_groups_handler(update, context)
+    elif data == "help":                         await help_command(update, context)
+    elif data == "back_to_main":                 await start(update, context)
+    elif data.startswith("group_settings_"):     await group_settings_handler(update, context)
+    elif data.startswith("set_welcome_"):        await set_welcome_handler(update, context)
+    elif data.startswith("add_word_"):           await add_word_handler(update, context)
+    elif data.startswith("remove_word_"):        await remove_word_handler(update, context)
+    elif data.startswith("set_timer_"):          await set_timer_handler(update, context)
+    elif data.startswith("set_word_limit_"):     await set_word_limit_handler(update, context)
+    elif data.startswith("toggle_promo_"):       await toggle_promo_handler(update, context)
+    elif data.startswith("toggle_links_"):       await toggle_links_handler(update, context)
+    elif data.startswith("toggle_join_delete_"): await toggle_join_delete_handler(update, context)
+    elif data.startswith("toggle_sticker_"):     await toggle_sticker_handler(update, context)
+    elif data.startswith("toggle_autoapprove_"): await toggle_autoapprove_handler(update, context)
+    elif data.startswith("set_max_warnings_"):   await set_max_warnings_handler(update, context)
+    elif data.startswith("unban_user_"):         await unban_callback_handler(update, context)
+    elif data.startswith("unmute_user_"):        await unmute_callback_handler(update, context)
+    elif data.startswith("ban_from_warn_"):      await ban_from_warn_callback_handler(update, context)
+    elif data.startswith("mute_from_warn_"):     await mute_from_warn_callback_handler(update, context)
+    elif data.startswith("cmd_"):               await admin_keyboard_callback_handler(update, context)
+    else:                                        await query.answer()
 
 # --- FASTAPI / WEBHOOK SETUP ---
 @app.on_event("startup")
 async def startup_event():
     """Initialize the bot and set webhook with required allowed_updates"""
     global ptb_application
-    
+
     if ptb_application is None:
         ptb_application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        
-        # Add all handlers
-        ptb_application.add_handler(CommandHandler("start", start, filters.ChatType.PRIVATE))
-        ptb_application.add_handler(CommandHandler("help", help_command, filters.ChatType.PRIVATE))
+
+        gf = filters.ChatType.GROUP | filters.ChatType.SUPERGROUP
+
+        # ── Private commands ─────────────────────────────────
+        ptb_application.add_handler(CommandHandler("start",    start,            filters.ChatType.PRIVATE))
+        ptb_application.add_handler(CommandHandler("help",     help_command,     filters.ChatType.PRIVATE))
         ptb_application.add_handler(CommandHandler("mygroups", my_groups_handler, filters.ChatType.PRIVATE))
-        ptb_application.add_handler(CommandHandler("cancel", cancel_handler, filters.ChatType.PRIVATE))
-        
-        # Moderation commands - Group only
-        ptb_application.add_handler(CommandHandler("warn", warn_command, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
-        ptb_application.add_handler(CommandHandler("mute", mute_command, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
-        ptb_application.add_handler(CommandHandler("unmute", unmute_command, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
-        ptb_application.add_handler(CommandHandler("ban", ban_command, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
-        ptb_application.add_handler(CommandHandler("unban", unban_command, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
-        ptb_application.add_handler(CommandHandler("report", report_command, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
-        ptb_application.add_handler(CommandHandler("admin", show_admin_keyboard, filters.ChatType.GROUP | filters.ChatType.SUPERGROUP))
-        
+        ptb_application.add_handler(CommandHandler("cancel",   cancel_handler,   filters.ChatType.PRIVATE))
+
+        # ── Group moderation commands ─────────────────────────
+        ptb_application.add_handler(CommandHandler("warn",    warn_command,    gf))
+        ptb_application.add_handler(CommandHandler("mute",    mute_command,    gf))
+        ptb_application.add_handler(CommandHandler("unmute",  unmute_command,  gf))
+        ptb_application.add_handler(CommandHandler("ban",     ban_command,     gf))
+        ptb_application.add_handler(CommandHandler("unban",   unban_command,   gf))
+        ptb_application.add_handler(CommandHandler("report",  report_command,  gf))
+        ptb_application.add_handler(CommandHandler("admin",   show_admin_keyboard, gf))
+
+        # ── New group feature commands ────────────────────────
+        ptb_application.add_handler(CommandHandler("tagall",         tag_all_command,         gf))
+        ptb_application.add_handler(CommandHandler("note",           note_command,            gf))
+        ptb_application.add_handler(CommandHandler("get",            get_note_command,        gf))
+        ptb_application.add_handler(CommandHandler("notes",          notes_command,           gf))
+        ptb_application.add_handler(CommandHandler("delnote",        delnote_command,         gf))
+        ptb_application.add_handler(CommandHandler("forcesub",       forcesub_command,        gf))
+        ptb_application.add_handler(CommandHandler("removeforcesub", removeforcesub_command,  gf))
+        ptb_application.add_handler(CommandHandler("filterdeleted",  filter_deleted_command,  gf))
+
+        # ── Callbacks + private text input ────────────────────
         ptb_application.add_handler(CallbackQueryHandler(callback_query_router))
         ptb_application.add_handler(MessageHandler(
             filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
             handle_input
         ))
-        ptb_application.add_handler(ChatMemberHandler(
-            track_chat_member,
-            ChatMemberHandler.MY_CHAT_MEMBER
-        ))
-        ptb_application.add_handler(ChatMemberHandler(
-            user_chat_member,
-            ChatMemberHandler.CHAT_MEMBER
-        ))
-        
-        # NEW: Add photo filter handler for photo caption link detection
-        ptb_application.add_handler(MessageHandler(
-            filters.PHOTO & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
-            check_message
-        ))
 
-        # NEW: Add sticker handler for sticker protection
-        ptb_application.add_handler(MessageHandler(
-            filters.Sticker.ALL & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
-            check_message
-        ))
-        
-        # Text message handler (existing)
-        ptb_application.add_handler(MessageHandler(
-            filters.TEXT & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
-            check_message
-        ))
-        
+        # ── Member tracking ───────────────────────────────────
+        ptb_application.add_handler(ChatMemberHandler(track_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+        ptb_application.add_handler(ChatMemberHandler(user_chat_member,  ChatMemberHandler.CHAT_MEMBER))
+
+        # ── Join requests ─────────────────────────────────────
+        ptb_application.add_handler(ChatJoinRequestHandler(handle_join_request))
+
+        # ── Group message filters ─────────────────────────────
+        ptb_application.add_handler(MessageHandler(filters.PHOTO       & gf, check_message))
+        ptb_application.add_handler(MessageHandler(filters.Sticker.ALL & gf, check_message))
+        ptb_application.add_handler(MessageHandler(filters.TEXT        & gf, check_message))
+
         await ptb_application.initialize()
         await ptb_application.start()
-        
-        # Set webhook safely with retry for flood control
+
         if WEBHOOK_URL:
             try:
                 await ptb_application.bot.set_webhook(
@@ -3205,13 +3209,13 @@ async def startup_event():
                         "chat_join_request",
                     ]
                 )
-                logger.info(f"Webhook successfully set to {WEBHOOK_URL} with chat_member updates")
+                logger.info(f"Webhook set → {WEBHOOK_URL}")
             except RetryAfter as e:
-                logger.warning(f"Rate limited when setting webhook. Will retry in {e.retry_after} seconds...")
+                logger.warning(f"Rate limited on webhook: {e}")
             except Exception as e:
-                logger.error(f"Failed to set webhook: {e}")
+                logger.error(f"set_webhook: {e}")
         else:
-            logger.error("WEBHOOK_URL is not set! Please add it to your .env file.")
+            logger.error("WEBHOOK_URL env var not set!")
 
 @app.post("/webhook/webhook")
 async def telegram_webhook(request: Request):
@@ -3227,7 +3231,31 @@ async def telegram_webhook(request: Request):
 
 @app.api_route("/", methods=["GET", "POST"])
 async def health_check():
-    return {"status": "ok", "message": "Bot is running"}
+    return {"status": "ok", "bot": "GroupPilot"}
+
+
+@app.post("/api/approve-join")
+async def approve_join_api(request: Request):
+    try:
+        d = await request.json()
+        await ptb_application.bot.approve_chat_join_request(int(d["chat_id"]), int(d["user_id"]))
+        supabase.table("join_requests").update({"status": "approved"}) \
+            .eq("chat_id", d["chat_id"]).eq("user_id", d["user_id"]).execute()
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+@app.post("/api/reject-join")
+async def reject_join_api(request: Request):
+    try:
+        d = await request.json()
+        await ptb_application.bot.decline_chat_join_request(int(d["chat_id"]), int(d["user_id"]))
+        supabase.table("join_requests").update({"status": "rejected"}) \
+            .eq("chat_id", d["chat_id"]).eq("user_id", d["user_id"]).execute()
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
 # --- CRON JOB ENDPOINT ---
 @app.get("/run-cleanup")
@@ -3241,7 +3269,7 @@ async def run_cleanup_job():
     
     # Cleanup expired mutes first
     try:
-        unmuted_count = await cleanup_expired_mutes(ptb_application)
+        unmuted_count = await cleanup_expired_mutes(ptb_application.bot)
     except Exception as e:
         logger.error(f"Error in mute cleanup: {e}")
     
