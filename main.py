@@ -2955,20 +2955,23 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message:
         return
-    
+
     chat = message.chat
     if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
         return
-    
+
     settings = await get_group_settings(chat.id)
     if not settings:
         return
-    
-    warning_timer = settings.get('warning_timer', 30)
-    
+
+    # ── Exempt check (admins, anonymous admins, channel posts) ──────────────
     is_admin_or_exempt = False
-    if message.from_user and message.from_user.id == 1087968824 or (message.sender_chat and message.sender_chat.id == chat.id):
-        is_admin_or_exempt = True
+    if message.sender_chat and message.sender_chat.id == chat.id:
+        is_admin_or_exempt = True  # anonymous admin posting as group
+    elif message.from_user and message.from_user.id == 1087968824:
+        is_admin_or_exempt = True  # GroupAnonymousBot
+    elif message.sender_chat and message.sender_chat.type == ChatType.CHANNEL:
+        is_admin_or_exempt = True  # linked channel post
     else:
         try:
             if message.from_user:
@@ -2977,140 +2980,195 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     is_admin_or_exempt = True
         except Exception:
             pass
-    
-    if message.sender_chat and message.sender_chat.type == ChatType.CHANNEL:
-        is_admin_or_exempt = True
-    
+
     if is_admin_or_exempt:
         return
-    
-    # Get user information
-    user_id = message.from_user.id if message.from_user else 0
-    username = message.from_user.username or message.from_user.first_name if message.from_user else "Anonymous"
 
-    # Track user activity in users and group_members tables
-    if message.from_user and user_id:
-        await upsert_user(user_id, message.from_user.username, message.from_user.first_name, message.from_user.last_name if hasattr(message.from_user, 'last_name') else None)
-        await upsert_group_member(chat.id, user_id, message.from_user.username, message.from_user.first_name)
-    
-    # --- STICKER PROTECTION ---
+    # ── User info ────────────────────────────────────────────────────────────
+    if not message.from_user:
+        return  # no user to check (channel post handled above)
+
+    user     = message.from_user
+    user_id  = user.id
+    username = user.username or user.first_name or str(user_id)
+
+    # ── Deleted/ghost account ────────────────────────────────────────────────
+    if is_deleted_account(user):
+        try:
+            await message.delete()
+            await context.bot.ban_chat_member(chat.id, user_id)
+            await context.bot.unban_chat_member(chat.id, user_id)
+        except Exception:
+            pass
+        return
+
+    # ── Track activity ───────────────────────────────────────────────────────
+    await upsert_user(user_id, user.username, user.first_name,
+                      getattr(user, 'last_name', None))
+    await upsert_group_member(chat.id, user_id, user.username, user.first_name)
+
+    # ── FORCE SUBSCRIBE CHECK ────────────────────────────────────────────────
+    # This runs on EVERY message. If the group has force-sub channels set,
+    # check whether this user is a member of ALL of them.
+    # If not → delete their message, send join button, stop processing.
+    not_joined = await check_force_sub(chat.id, user_id, context)
+    if not_joined:
+        # Delete the message they tried to send
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        # Build join buttons — one per missing channel
+        keyboard = []
+        channel_names = []
+        for fc in not_joined:
+            title = fc.get('channel_title') or fc.get('channel_username') or str(fc['channel_id'])
+            channel_names.append(f"<b>{title}</b>")
+            if fc.get('channel_username'):
+                link = f"https://t.me/{fc['channel_username']}"
+            else:
+                # private channel — strip -100 prefix
+                raw_id = str(fc['channel_id']).replace('-100', '')
+                link = f"https://t.me/c/{raw_id}"
+            keyboard.append([InlineKeyboardButton(f"➕ Join {title}", url=link)])
+
+        user_mention = get_user_mention_html(user)
+        channels_text = " and ".join(channel_names)
+        text = (
+            f"⚠️ {user_mention}, you must join {channels_text} "
+            f"before you can send messages in this group.\n\n"
+            f"Click the button below to join, then send your message again."
+        )
+
+        timer = settings.get('force_sub_message_timer', 60)
+        try:
+            warn_msg = await chat.send_message(
+                text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            # Auto-delete the warning after the configured timer
+            if timer > 0:
+                await schedule_message_deletion(chat.id, warn_msg.message_id, timer)
+        except Exception as e:
+            logger.error(f"Force sub warning send error: {e}")
+        return  # stop — don't process any other rules for this message
+
+    # ── STICKER PROTECTION ───────────────────────────────────────────────────
     if settings.get('sticker_protect', False) and message.sticker:
         try:
             await message.delete()
-            sticker_warn = await chat.send_message(
-                f"⚠️ @{username}, stickers are not allowed in this group.",
-                parse_mode='HTML'
+            warn = await chat.send_message(
+                f"⚠️ @{username}, stickers are not allowed in this group."
             )
-            warning_timer = settings.get('warning_timer', 30)
-            if warning_timer > 0:
-                await schedule_message_deletion(chat.id, sticker_warn.message_id, warning_timer)
+            wt = settings.get('warning_timer', 30)
+            if wt > 0:
+                await schedule_message_deletion(chat.id, warn.message_id, wt)
         except Exception as e:
-            logger.error(f"Error deleting sticker: {e}")
+            logger.error(f"Sticker protect error: {e}")
         return
 
-    # --- PHOTO CAPTION LINK MODERATION (INCLUDING FORWARDED MESSAGES) ---
-    # This applies to both normal photo messages and forwarded photo messages
+    # ── PHOTO CAPTION LINK CHECK ─────────────────────────────────────────────
     if settings.get('delete_links', False) and message.photo and message.caption:
-        # Check if photo caption contains a link
         if contains_link_in_caption(message.caption, message.caption_entities):
             try:
                 await message.delete()
-                # Send warning WITH count (adds to warning system)
-                await send_warning_with_count(chat, user_id, username, "Links in photo captions are not allowed in this group", context, "photo_caption_link")
-                return
+                await send_warning_with_count(
+                    chat, user_id, username,
+                    "Links in photo captions are not allowed in this group",
+                    context, "photo_caption_link"
+                )
             except Exception as e:
-                logger.error(f"Error deleting photo with caption link: {e}")
-    
-    # Check text messages (existing logic)
-    if message.text:
-        # Check word count
-        max_word_count = settings.get('max_word_count', 0)
-        if max_word_count > 0:
-            word_count = len(message.text.split())
-            if word_count > max_word_count:
-                try:
-                    await message.delete()
-                    # Send warning WITH count (adds to warning system)
-                    await send_warning_with_count(chat, user_id, username, f"Message too long ({word_count} words. Max: {max_word_count})", context, "word_limit")
-                    return
-                except Exception as e:
-                    logger.error(f"Error deleting long message: {e}")
-        
-        # Check for promotional/forwarded content (WITHOUT spam keyword patterns)
-        if settings.get('delete_promotions', False):
-            is_promotion = False
-            reason = "promotional content"
-            
-            # Check for forwarded messages
-            if is_forwarded_or_channel_message(message):
-                is_promotion = True
-                reason = "forwarded or channel message"
-            elif message.via_bot:
-                is_promotion = True
-                reason = "sent via bot"
-            elif message.from_user and message.from_user.is_bot:
-                is_promotion = True
-                reason = "bot message"
-            # REMOVED: Spam keyword patterns check - now only using banned words
-            
-            # Check for excessive emojis
-            if message.text:
-                emoji_pattern = r'[\U0001F000-\U0001FFFF]|[\U00002600-\U000027BF]|[\U0001F600-\U0001F64F]|[\U0001F300-\U0001F5FF]|[\U0001F680-\U0001F6FF]|[\u200d\u2600-\u26FF\u2700-\u27BF]'
-                emojis = re.findall(emoji_pattern, message.text)
-                emoji_count = len(emojis)
-                text_len = len(message.text)
-                if emoji_count > 15 or (text_len > 10 and (emoji_count / text_len) > 0.4):
-                    is_promotion = True
-                    reason = "too many emojis"
-            
-            if is_promotion:
-                try:
-                    await message.delete()
-                    # Send warning WITH count (adds to warning system)
-                    await send_warning_with_count(chat, user_id, username, f"{reason} is not allowed", context, reason.replace(" ", "_"))
-                    return
-                except Exception as e:
-                    logger.error(f"Error deleting promotional message: {e}")
-        
-        # Check for links in text messages
-        if settings.get('delete_links', False):
-            link_pattern = r'(https?://\S+|www\.\S+|t\.me/\S+)'
-            has_link = False
-            
-            if re.search(link_pattern, message.text):
-                has_link = True
-            
-            if message.entities:
-                for entity in message.entities:
-                    if entity.type in [MessageEntity.URL, MessageEntity.TEXT_LINK]:
-                        has_link = True
-            
-            if has_link:
-                try:
-                    await message.delete()
-                    # Send warning WITH count (adds to warning system)
-                    await send_warning_with_count(chat, user_id, username, "Links are not allowed in this group", context, "link")
-                    return
-                except Exception as e:
-                    logger.error(f"Error deleting link message: {e}")
-        
-        # Check for banned words (NO count added)
-        banned_words = await get_banned_words(chat.id)
-        if not banned_words:
+                logger.error(f"Photo caption link error: {e}")
             return
-        
-        message_text = message.text.lower()
+
+    # ── TEXT MESSAGE CHECKS ──────────────────────────────────────────────────
+    if not message.text:
+        return
+
+    # Word count limit
+    max_word_count = settings.get('max_word_count', 0)
+    if max_word_count > 0:
+        word_count = len(message.text.split())
+        if word_count > max_word_count:
+            try:
+                await message.delete()
+                await send_warning_with_count(
+                    chat, user_id, username,
+                    f"Message too long ({word_count} words, max {max_word_count})",
+                    context, "word_limit"
+                )
+            except Exception as e:
+                logger.error(f"Word count error: {e}")
+            return
+
+    # Promotions / forwarded messages
+    if settings.get('delete_promotions', False):
+        reason = None
+        if is_forwarded_or_channel_message(message):
+            reason = "forwarded or channel message"
+        elif message.via_bot:
+            reason = "sent via bot"
+        elif message.from_user and message.from_user.is_bot:
+            reason = "bot message"
+        else:
+            emoji_pattern = (
+                r'[\U0001F000-\U0001FFFF]|[\U00002600-\U000027BF]'
+                r'|[\U0001F600-\U0001F64F]|[\U0001F300-\U0001F5FF]'
+                r'|[\U0001F680-\U0001F6FF]|[\u200d\u2600-\u26FF\u2700-\u27BF]'
+            )
+            emojis   = re.findall(emoji_pattern, message.text)
+            text_len = len(message.text)
+            if len(emojis) > 15 or (text_len > 10 and len(emojis) / text_len > 0.4):
+                reason = "too many emojis"
+        if reason:
+            try:
+                await message.delete()
+                await send_warning_with_count(
+                    chat, user_id, username,
+                    f"{reason} is not allowed",
+                    context, reason.replace(" ", "_")
+                )
+            except Exception as e:
+                logger.error(f"Promo delete error: {e}")
+            return
+
+    # Links in text
+    if settings.get('delete_links', False):
+        has_link = bool(re.search(r'(https?://\S+|www\.\S+|t\.me/\S+)', message.text))
+        if not has_link and message.entities:
+            for entity in message.entities:
+                if entity.type in [MessageEntity.URL, MessageEntity.TEXT_LINK]:
+                    has_link = True
+                    break
+        if has_link:
+            try:
+                await message.delete()
+                await send_warning_with_count(
+                    chat, user_id, username,
+                    "Links are not allowed in this group",
+                    context, "link"
+                )
+            except Exception as e:
+                logger.error(f"Link delete error: {e}")
+            return
+
+    # Banned words
+    banned_words = await get_banned_words(chat.id)
+    if banned_words:
+        msg_lower = message.text.lower()
         for word in banned_words:
-            pattern = r'\b' + re.escape(word) + r'\b'
-            if re.search(pattern, message_text):
+            if re.search(r'\b' + re.escape(word) + r'\b', msg_lower):
                 try:
                     await message.delete()
-                    # Send warning WITHOUT count (banned words don't add to warning count)
-                    await send_warning_with_count(chat, user_id, username, "banned word", context, "banned_word")
-                    return
+                    await send_warning_with_count(
+                        chat, user_id, username,
+                        "banned word", context, "banned_word"
+                    )
                 except Exception as e:
-                    logger.error(f"Error deleting message with banned word: {e}")
-                    return
+                    logger.error(f"Banned word delete error: {e}")
+                return
 
 async def callback_query_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
