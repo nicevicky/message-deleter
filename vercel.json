@@ -1,27 +1,29 @@
- {
+{
   "version": 2,
   "builds": [
     {
-      "src": "*.html",
-      "use": "@vercel/static"
-    },
-    {
       "src": "main.py",
       "use": "@vercel/python"
+    },
+    {
+      "src": "*.html",
+      "use": "@vercel/static"
     }
   ],
   "routes": [
-    { "src": "/", "dest": "/index.html" },
+    { "src": "/webhook/webhook",    "dest": "main.py" },
+    { "src": "/api/(.*)",           "dest": "main.py" },
+    { "src": "/run-cleanup",        "dest": "main.py" },
+    { "src": "/run-group-cleanup",  "dest": "main.py" },
 
-    { "src": "/admin", "dest": "/admin.html" },
-    { "src": "/home", "dest": "/home.html" },
-    { "src": "/profile", "dest": "/profile.html" },
-    { "src": "/groups", "dest": "/groups.html" },
-    { "src": "/group-settings", "dest": "/group-settings.html" },
-    { "src": "/join-requests", "dest": "/join-requests.html" },
-    { "src": "/moderation", "dest": "/moderation.html" },
-    { "src": "/reports", "dest": "/reports.html" },
-
-    { "src": "/api/(.*)", "dest": "main.py" }
+    { "src": "/",                   "dest": "/index.html" },
+    { "src": "/admin",              "dest": "/admin.html" },
+    { "src": "/home",               "dest": "/home.html" },
+    { "src": "/profile",            "dest": "/profile.html" },
+    { "src": "/groups",             "dest": "/groups.html" },
+    { "src": "/group-settings",     "dest": "/group-settings.html" },
+    { "src": "/join-requests",      "dest": "/join-requests.html" },
+    { "src": "/moderation",         "dest": "/moderation.html" },
+    { "src": "/reports",            "dest": "/reports.html" }
   ]
 }
