@@ -47,6 +47,14 @@ app = FastAPI()
 # Global variable to store the Telegram Application
 ptb_application = None
 
+# ── In-memory caches for speed ───────────────────────────────────────────────
+# force_sub_cache: {chat_id: (channels_list, fetched_at_timestamp)}
+# membership_cache: {(chat_id, user_id, channel_id): (is_member_bool, fetched_at_timestamp)}
+_force_sub_cache:   dict = {}
+_membership_cache:  dict = {}
+_FORCE_SUB_TTL    = 120   # re-fetch channel list every 2 minutes
+_MEMBERSHIP_TTL   = 90    # re-check membership every 90 seconds
+
 def is_forwarded_or_channel_message(message) -> bool:
     """
     Detects forwarded messages (including hidden channel forwards) and direct channel posts.
@@ -583,6 +591,8 @@ async def add_force_sub(chat_id: int, channel_id: int, channel_title: str = None
             "is_active": True,
         }
         supabase.table('force_sub').upsert(data, on_conflict='chat_id,channel_id').execute()
+        # Invalidate channel list cache so next message re-fetches
+        _force_sub_cache.pop(chat_id, None)
     except Exception as e:
         logger.error(f"Error adding force_sub for {chat_id}: {e}")
 
@@ -599,6 +609,8 @@ async def remove_force_sub(chat_id: int, channel_id: int):
     """Deactivate a force-subscribe channel"""
     try:
         supabase.table('force_sub').update({"is_active": False}).eq('chat_id', chat_id).eq('channel_id', channel_id).execute()
+        # Invalidate cache
+        _force_sub_cache.pop(chat_id, None)
     except Exception as e:
         logger.error(f"Error removing force_sub: {e}")
 
@@ -2041,16 +2053,48 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 # --- FORCE SUB CHECK + MESSAGE ---
 
 async def check_force_sub(chat_id: int, user_id: int, context) -> list:
-    """Return list of force_sub channels the user has NOT joined."""
-    channels   = await get_active_force_subs(chat_id)
+    """
+    Return list of force_sub channels the user has NOT joined.
+    Uses two in-memory caches to avoid hitting Telegram/Supabase on every message:
+      • channel list cache (TTL 2 min)  — avoids repeated Supabase reads
+      • membership cache  (TTL 90 sec)  — avoids repeated get_chat_member calls
+    """
+    import time
+    now = time.monotonic()
+
+    # ── 1. Get channel list (cached) ─────────────────────────────────────────
+    cached = _force_sub_cache.get(chat_id)
+    if cached and (now - cached[1]) < _FORCE_SUB_TTL:
+        channels = cached[0]
+    else:
+        channels = await get_active_force_subs(chat_id)
+        _force_sub_cache[chat_id] = (channels, now)
+
+    if not channels:
+        return []  # fast path — no force sub set, skip immediately
+
+    # ── 2. Check membership for each channel (cached) ────────────────────────
     not_joined = []
-    for fc in channels:
-        try:
-            m = await context.bot.get_chat_member(fc["channel_id"], user_id)
-            if m.status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]:
-                not_joined.append(fc)
-        except Exception:
+    checks = []
+
+    async def _check_one(fc):
+        channel_id = fc["channel_id"]
+        key = (chat_id, user_id, channel_id)
+        cached_m = _membership_cache.get(key)
+        if cached_m and (now - cached_m[1]) < _MEMBERSHIP_TTL:
+            is_member = cached_m[0]
+        else:
+            try:
+                m = await context.bot.get_chat_member(channel_id, user_id)
+                is_member = m.status not in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]
+            except Exception:
+                is_member = False
+            _membership_cache[key] = (is_member, now)
+        if not is_member:
             not_joined.append(fc)
+
+    # Run all channel checks concurrently
+    await asyncio.gather(*[_check_one(fc) for fc in channels])
     return not_joined
 
 
@@ -2768,16 +2812,15 @@ async def user_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_member_update = update.chat_member
     if not chat_member_update:
         return
-    
+
     chat = chat_member_update.chat
     if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
         return
-    
+
     new_member = chat_member_update.new_chat_member
     old_member = chat_member_update.old_chat_member
     user = new_member.user
 
-    # FIXED: Use ChatMemberStatus.BANNED instead of non-existent .KICKED
     if old_member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED] and new_member.status == ChatMemberStatus.MEMBER:
         logger.info(f"New member {user.id} ({user.first_name}) joined group {chat.id}")
         settings = await get_group_settings(chat.id)
@@ -2787,7 +2830,12 @@ async def user_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await upsert_group_member(chat.id, user.id, user.username, user.first_name)
         await increment_member_count(chat.id)
 
-        # Auto-approve join request if it exists
+        # Clear membership cache for this user so their next message passes instantly
+        keys_to_clear = [k for k in _membership_cache if k[0] == chat.id and k[1] == user.id]
+        for k in keys_to_clear:
+            del _membership_cache[k]
+
+        # Auto-approve join request if enabled
         if settings and settings.get('auto_approve', False):
             try:
                 await context.bot.approve_chat_join_request(chat.id, user.id)
@@ -2799,31 +2847,16 @@ async def user_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if settings and settings.get('delete_join_messages', False):
             context.user_data['last_join_message_id'] = None
 
-        # Force sub check: if active force_subs exist, warn the user
-        is_subscribed, missing_channels = await check_user_force_sub(chat.id, user.id, context)
-        if not is_subscribed and missing_channels:
-            timer = settings.get('force_sub_message_timer', 60) if settings else 60
-            channel_links = "\n".join([
-                f"• <a href='https://t.me/{fs['channel_username']}'>{fs['channel_title'] or fs['channel_username']}</a>"
-                if fs.get('channel_username') else f"• {fs.get('channel_title', 'Channel')}"
-                for fs in missing_channels
-            ])
-            force_msg = await chat.send_message(
-                f"👋 Welcome {user.mention_html()}!\n\n"
-                f"⚠️ Please subscribe to the following channel(s) to stay in this group:\n{channel_links}",
-                parse_mode='HTML'
-            )
-            if timer > 0:
-                await schedule_message_deletion(chat.id, force_msg.message_id, timer)
-            return  # Skip normal welcome if force sub is pending
-
         await send_welcome_message(chat, user, context, settings)
 
     elif new_member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]:
-        # User left or was banned — remove from group_members, decrement count
         logger.info(f"Member {user.id} left/banned from group {chat.id}")
         await remove_group_member(chat.id, user.id)
         await decrement_member_count(chat.id)
+        # Clear their cache entry too
+        keys_to_clear = [k for k in _membership_cache if k[0] == chat.id and k[1] == user.id]
+        for k in keys_to_clear:
+            del _membership_cache[k]
 
 async def send_warning_with_count(chat: any, user_id: int, username: str, reason: str, context: ContextTypes.DEFAULT_TYPE, offense_type: str = "general"):
     """
@@ -3008,52 +3041,53 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await upsert_group_member(chat.id, user_id, user.username, user.first_name)
 
     # ── FORCE SUBSCRIBE CHECK ────────────────────────────────────────────────
-    # This runs on EVERY message. If the group has force-sub channels set,
-    # check whether this user is a member of ALL of them.
-    # If not → delete their message, send join button, stop processing.
+    # Runs on every message. Channel list and membership are both cached so
+    # this adds virtually zero latency when the user is already a member.
     not_joined = await check_force_sub(chat.id, user_id, context)
     if not_joined:
-        # Delete the message they tried to send
-        try:
-            await message.delete()
-        except Exception:
-            pass
-
-        # Build join buttons — one per missing channel
-        keyboard = []
+        # Build the warning text and buttons BEFORE the awaits so we're ready
+        keyboard      = []
         channel_names = []
         for fc in not_joined:
             title = fc.get('channel_title') or fc.get('channel_username') or str(fc['channel_id'])
             channel_names.append(f"<b>{title}</b>")
-            if fc.get('channel_username'):
-                link = f"https://t.me/{fc['channel_username']}"
-            else:
-                # private channel — strip -100 prefix
-                raw_id = str(fc['channel_id']).replace('-100', '')
-                link = f"https://t.me/c/{raw_id}"
+            link = (
+                f"https://t.me/{fc['channel_username']}"
+                if fc.get('channel_username')
+                else f"https://t.me/c/{str(fc['channel_id']).replace('-100', '')}"
+            )
             keyboard.append([InlineKeyboardButton(f"➕ Join {title}", url=link)])
 
-        user_mention = get_user_mention_html(user)
+        user_mention  = get_user_mention_html(user)
         channels_text = " and ".join(channel_names)
-        text = (
+        warn_text = (
             f"⚠️ {user_mention}, you must join {channels_text} "
             f"before you can send messages in this group.\n\n"
-            f"Click the button below to join, then send your message again."
+            f"Join using the button below, then send your message again."
         )
+        timer = settings.get('force_sub_message_timer', 120)  # default 2 min
 
-        timer = settings.get('force_sub_message_timer', 60)
-        try:
-            warn_msg = await chat.send_message(
-                text,
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
-            # Auto-delete the warning after the configured timer
-            if timer > 0:
-                await schedule_message_deletion(chat.id, warn_msg.message_id, timer)
-        except Exception as e:
-            logger.error(f"Force sub warning send error: {e}")
-        return  # stop — don't process any other rules for this message
+        # Delete their message AND send the warning at the same time (fastest)
+        async def _delete_msg():
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+        async def _send_warning():
+            try:
+                warn_msg = await chat.send_message(
+                    warn_text,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+                if timer > 0:
+                    await schedule_message_deletion(chat.id, warn_msg.message_id, timer)
+            except Exception as e:
+                logger.error(f"Force sub warning send error: {e}")
+
+        await asyncio.gather(_delete_msg(), _send_warning())
+        return  # stop all other checks
 
     # ── STICKER PROTECTION ───────────────────────────────────────────────────
     if settings.get('sticker_protect', False) and message.sticker:
