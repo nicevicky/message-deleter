@@ -2573,10 +2573,13 @@ async def toggle_promo_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await group_settings_handler(update, context)
 
 
-async def toggle_links_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    chat_id = int(query.data.split("_")[2])
+
+    parts = query.data.split("_")
+    chat_id = int(parts[-1])
+
     settings = await get_group_settings(chat_id)
     new_value = not settings.get('delete_links', False)
     await update_link_setting(chat_id, new_value)
