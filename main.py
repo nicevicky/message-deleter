@@ -844,41 +844,66 @@ async def channel_reject_callback(update: Update, context: ContextTypes.DEFAULT_
 # Telegram fires MY_CHAT_MEMBER with the channel. We auto-register it there.
 # ─────────────────────────────────────────────────────────────────────────────
 async def _register_channel(bot, chat, added_by_user):
-    """Register a channel automatically when bot is made admin there."""
+    """
+    Register (or re-register) a channel automatically when bot becomes admin.
+    Called every time MY_CHAT_MEMBER fires with status=ADMINISTRATOR on a channel.
+    We always upsert so that:
+      - First time → creates the record with defaults
+      - Re-add → updates title/username in case they changed, keeps all other settings
+    Either way we DM the admin so they know it's live.
+    """
     existing = await get_channel_settings(chat.id)
+    ch_username = getattr(chat, 'username', None)
+
     if existing:
-        return  # already registered
-    await upsert_channel_settings(chat.id, {
-        "channel_title":    chat.title,
-        "channel_username": getattr(chat, 'username', None),
-        "added_by":         added_by_user.id,
-        "auto_approve":     True,
-        "approval_delay":   0,
-        "welcome_message":  None,
-        "welcome_timer":    0,
-        "created_at":       datetime.now(timezone.utc).isoformat(),
-    })
+        # Update title and username in case they changed, preserve all other settings
+        await upsert_channel_settings(chat.id, {
+            "channel_title":    chat.title,
+            "channel_username": ch_username,
+            # Keep added_by as the NEW admin who re-added (so they see it in My Channels)
+            "added_by":         added_by_user.id,
+        })
+        is_new = False
+    else:
+        await upsert_channel_settings(chat.id, {
+            "channel_title":    chat.title,
+            "channel_username": ch_username,
+            "added_by":         added_by_user.id,
+            "auto_approve":     True,
+            "approval_delay":   0,
+            "welcome_message":  None,
+            "welcome_timer":    0,
+            "created_at":       datetime.now(timezone.utc).isoformat(),
+        })
+        is_new = True
+
     deep_link = f"https://t.me/{bot.username}?start=channel_{chat.id}"
+    is_private = not ch_username
+    status_word = "Registered" if is_new else "Updated"
+
     try:
         await bot.send_message(
             added_by_user.id,
-            f"✅ <b>Channel Registered!</b>\n\n"
+            f"✅ <b>Channel {status_word}!</b>\n\n"
             f"📢 <b>{chat.title}</b>\n"
             f"🆔 <code>{chat.id}</code>\n"
-            f"🔒 {'Private' if not getattr(chat,'username',None) else 'Public'}\n\n"
-            f"I'll now:\n• Auto-approve join requests\n"
-            f"• Send private welcome DMs\n• Track analytics\n\n"
-            f"<b>Deep-link for welcome DMs:</b>\n<code>{deep_link}</code>\n"
-            f"<i>Share this link so users can receive DMs.</i>\n\n"
-            f"Use <b>My Channels</b> → <b>⚙️ Settings</b> to configure.",
+            f"🔒 {'Private' if is_private else 'Public'}\n\n"
+            f"{'I will now:' if is_new else 'Still active:'}\n"
+            f"• Auto-approve join requests\n"
+            f"• Send private welcome DMs\n"
+            f"• Track analytics\n\n"
+            f"<b>Welcome DM deep-link:</b>\n<code>{deep_link}</code>\n"
+            f"<i>Share this link so users can receive DMs immediately.</i>\n\n"
+            f"Go to <b>My Channels</b> to configure settings.",
             parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⚙️ Channel Settings", callback_data=f"ch_settings_{chat.id}")
-            ]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Channel Settings", callback_data=f"ch_settings_{chat.id}")],
+                [InlineKeyboardButton("📢 My Channels",      callback_data="my_channels")],
+            ])
         )
-        logger.info(f"Channel {chat.id} auto-registered for user {added_by_user.id}")
+        logger.info(f"Channel {chat.id} {'registered' if is_new else 'updated'} for user {added_by_user.id}")
     except Forbidden:
-        logger.info(f"Could not DM user {added_by_user.id} about channel registration.")
+        logger.info(f"Could not DM user {added_by_user.id} — they need to /start the bot first.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2043,7 +2068,7 @@ async def group_settings_handler(update: Update, context: ContextTypes.DEFAULT_T
         f"👋 Del Join/Leave Msgs: {yn(settings.get('delete_join_messages'))}\n"
         f"🎭 Sticker Protect: {yn(settings.get('sticker_protect'))}\n"
         f"✅ Auto Approve: {yn(settings.get('auto_approve'))}\n"
-        f"📢 Force Sub: {f\"@{settings['force_sub_channel']}\" if settings.get('force_sub_channel') else '❌ Not Set'}\n"
+        f"📢 Force Sub: {("@" + settings["force_sub_channel"]) if settings.get("force_sub_channel") else "❌ Not Set"}\n"
     )
     keyboard = [
         [InlineKeyboardButton("🎉 Set Welcome Message",  callback_data=f"set_welcome_{chat_id}")],
@@ -2177,19 +2202,9 @@ async def toggle_join_delete_handler(update: Update, context: ContextTypes.DEFAU
 # PRIVATE CHAT TEXT INPUT HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Only process text input when we're awaiting something.
+    # Photo input is handled separately by handle_photo_input.
     if 'awaiting_input' not in context.user_data:
-        # Check if we're waiting for a photo for post draft
-        if context.user_data.get('action') == 'ch_post_photo' and update.message.photo:
-            channel_id = context.user_data.get('awaiting_input_channel')
-            if channel_id:
-                draft = context.user_data.get('post_draft', {})
-                draft['photo_file_id'] = update.message.photo[-1].file_id
-                context.user_data['post_draft'] = draft
-                for k in ['action', 'awaiting_input_channel']:
-                    context.user_data.pop(k, None)
-                await update.message.reply_text("✅ Photo saved!")
-                await _show_post_compose(update.message, channel_id, context, edit=False)
-                return
         return
 
     chat_id   = context.user_data['awaiting_input']
@@ -2472,8 +2487,8 @@ async def user_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_subscribed and missing:
             timer = settings.get('force_sub_message_timer', 60) if settings else 60
             channel_links = "\n".join([
-                f"• <a href='https://t.me/{fs[\"channel_username\"]}'>{fs[\"channel_title\"] or fs[\"channel_username\"]}</a>"
-                if fs.get("channel_username") else f"• {fs.get('channel_title','Channel')}"
+                (f"• <a href='https://t.me/{fs['channel_username']}'>{fs['channel_title'] or fs['channel_username']}</a>"
+                 if fs.get("channel_username") else f"• {fs.get('channel_title','Channel')}")
                 for fs in missing])
             force_msg = await chat.send_message(
                 f"👋 Welcome {user.mention_html()}!\n\n"
